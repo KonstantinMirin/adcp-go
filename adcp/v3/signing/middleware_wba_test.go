@@ -3,6 +3,7 @@ package signing
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -61,22 +62,31 @@ func mcpCall(tool string) string {
 }
 
 func TestMiddlewareWebBotAuthBindingGate(t *testing.T) {
+	const (
+		withIdentity = "identity"  // handler runs with the verified signer
+		anonymous    = "anonymous" // handler runs as an anonymous request
+		refused      = "refused"   // AdCP error envelope, handler not run
+	)
+	bound := map[string]string{"https://buyer.example.com": "principal_7"}
 	cases := []struct {
-		name       string
-		body       string
-		authorizer *fakeAuthorizer
-		unboundFor []string
-		wantStatus int
-		principal  string
+		name        string
+		body        string
+		authorizer  WBAAuthorizer
+		unboundFor  []string
+		requiredFor []string
+		want        string
+		principal   string
+		code        string
 	}{
-		{"identity-established may call get_principal", mcpCall("get_principal"), &fakeAuthorizer{}, nil, http.StatusOK, ""},
-		{"identity-established may call get_adcp_capabilities", mcpCall("get_adcp_capabilities"), nil, nil, http.StatusOK, ""},
-		{"identity-established gets no authority for create_media_buy", mcpCall("create_media_buy"), &fakeAuthorizer{}, nil, http.StatusForbidden, ""},
-		{"identity-established gets no authority for sync_accounts", mcpCall("sync_accounts"), nil, nil, http.StatusForbidden, ""},
-		{"configured anonymous reads", mcpCall("get_products"), &fakeAuthorizer{}, []string{"get_products", "tools/list"}, http.StatusOK, ""},
-		{"configured protocol method", `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`, &fakeAuthorizer{}, []string{"get_products", "tools/list"}, http.StatusOK, ""},
-		{"bound origin gets its principal", mcpCall("create_media_buy"), &fakeAuthorizer{principals: map[string]string{"https://buyer.example.com": "principal_7"}}, nil, http.StatusOK, "principal_7"},
-		{"bound but delisted origin is denied", mcpCall("create_media_buy"), &fakeAuthorizer{principals: map[string]string{"https://buyer.example.com": "principal_7"}, deny: map[string]bool{"https://buyer.example.com": true}}, nil, http.StatusForbidden, ""},
+		{"identity-established may call get_principal", mcpCall("get_principal"), &fakeAuthorizer{}, nil, nil, withIdentity, "", ""},
+		{"identity-established may call get_adcp_capabilities", mcpCall("get_adcp_capabilities"), nil, nil, nil, withIdentity, "", ""},
+		{"beyond UnboundFor: served as an anonymous caller", mcpCall("create_media_buy"), &fakeAuthorizer{}, nil, nil, anonymous, "", ""},
+		{"sync_accounts from an unbound origin: anonymous", mcpCall("sync_accounts"), nil, nil, nil, anonymous, "", ""},
+		{"beyond UnboundFor on a signature-required operation: PERMISSION_DENIED", mcpCall("create_media_buy"), nil, nil, []string{"create_media_buy"}, refused, "", CodePermissionDenied},
+		{"configured anonymous reads", mcpCall("get_products"), &fakeAuthorizer{}, []string{"get_products"}, nil, withIdentity, "", ""},
+		{"bound origin gets its principal", mcpCall("create_media_buy"), &fakeAuthorizer{principals: bound}, nil, nil, withIdentity, "principal_7", ""},
+		{"authorizer error: PERMISSION_DENIED envelope", mcpCall("create_media_buy"), &fakeAuthorizer{principals: bound, deny: map[string]bool{"https://buyer.example.com": true}}, nil, nil, refused, "", CodePermissionDenied},
+		{"authorizer outage on spend: SERVICE_UNAVAILABLE", mcpCall("create_media_buy"), outageAuthorizer{}, nil, nil, refused, "", CodeServiceUnavailable},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -86,24 +96,90 @@ func TestMiddlewareWebBotAuthBindingGate(t *testing.T) {
 				opts.Authorizer = tc.authorizer
 			}
 			var c captured
-			h := Middleware(MiddlewareOptions{WebBotAuth: opts, Replay: rig.replay, Logger: discardLogger()})(captureHandler(&c))
+			h := Middleware(MiddlewareOptions{WebBotAuth: opts, Replay: rig.replay, RequiredFor: tc.requiredFor,
+				OperationResolver: func(*http.Request) string { return "" }, Logger: discardLogger()})(captureHandler(&c))
 			r := rig.signedRequest(t, tc.body)
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, r)
-			require.Equal(t, tc.wantStatus, rec.Code, rec.Body.String())
-			if tc.wantStatus == http.StatusOK {
+			// A correctly signed request never gets Accept-Signature.
+			require.Empty(t, rec.Header().Get("Accept-Signature"))
+			switch tc.want {
+			case withIdentity:
+				require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 				require.True(t, c.called)
 				require.Equal(t, "https://buyer.example.com", c.signer.AgentURL)
 				require.Equal(t, tc.principal, c.signer.PrincipalID)
 				require.Equal(t, tc.body, c.body, "the handler still reads the body")
-				return
+			case anonymous:
+				require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+				require.True(t, c.called)
+				require.Nil(t, c.signer, "no identity is attached beyond the unbound surface")
+				require.Equal(t, tc.body, c.body)
+			case refused:
+				require.False(t, c.called)
+				requireAdCPEnvelope(t, rec, tc.code)
+				require.NotContains(t, rec.Body.String(), "delisted", "no detail leaks")
 			}
-			require.False(t, c.called)
-			require.Empty(t, rec.Header().Get("Accept-Signature"), "an authorization failure carries no Accept-Signature")
-			require.Contains(t, rec.Body.String(), `"PERMISSION_DENIED"`)
-			require.NotContains(t, rec.Body.String(), "delisted", "no detail leaks")
 		})
 	}
+}
+
+type outageAuthorizer struct{}
+
+func (outageAuthorizer) AuthorizeWBA(context.Context, *VerifiedSigner, string) (string, error) {
+	return "", NewAuthorizationError(CodeServiceUnavailable, "trust record unreachable", nil)
+}
+
+// requireAdCPEnvelope asserts the standard AdCP error envelope with code,
+// the matching HTTP status, and no Accept-Signature.
+func requireAdCPEnvelope(t *testing.T, rec *httptest.ResponseRecorder, code string) {
+	t.Helper()
+	require.Empty(t, rec.Header().Get("Accept-Signature"))
+	require.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	var body struct {
+		Errors []struct{ Code, Message, Recovery string } `json:"errors"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body), rec.Body.String())
+	require.Len(t, body.Errors, 1)
+	require.Equal(t, code, body.Errors[0].Code)
+	switch code {
+	case CodeServiceUnavailable:
+		require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+		require.Equal(t, "transient", body.Errors[0].Recovery)
+		require.NotEmpty(t, rec.Header().Get("Retry-After"))
+	default:
+		require.Equal(t, http.StatusForbidden, rec.Code)
+		require.Equal(t, "correctable", body.Errors[0].Recovery)
+	}
+}
+
+// TestMiddlewareRevocationOutage: a revocation list that cannot be read is
+// an outage, not a signature failure. Spend-committing calls fail with
+// SERVICE_UNAVAILABLE; other calls proceed. A revoked key is
+// PERMISSION_DENIED. None of these gets Accept-Signature.
+func TestMiddlewareRevocationOutage(t *testing.T) {
+	serve := func(t *testing.T, rig *wbaRig, body string) (*httptest.ResponseRecorder, *captured) {
+		var c captured
+		auth := &fakeAuthorizer{principals: map[string]string{rig.origin: "p"}}
+		h := Middleware(MiddlewareOptions{WebBotAuth: &WebBotAuthOptions{Keys: rig.resolver, Revocation: rig.checker, Authorizer: auth, Clock: wbaClock},
+			Replay: rig.replay, Logger: discardLogger()})(captureHandler(&c))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, rig.signedRequest(t, body))
+		return rec, &c
+	}
+	rig := newWBARig(t)
+	rig.revs.fetchErr = errors.New("connection refused")
+	rec, _ := serve(t, rig, mcpCall("create_media_buy"))
+	requireAdCPEnvelope(t, rec, CodeServiceUnavailable)
+	rec, c := serve(t, rig, mcpCall("get_media_buys"))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.True(t, c.signer.RevocationUnknown)
+
+	rig = newWBARig(t)
+	jwk, _ := PublicDirectoryKey(rig.key)
+	rig.revs.set(t, revocationPayload{Updated: rfc3339(wbaTestNow.Add(-time.Minute)), NextUpdate: rfc3339(wbaTestNow.Add(10 * time.Minute)), RevokedKids: []string{jwk.Kid}})
+	rec, _ = serve(t, rig, mcpCall("get_media_buys"))
+	requireAdCPEnvelope(t, rec, CodePermissionDenied)
 }
 
 func TestMiddlewareWebBotAuthFailuresUseStatusCodes(t *testing.T) {
@@ -142,7 +218,9 @@ func TestMiddlewareWebBotAuthFailuresUseStatusCodes(t *testing.T) {
 		}},
 		Replay: rig.replay, Logger: discardLogger(),
 	})(captureHandler(&c))
-	r = rig.signedRequest(t, mcpCall("create_media_buy"))
+	jwk, _ := PublicDirectoryKey(rig.key)
+	rig.revs.set(t, revocationPayload{Updated: rfc3339(wbaTestNow.Add(-time.Minute)), NextUpdate: rfc3339(wbaTestNow.Add(10 * time.Minute)), RevokedKids: []string{jwk.Kid}})
+	r = rig.signedRequest(t, mcpCall("get_principal"))
 	rec = httptest.NewRecorder()
 	h2.ServeHTTP(rec, r)
 	require.NotNil(t, seen)
@@ -176,8 +254,9 @@ func TestMiddlewareWebBotAuthRelaysDoNotInheritAuthority(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, sign())
 	// The caller is the originating (unbound) brand agent; the bound relay
-	// does not lend it authority.
-	require.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+	// does not lend it authority, so it is served as anonymous.
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Nil(t, c.signer)
 
 	auth.principals[rig.origin] = "brand_principal"
 	rec = httptest.NewRecorder()
@@ -276,8 +355,10 @@ func TestMiddlewareUnboundGateReadsExactKeys(t *testing.T) {
 		{"exact get_principal (positive control)", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_principal","arguments":{}}}`, http.StatusOK},
 		{"name and Name", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_media_buy","arguments":{},"Name":"get_principal"}}`, http.StatusBadRequest},
 		{"method and Method", `{"jsonrpc":"2.0","id":1,"method":"tools/call","Method":"initialize","params":{"name":"create_media_buy"}}`, http.StatusBadRequest},
-		{"Name only", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"Name":"get_principal","arguments":{}}}`, http.StatusForbidden},
-		{"Method only", `{"jsonrpc":"2.0","id":1,"Method":"tools/call","params":{"name":"get_principal"}}`, http.StatusForbidden},
+		// Without an exact name the request names no allowed operation, so
+		// it is served as anonymous: no identity is attached.
+		{"Name only", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"Name":"get_principal","arguments":{}}}`, http.StatusOK},
+		{"Method only", `{"jsonrpc":"2.0","id":1,"Method":"tools/call","params":{"name":"get_principal"}}`, http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rig := newWBARig(t)
@@ -287,6 +368,9 @@ func TestMiddlewareUnboundGateReadsExactKeys(t *testing.T) {
 			h.ServeHTTP(rec, rig.signedRequest(t, tc.body))
 			require.Equal(t, tc.status, rec.Code, rec.Body.String())
 			require.Equal(t, tc.status == http.StatusOK, c.called)
+			if c.called {
+				require.Equal(t, strings.HasPrefix(tc.name, "exact"), c.signer != nil, "identity only for the exact allowed operation")
+			}
 		})
 	}
 	req := func(body string) *http.Request {
@@ -319,7 +403,9 @@ func TestMiddlewareSessionMethodsAndTransportRequests(t *testing.T) {
 	for _, body := range []string{`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`, `{"jsonrpc":"2.0","method":"notifications/initialized"}`, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`} {
 		require.Equal(t, http.StatusOK, serve(rig.signedRequest(t, body)), body)
 	}
-	require.Equal(t, http.StatusForbidden, serve(rig.signedRequest(t, mcpCall("get_principal"))), "UnboundFor replaced the default")
+	c = captured{}
+	require.Equal(t, http.StatusOK, serve(rig.signedRequest(t, mcpCall("get_principal"))))
+	require.Nil(t, c.signer, "UnboundFor replaced the default: get_principal is served as anonymous")
 	for _, method := range []string{http.MethodGet, http.MethodDelete} {
 		r := httptest.NewRequest(method, "https://seller.example.com/mcp", nil)
 		require.NoError(t, SignWebBotAuthRequest(r, rig.key, WBASignOptions{AgentOrigin: rig.origin, Clock: wbaClock}))
@@ -327,7 +413,9 @@ func TestMiddlewareSessionMethodsAndTransportRequests(t *testing.T) {
 	}
 	r := httptest.NewRequest(http.MethodGet, "https://seller.example.com/adcp/create_media_buy", nil)
 	require.NoError(t, SignWebBotAuthRequest(r, rig.key, WBASignOptions{AgentOrigin: rig.origin, Clock: wbaClock}))
-	require.Equal(t, http.StatusForbidden, serve(r), "a resolved operation is gated even without a body")
+	c = captured{}
+	require.Equal(t, http.StatusOK, serve(r))
+	require.Nil(t, c.signer, "a resolved operation beyond UnboundFor is served as anonymous, even without a body")
 }
 
 // TestMiddlewareCarriesSignerToToolRequests: every verified signer, under

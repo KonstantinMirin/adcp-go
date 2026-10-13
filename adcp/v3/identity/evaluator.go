@@ -16,15 +16,22 @@ import (
 	"github.com/adcontextprotocol/adcp-go/adcp/v3/signing"
 )
 
-// TrustRecordError is a trust record that provides no authority: missing,
-// unavailable, invalid, or expired. Absent is set only for a 404 or 410 at
-// the derived URL before any 200 from that operator, the one case that
-// permits a configured legacy (brand.json) fallback. A fetch failure is
-// never absence.
+// TrustRecordError is a trust record that provides no authority. It is
+// one of two kinds, which the spec treats differently for a bound origin:
+//   - not listed (Unlisted or Absent): the operator's record was read and
+//     does not list the origin with the role, publishes no record (a 404 or
+//     410 before any 200 from that operator), or the origin has no
+//     registrable domain. A bound origin falls back to identity-established.
+//     Absent is also the one case that permits a configured legacy
+//     (brand.json) fallback for grants.
+//   - unavailable (neither flag): the record could not be fetched or read.
+//     A fetch failure is never absence: spend-committing calls fail with
+//     SERVICE_UNAVAILABLE, other calls continue under the cached binding.
 type TrustRecordError struct {
-	Absent  bool
-	Reason  string
-	Wrapped error
+	Absent   bool
+	Unlisted bool
+	Reason   string
+	Wrapped  error
 }
 
 func (e *TrustRecordError) Error() string { return "identity: " + e.Reason }
@@ -35,6 +42,21 @@ func (e *TrustRecordError) Unwrap() error { return e.Wrapped }
 func IsTrustRecordAbsent(err error) bool {
 	var e *TrustRecordError
 	return errors.As(err, &e) && e.Absent
+}
+
+// IsTrustRecordUnavailable reports whether err means the record could not
+// be read (a fetch, parse, or capacity failure), as opposed to a record
+// that does not list the origin. Any error that is not a TrustRecordError
+// counts as unavailable.
+func IsTrustRecordUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var e *TrustRecordError
+	if !errors.As(err, &e) {
+		return true
+	}
+	return !e.Absent && !e.Unlisted
 }
 
 func trustErr(reason string, wrapped error) *TrustRecordError {
@@ -48,7 +70,7 @@ func trustErr(reason string, wrapped error) *TrustRecordError {
 func TrustRecordURL(originOrDomain string) (string, error) {
 	domain, ok := psl.RegistrableDomain(originOrDomain)
 	if !ok {
-		return "", trustErr("identity has no registrable operator domain", nil)
+		return "", &TrustRecordError{Unlisted: true, Reason: "identity has no registrable operator domain"}
 	}
 	return "https://" + domain + "/.well-known/trust.json", nil
 }
@@ -265,7 +287,7 @@ func (e *TrustRecordEvaluator) Evaluate(ctx context.Context, originOrDomain, rol
 	}
 	if role != "" {
 		if _, err := rec.Agent(originOrDomain, role); err != nil {
-			return nil, trustErr("trust record does not list the origin with the required role", err)
+			return nil, &TrustRecordError{Unlisted: true, Reason: "trust record does not list the origin with the required role", Wrapped: err}
 		}
 	}
 	return rec.clone(), nil

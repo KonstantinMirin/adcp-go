@@ -89,42 +89,65 @@ func (b *OriginBindings) PrincipalForOrigin(_ context.Context, origin string) (s
 
 // BindingGate is the signing.WBAAuthorizer that turns a verified origin
 // into a principal. An unbound origin is identity-established (it returns
-// ""; the middleware then allows only its UnboundFor operations). A bound
-// origin is re-evaluated against its operator's trust record on every
-// request, through the evaluator's cache, which is bounded by the
-// revocation polling interval: when the operator delists the origin, or the
-// record cannot be fetched, authority ends within one cache lifetime and
-// the request is denied. The binding itself is kept, so the origin still
-// cannot fall back to the RFC 9421 profile.
+// ""; the middleware then serves it as an anonymous caller beyond
+// UnboundFor). A bound origin is re-evaluated against its operator's trust
+// record on every request, through the evaluator's cache, which is bounded
+// by the revocation polling interval:
+//   - listed with the role: the bound principal;
+//   - delisted (the record no longer lists it, or no record is published):
+//     identity-established again, as at first contact. The binding itself
+//     is kept, so the origin still cannot fall back to the RFC 9421
+//     profile, and TrustRecordEvaluator.Bind refuses to bind it again
+//     while it stays unlisted;
+//   - record unreachable (a fetch failure is never a delisting): a
+//     spend-committing operation fails with the retryable
+//     SERVICE_UNAVAILABLE; any other operation continues under the
+//     binding.
 type BindingGate struct {
 	Bindings signing.OriginBindingLookup
 	Records  *TrustRecordEvaluator
 	// Role defaults to adcp:buying. Configure the role your receiving
 	// surface needs.
 	Role string
+	// SpendCommitting classifies operations for the outage rule. Defaults
+	// to signing.IsSpendCommittingOperation.
+	SpendCommitting func(operation string) bool
 }
 
 // AuthorizeWBA implements signing.WBAAuthorizer.
-func (g *BindingGate) AuthorizeWBA(ctx context.Context, signer *signing.VerifiedSigner, _ string) (string, error) {
+func (g *BindingGate) AuthorizeWBA(ctx context.Context, signer *signing.VerifiedSigner, operation string) (string, error) {
 	if g.Bindings == nil {
 		return "", nil
 	}
 	principal, bound, err := g.Bindings.PrincipalForOrigin(ctx, signer.AgentURL)
 	if err != nil {
-		return "", err
+		return "", signing.NewAuthorizationError(signing.CodeServiceUnavailable, "binding lookup failed", err)
 	}
 	if !bound {
 		return "", nil
 	}
 	if g.Records == nil {
-		return "", errors.New("identity: binding evaluation unavailable")
+		return "", signing.NewAuthorizationError(signing.CodeServiceUnavailable, "binding evaluation unavailable", nil)
 	}
 	role := g.Role
 	if role == "" {
 		role = RoleBuying
 	}
-	if _, err := g.Records.Evaluate(ctx, signer.AgentURL, role); err != nil {
-		return "", err
+	_, err = g.Records.Evaluate(ctx, signer.AgentURL, role)
+	switch {
+	case err == nil:
+		return principal, nil
+	case IsTrustRecordUnavailable(err):
+		spend := signing.IsSpendCommittingOperation(operation)
+		if g.SpendCommitting != nil {
+			spend = g.SpendCommitting(operation)
+		}
+		if spend {
+			return "", signing.NewAuthorizationError(signing.CodeServiceUnavailable, "operator trust record unavailable on a spend-committing call", err)
+		}
+		return principal, nil
+	default:
+		// Delisted: identity-established again.
+		return "", nil
 	}
-	return principal, nil
 }

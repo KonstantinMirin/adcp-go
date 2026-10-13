@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -196,9 +197,12 @@ type WebBotAuthOptions struct {
 	Authorizer WBAAuthorizer
 
 	// UnboundFor lists the operations (AdCP tool names or JSON-RPC methods)
-	// an identity-established signer may call. The spec gives it what an
-	// anonymous caller gets, reads included, plus get_principal: set this to
-	// your anonymous permissions plus get_principal. Defaults to
+	// an identity-established signer may call with its verified identity
+	// attached. Any other operation is served exactly as an anonymous
+	// request (no verified signer in context), so the caller gets what an
+	// anonymous caller gets; an operation in RequiredFor or
+	// ProtocolMethodsRequiredFor is refused with PERMISSION_DENIED instead.
+	// List get_principal and anything else that needs the identity. Defaults to
 	// get_adcp_capabilities and get_principal. The MCP session methods
 	// (initialize, notifications/initialized, ping, tools/list) and bodyless
 	// streamable-HTTP GET and DELETE requests are always allowed, whatever
@@ -213,6 +217,11 @@ type WebBotAuthOptions struct {
 	// Clock supplies the verifier's wall clock. Defaults to time.Now.
 	Clock func() time.Time
 
+	// SpendCommitting classifies operations for fail-closed outage handling
+	// (a revocation list or trust record that cannot be read). Defaults to
+	// IsSpendCommittingOperation.
+	SpendCommitting func(op string) bool
+
 	// Authorities lists the host[:port] values this endpoint serves; see
 	// WBAVerifyOptions.Authorities. Recommended.
 	Authorities []string
@@ -220,8 +229,12 @@ type WebBotAuthOptions struct {
 
 // WBAAuthorizer is the binding hook for verified Web Bot Auth origins. It
 // returns the principal bound to signer.AgentURL, re-evaluating the binding
-// as its freshness rules require, or "" when the origin is not bound. A
-// non-nil error denies the request with PERMISSION_DENIED.
+// as its freshness rules require, or "" when the origin is not bound or no
+// longer listed (identity-established). A non-nil error is an
+// authorization outcome: return NewAuthorizationError with an AdCP code
+// (SERVICE_UNAVAILABLE for a retryable outage); any other error is answered
+// with PERMISSION_DENIED. operation lets it fail closed only for
+// spend-committing calls.
 type WBAAuthorizer interface {
 	AuthorizeWBA(ctx context.Context, signer *VerifiedSigner, operation string) (principalID string, err error)
 }
@@ -337,7 +350,7 @@ func Middleware(opts MiddlewareOptions) func(http.Handler) http.Handler {
 				}
 			}
 			if wba != nil && UsesWebBotAuth(r.Header) {
-				serveWebBotAuth(w, r, next, wba, unboundFor, replay, scheme, opName, opts.MaxBodyBytes, logger)
+				serveWebBotAuth(w, r, next, wba, unboundFor, replay, scheme, opName, opts, logger)
 				return
 			}
 			signer, err := VerifyRequestSignature(r, VerifyOptions{
@@ -420,54 +433,103 @@ func Middleware(opts MiddlewareOptions) func(http.Handler) http.Handler {
 // serveWebBotAuth verifies a request selected for the Web Bot Auth profile,
 // applies the binding gate, and dispatches or rejects it.
 func serveWebBotAuth(w http.ResponseWriter, r *http.Request, next http.Handler, wba *WebBotAuthOptions,
-	unboundFor map[string]struct{}, replay ReplayStore, scheme, opName string, maxBody int64, logger *slog.Logger) {
+	unboundFor map[string]struct{}, replay ReplayStore, scheme, opName string, opts MiddlewareOptions, logger *slog.Logger) {
 	signers, err := VerifyWebBotAuthRequest(r, WBAVerifyOptions{
-		Keys:         wba.Keys,
-		Revocation:   wba.Revocation,
-		Replay:       replay,
-		Scheme:       scheme,
-		MaxBodyBytes: maxBody,
-		Clock:        wba.Clock,
-		Authorities:  wba.Authorities,
+		Keys:                    wba.Keys,
+		Revocation:              wba.Revocation,
+		RevocationOutageAllowed: true, // fail closed for spend below
+		Replay:                  replay,
+		Scheme:                  scheme,
+		MaxBodyBytes:            opts.MaxBodyBytes,
+		Clock:                   wba.Clock,
+		Authorities:             wba.Authorities,
 	})
-	if err == nil {
-		// The originating signer is the AdCP caller; relays are verified
-		// independently and acquire none of its authority.
-		caller := signers[0]
-		op := opName
-		if op == "" {
-			op = jsonRPCOperation(r, maxBody)
-		}
-		principal := ""
-		if wba.Authorizer != nil {
-			principal, err = wba.Authorizer.AuthorizeWBA(r.Context(), caller, op)
-			if err != nil && AsWBAError(err) == nil {
-				err = &WBAError{Status: http.StatusForbidden, Authorization: true, Reason: "signer origin is not authorized", Wrapped: err}
-			}
-		}
-		if err == nil && principal == "" && !transportOnly(r, op) {
-			if _, ok := unboundFor[op]; !ok {
-				err = wbaDeny("signer identity is not bound")
-			}
-		}
-		if err == nil {
-			caller.PrincipalID = principal
-			ctx := context.WithValue(r.Context(), contextKey{}, caller)
-			ctx = context.WithValue(ctx, verifiedSignersKey{}, signers)
-			serveWithToolRequestSigner(w, r.WithContext(ctx), next, caller)
+	if err != nil {
+		rejectWBA(w, r, err, opName, wba, logger)
+		return
+	}
+	// Identity is established. From here every outcome is authorization:
+	// the AdCP error envelope with existing codes, never 403 with
+	// Accept-Signature. The originating signer is the AdCP caller; relays
+	// are verified independently and acquire none of its authority.
+	caller := signers[0]
+	op := opName
+	if op == "" {
+		op = jsonRPCOperation(r, opts.MaxBodyBytes)
+	}
+	spend := IsSpendCommittingOperation(op)
+	if wba.SpendCommitting != nil {
+		spend = wba.SpendCommitting(op)
+	}
+	for _, s := range signers {
+		if s.RevocationUnknown && spend {
+			rejectWBA(w, r, NewAuthorizationError(CodeServiceUnavailable, "origin revocation status unavailable on a spend-committing call", nil), op, wba, logger)
 			return
 		}
 	}
+	principal := ""
+	if wba.Authorizer != nil {
+		principal, err = wba.Authorizer.AuthorizeWBA(r.Context(), caller, op)
+		if err != nil {
+			if we := AsWBAError(err); we == nil || !we.Authorization {
+				err = NewAuthorizationError(CodePermissionDenied, "signer origin is not authorized", err)
+			}
+			rejectWBA(w, r, err, op, wba, logger)
+			return
+		}
+	}
+	if principal == "" && !transportOnly(r, op) {
+		if _, ok := unboundFor[op]; !ok {
+			// Outside what an identity-established caller may do: it gets
+			// what an anonymous caller gets. An operation the middleware
+			// requires a signature for is refused with the gate's
+			// authorization error (an anonymous caller would be refused
+			// too); anything else proceeds exactly as an anonymous request,
+			// with no verified signer, for the application to answer.
+			if requiresSignature(r, op, opts) {
+				rejectWBA(w, r, wbaDeny("signer identity is not bound"), op, wba, logger)
+				return
+			}
+			logger.Info("web bot auth signer is identity-established; serving as anonymous", "op", op)
+			next.ServeHTTP(w, r)
+			return
+		}
+	}
+	caller.PrincipalID = principal
+	ctx := context.WithValue(r.Context(), contextKey{}, caller)
+	ctx = context.WithValue(ctx, verifiedSignersKey{}, signers)
+	serveWithToolRequestSigner(w, r.WithContext(ctx), next, caller)
+}
+
+// requiresSignature reports whether op (or the request's JSON-RPC method)
+// is in the middleware's RequiredFor or ProtocolMethodsRequiredFor.
+func requiresSignature(r *http.Request, op string, opts MiddlewareOptions) bool {
+	if slices.Contains(opts.RequiredFor, op) {
+		return true
+	}
+	if len(opts.ProtocolMethodsRequiredFor) == 0 || r.Body == nil {
+		return false
+	}
+	limit := opts.MaxBodyBytes
+	if limit <= 0 {
+		limit = defaultMaxBodyBytes
+	}
+	body, err := readAndReplaceBody(r, limit)
+	return err == nil && slices.Contains(opts.ProtocolMethodsRequiredFor, protocolMethodFromJSONRPC(body))
+}
+
+func rejectWBA(w http.ResponseWriter, r *http.Request, err error, op string, wba *WebBotAuthOptions, logger *slog.Logger) {
 	e := AsWBAError(err)
 	if e == nil {
 		logger.Error("web bot auth verification error", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	logger.Warn("signature rejected",
+	logger.Warn("web bot auth request rejected",
 		"status", e.Status,
+		"code", e.Code,
 		"detail", e.Reason,
-		"op", opName,
+		"op", op,
 		"label", e.Label,
 		"authorization", e.Authorization,
 		"profile", ProfileTagWebBotAuth,
@@ -475,25 +537,37 @@ func serveWebBotAuth(w http.ResponseWriter, r *http.Request, next http.Handler, 
 	writeWBAReject(w, r, e, wba.OnReject)
 }
 
-// writeWBAReject writes the profile's failure response. An authorization
-// failure is a generic AdCP PERMISSION_DENIED with no Accept-Signature; any
-// other failure is its status with Accept-Signature on a 403. Neither body
-// carries signature-specific detail.
+// writeWBAReject writes the profile's failure response, split by layer. A
+// signature failure is its WBA status (400, 403 with Accept-Signature, 429)
+// with a generic body. An authorization outcome (identity established) is
+// the standard AdCP error envelope with its code and no Accept-Signature:
+// PERMISSION_DENIED as 403, SERVICE_UNAVAILABLE as 503 with Retry-After.
+// Neither body carries signature-specific detail.
 func writeWBAReject(w http.ResponseWriter, r *http.Request, e *WBAError, onReject func(http.ResponseWriter, *http.Request, *WBAError)) {
 	if onReject != nil {
 		onReject(w, r, e)
+		return
+	}
+	if e.Authorization {
+		code, recovery, message := e.Code, "correctable", "Agent is not authorized for this request"
+		if code == "" {
+			code = CodePermissionDenied
+		}
+		status := http.StatusForbidden
+		if code == CodeServiceUnavailable {
+			status, recovery, message = http.StatusServiceUnavailable, "transient", "Authorization status is temporarily unavailable; retry later"
+			w.Header().Set("Retry-After", "60")
+		}
+		body, _ := json.Marshal(map[string]any{"errors": []map[string]string{{"code": code, "message": message, "recovery": recovery}}})
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write(body)
 		return
 	}
 	for k, vs := range e.ResponseHeader() {
 		for _, v := range vs {
 			w.Header().Add(k, v)
 		}
-	}
-	if e.Authorization {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = w.Write([]byte(`{"errors":[{"code":"PERMISSION_DENIED","message":"permission denied"}]}`))
-		return
 	}
 	http.Error(w, http.StatusText(e.Status), e.Status)
 }

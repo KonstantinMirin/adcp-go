@@ -82,24 +82,39 @@ mw := signing.Middleware(signing.MiddlewareOptions{
 - **Profile selection.** A request with `Signature-Agent` or a `web-bot-auth` tag is verified under Web Bot Auth only, including under `ObserveOnly`. An uncovered `Signature-Agent` member is never attributed.
 - **Body.** A non-empty signed body must be strict JSON: no duplicate keys, including keys that differ only in case. Anything else is `400`.
 - **Authorities.** Set `Authorities` so that a signature captured at another seller cannot be replayed to this endpoint under that seller's `Host`.
-- **Errors.** Failures are `400`, `403` with `Accept-Signature`, or `429`. A revoked key or an origin without authority gets a generic `PERMISSION_DENIED` and no `Accept-Signature`. `request_signature_*` codes remain for the RFC 9421 profile.
-- **Identity-established.** A verified origin with no binding may call only `UnboundFor` (default `get_adcp_capabilities` and `get_principal`). Set it to your anonymous permissions plus `get_principal`.
+- **Errors are split by layer.**
+  - **Signature failures** use the WBA statuses with a generic body: `400` when headers don't parse, `403` with `Accept-Signature`, and `429`.
+  - **Authorization outcomes.** Once the signature verifies, every outcome uses the standard AdCP error envelope (`{"errors":[{"code","message","recovery"}]}`) with existing codes:
+    - a revoked key, a failed binding, or a signature-required operation from an unbound origin gets `PERMISSION_DENIED` (403);
+    - a trust-record or revocation-list outage on a spend-committing call gets `SERVICE_UNAVAILABLE` (503, `Retry-After`, retryable);
+    - a missing grant gets `PERMISSION_DENIED` with `grant_absent`, from the grant gate.
+  - A correctly signed request never gets `403` with `Accept-Signature`.
+  - `request_signature_*` codes remain for the RFC 9421 profile.
+- **Identity-established.** A verified origin with no binding gets what an anonymous caller gets.
+  - Operations in `UnboundFor` (default `get_adcp_capabilities` and `get_principal`) run with the verified identity attached. List there whatever needs the identity.
+  - Any other operation is served exactly as an anonymous request, with no verified signer, so your application answers it as it answers anonymous callers. An operation in `RequiredFor` or `ProtocolMethodsRequiredFor` is refused with `PERMISSION_DENIED`.
   - The MCP session methods (`initialize`, `notifications/initialized`, `ping`, `tools/list`) and bodyless streamable-HTTP `GET`/`DELETE` are always allowed in addition, so the signer can open and close a session.
   - A2A deployments resolve skills with `OperationResolver`.
   - `get_principal` should return `unconfigured`, with `relationship` (an `identity.PrincipalRelationship`) when an application is in progress.
   - Add `sync_principal` only when its handler implements an explicit `open` policy.
 - **Binding.** This is an explicit seller decision: `records.Bind(ctx, signer, principalID, bindings, identity.BindOptions{})`. The operator's trust record must list exactly one agent at the origin with `adcp:buying`.
   - An origin maps to one principal. Binding onto a principal that already uses RFC 9421 needs `ExistingRFC9421Principal: true, MigrationApproved: true`. Set those from your own records: the zero value treats the principal as new, as in the Python SDK.
-  - `BindingGate` re-evaluates the trust record on every request, through the evaluator's cache, which is bounded by the polling interval. When the operator delists the origin, or its record cannot be fetched, the bound origin is denied every operation, including the `UnboundFor` ones. This matches the Python SDK and is raised upstream. The binding stays, so the origin still cannot downgrade to RFC 9421.
+  - `BindingGate` re-evaluates the trust record on every request, through the evaluator's cache, which is bounded by the polling interval.
+    - **Delisted**, or the operator publishes no record: the origin falls back to identity-established (anonymous-equivalent, plus `UnboundFor`), not to deny-everything. The binding stays, so the origin still cannot downgrade to RFC 9421, and `Bind` refuses to bind it again while it is unlisted.
+    - **Unreachable or unreadable record**: this is not a delisting. Spend-committing calls (`signing.IsSpendCommittingOperation`, configurable) fail with `SERVICE_UNAVAILABLE`, and other calls continue under the binding.
 - **The trust record is never read on the signature path.** The `signing` package cannot import `identity`, because `identity` imports `signing`.
 - **MCP tool handlers.** Read the signer with `signing.VerifiedSignerFromToolRequest(req)`. A stateful go-sdk session binds handlers to the context of its `initialize` request, so `VerifiedSignerFromContext` can return another request's signer there. The middleware places every verified signer, under either profile, in the per-request `auth.TokenInfo`. It sets only `TokenInfo.Extra`, never `UserID`, and the MCP SDK copies it into `req.Extra`. `GrantGate.RequireAccountForToolRequest` uses it.
 - **Grants.** Set `adcp.Config.SyncAccountsAuthorizer = gate.SyncAccountsAuthorizer()`, with `gate := &identity.GrantGate{Evaluator: &identity.GrantEvaluator{Records: records}, ExistingAccountClaim: ...}`.
   - The hook reads the per-request signer (Web Bot Auth or RFC 9421) and checks every entry before the handler runs.
   - An identity-established Web Bot Auth signer (no `PrincipalID`) never provisions accounts.
   - A missing grant is `PERMISSION_DENIED` with `{scope: "agent", reason: "grant_absent"}`, or with no details when no identity is established.
+  - A chain takes one of three shapes:
+    - the brand grants the signer's operator, which is `account.operator`;
+    - a self-operated brand (it is `account.operator`) grants the signer's operator directly, for example the platform hosting its agent;
+    - the brand grants `account.operator`, which grants the signer's operator.
   - Before spend-committing calls, call `gate.RequireAccountForToolRequest(ctx, req, accountID)`. An operation outside media buying needs an explicit scope (`OperationClaim`).
   - `GrantEvaluator.LegacyAuthorization` (brand.json `authorized_operators`) runs only while the brand has never served a trust.json. `SellerAuthorization` is your discretion for uncovered claims and is disabled by `exclusive_grants`.
-- **Revocation.** `OriginRevocationChecker` retains every thumbprint-shaped revoked kid, at most 1024 per origin. It keeps `keyCompromise` and the earliest `invalidity_date`, and refuses older lists. After an origin is evicted, that holds only while the origin stays in the history. The default in-memory history is bounded, with per-operator quotas, and an attacker with many registrable domains can flush it. **Public deployments should supply a durable `RevocationHistory`.** At capacity it evicts the least recently used origin rather than refusing new ones. `RevocationDetails.Exposes(receivedAt)` tells you which accepted buys came from suspect requests; never unwind them automatically.
+- **Revocation.** A revocation list that cannot be read fails spend-committing calls with `SERVICE_UNAVAILABLE`, and other calls proceed with `VerifiedSigner.RevocationUnknown` set. Standalone `VerifyWebBotAuthRequest` fails closed unless `RevocationOutageAllowed` is set. `OriginRevocationChecker` retains every thumbprint-shaped revoked kid, at most 1024 per origin. It keeps `keyCompromise` and the earliest `invalidity_date`, and refuses older lists. After an origin is evicted, that holds only while the origin stays in the history. The default in-memory history is bounded, with per-operator quotas, and an attacker with many registrable domains can flush it. **Public deployments should supply a durable `RevocationHistory`.** At capacity it evicts the least recently used origin rather than refusing new ones. `RevocationDetails.Exposes(receivedAt)` tells you which accepted buys came from suspect requests; never unwind them automatically.
 - **Advertising.** Advertise the profile with `identity.RequestSigningCapabilities{Profiles: []string{signing.ProfileTagRequestSigning, signing.ProfileTagWebBotAuth}}`, and advertise onboarding with `identity.AccountCapabilities.AgentOnboarding` (list `account.agent_onboarding` in `experimental_features`).
 
 ## Deprecation

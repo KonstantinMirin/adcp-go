@@ -97,8 +97,10 @@ type GrantHook func(ctx context.Context, req GrantRequest) (bool, error)
 //   - authority is implicit when the account operator, the brand, and the
 //     signer's operator share a registrable domain;
 //   - otherwise a chain must reach the signer's operator with the account
-//     operator on it: the brand grants the signer's operator directly (when
-//     it is the account operator), or the brand grants the account
+//     operator on it, in one of three shapes: the brand grants the signer's
+//     operator, which is the account operator; the brand is the account
+//     operator and grants the signer's operator (a self-operated brand
+//     whose agent a platform hosts); or the brand grants the account
 //     operator, whose own record grants the signer's operator. There is no
 //     third link;
 //   - every link must cover the claim's scope, brand, countries, agent
@@ -217,7 +219,12 @@ func (g *GrantEvaluator) Check(ctx context.Context, req GrantRequest) (GrantAuth
 	var links [][]TrustGrant
 	switch {
 	case accountOp == signerOp:
+		// The brand grants the signer's operator, which is account.operator.
 		links = [][]TrustGrant{first}
+	case accountOp == brandOp:
+		// A self-operated brand (it is account.operator) grants the signer's
+		// operator directly, for example the platform hosting its agent.
+		links = [][]TrustGrant{match(brandRec.Record.Grants, signerOp, g.now())}
 	case len(first) > 0:
 		intermediary, err := g.Records.Evaluate(ctx, accountOp, "")
 		if err != nil {

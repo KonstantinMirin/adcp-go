@@ -228,4 +228,10 @@ type VerifiedSigner struct {
 	// an identity-established signer (verified, not bound), which carries
 	// no authority beyond an anonymous caller's.
 	PrincipalID string
+
+	// RevocationUnknown is set on a Web Bot Auth signer whose origin
+	// revocation list could not be read, when the verifier allowed that
+	// (WBAVerifyOptions.RevocationOutageAllowed). Such a signer must not
+	// make spend-committing calls; Middleware enforces that.
+	RevocationUnknown bool
 }

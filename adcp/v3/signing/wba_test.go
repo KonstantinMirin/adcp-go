@@ -273,9 +273,9 @@ func TestWBARejections(t *testing.T) {
 			jwk, _ := PublicDirectoryKey(rig.key)
 			rig.revs.set(t, revocationPayload{Updated: rfc3339(wbaTestNow.Add(-time.Minute)), NextUpdate: rfc3339(wbaTestNow.Add(10 * time.Minute)), RevokedKids: []string{jwk.Kid}})
 		}, http.StatusForbidden, true},
-		{"revocation list unavailable fails closed", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
+		{"revocation list unavailable fails closed (an outage, not a signature failure)", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
 			rig.revs.fetchErr = errors.New("connection refused")
-		}, http.StatusForbidden, false},
+		}, http.StatusServiceUnavailable, true},
 		{"directory discovery fails", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
 			rig.dirs.fail(rig.origin, errors.New("timeout"))
 		}, http.StatusForbidden, false},

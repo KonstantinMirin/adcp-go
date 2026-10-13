@@ -362,14 +362,45 @@ func TestBindingsAndGate(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, got, "an unbound origin is identity-established")
 
-	// Delisting removes authority on refresh but keeps the binding, which
-	// still blocks an RFC 9421 downgrade.
-	r.server.set(trustURL("example.com"), 200, `{"agents":[{"url":"https://other.example.com","roles":["adcp:buying"]}]}`)
+	// An unreachable record is not a delisting: spend-committing calls fail
+	// with the retryable SERVICE_UNAVAILABLE, other calls continue under
+	// the binding.
+	r.server.fail(trustURL("example.com"), errors.New("connection refused"))
 	r.now = r.now.Add(2 * time.Minute)
 	_, err = gate.AuthorizeWBA(ctx, signer, "create_media_buy")
-	require.Error(t, err)
+	we := signing.AsWBAError(err)
+	require.NotNil(t, we)
+	require.True(t, we.Authorization)
+	require.Equal(t, signing.CodeServiceUnavailable, we.Code)
+	got, err = gate.AuthorizeWBA(ctx, signer, "get_media_buys")
+	require.NoError(t, err)
+	require.Equal(t, "p1", got, "non-spend calls continue under the binding")
+
+	// Delisting ends the binding's authority: the origin falls back to
+	// identity-established, for spend and other calls alike, not to
+	// deny-everything. The binding is kept, so it still blocks an RFC 9421
+	// downgrade, and it cannot be bound again while unlisted.
+	r.server.set(trustURL("example.com"), 200, `{"agents":[{"url":"https://other.example.com","roles":["adcp:buying"]}]}`)
+	r.now = r.now.Add(2 * time.Minute)
+	for _, op := range []string{"create_media_buy", "get_principal"} {
+		got, err = gate.AuthorizeWBA(ctx, signer, op)
+		require.NoError(t, err, op)
+		require.Empty(t, got, op)
+	}
 	_, still, _ := b.PrincipalForOrigin(ctx, "https://buyer.example.com")
 	require.True(t, still)
+	_, err = r.eval.Bind(ctx, signer, "p1", b, BindOptions{})
+	require.Error(t, err, "open onboarding cannot bind an unlisted origin again")
+
+	// A published record that disappears before any 200 is absence: also
+	// not listed.
+	r2 := newEvalRig(t)
+	b2 := NewOriginBindings()
+	require.NoError(t, b2.Bind(ctx, "https://agent.absent-7k3q.com", "p9", BindOptions{}))
+	got, err = (&BindingGate{Bindings: b2, Records: r2.eval}).AuthorizeWBA(ctx,
+		&signing.VerifiedSigner{AgentURL: "https://agent.absent-7k3q.com", Profile: signing.ProfileTagWebBotAuth}, "create_media_buy")
+	require.NoError(t, err)
+	require.Empty(t, got)
 
 	// Binding is explicit and needs the trust record listing.
 	r.server.set(trustURL("example.com"), 200, `{"agents":[{"url":"https://new.example.com","roles":["adcp:buying"]},{"url":"https://sales.example.com","roles":["adcp:sales"]}]}`)

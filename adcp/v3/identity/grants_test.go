@@ -117,6 +117,18 @@ func TestGrantEvaluation(t *testing.T) {
 			reason:  GrantReasonAbsent,
 		},
 		{
+			name:    "a self-operated brand (brand is account.operator) grants the hosting platform directly",
+			records: with(baseRecords, map[string]string{"brand-7k3q.com": `{"grants":[{"grantee":"platform-7k3q.com","scopes":["adcp:media_buying"],"agents":[{"url":"https://agent.platform-7k3q.com/mcp"}]}]}`}),
+			req:     GrantRequest{AgentOrigin: platformAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "brand-7k3q.com"},
+			want:    true,
+		},
+		{
+			name:    "a self-operated brand's grant to someone else does not cover the platform",
+			records: with(baseRecords, map[string]string{"brand-7k3q.com": `{"grants":[{"grantee":"agency-7k3q.com","scopes":["adcp:media_buying"]}]}`}),
+			req:     GrantRequest{AgentOrigin: platformAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "brand-7k3q.com"},
+			reason:  GrantReasonAbsent,
+		},
+		{
 			name: "chain through account.operator to the hosting platform",
 			records: with(baseRecords, map[string]string{
 				"brand-7k3q.com":  brandGrantsAgency,

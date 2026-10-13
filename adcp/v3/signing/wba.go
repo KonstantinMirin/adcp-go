@@ -60,11 +60,12 @@ const (
 // status the profile defines: 400 when the signature fields do not parse,
 // 403 when a signature or a profile check fails, 429 for capacity.
 //
-// Authorization is set for an identity that verified but has no authority
-// here (a revoked key, an unbound identity, a bound origin whose operator no
-// longer lists it). Such a failure is answered with an AdCP authorization
-// error and no Accept-Signature, so the signer does not keep retrying with
-// the same key.
+// Authorization is set once identity is established (the signature
+// verified). Every such outcome is answered with the standard AdCP error
+// envelope, never 403 with Accept-Signature, which would tell a correctly
+// signing agent to sign again. Code is the AdCP error code
+// (PERMISSION_DENIED when empty, or SERVICE_UNAVAILABLE for a retryable
+// outage on a spend-committing call).
 //
 // Reason is for server-side logs only and must never be sent to the caller.
 type WBAError struct {
@@ -72,6 +73,7 @@ type WBAError struct {
 	Reason        string
 	Label         string
 	Authorization bool
+	Code          string
 	Wrapped       error
 
 	// labels are the request's web-bot-auth labels in order, used to build
@@ -99,7 +101,44 @@ func wbaFail(status int, label, reason string) *WBAError {
 }
 
 func wbaDeny(reason string) *WBAError {
-	return &WBAError{Status: http.StatusForbidden, Reason: reason, Authorization: true}
+	return &WBAError{Status: http.StatusForbidden, Reason: reason, Authorization: true, Code: CodePermissionDenied}
+}
+
+// AdCP error codes used for authorization outcomes after identity is
+// established.
+const (
+	CodePermissionDenied   = "PERMISSION_DENIED"
+	CodeServiceUnavailable = "SERVICE_UNAVAILABLE"
+)
+
+// NewAuthorizationError returns the error a WBAAuthorizer returns for an
+// established identity: code is an AdCP error code. PERMISSION_DENIED is
+// answered with HTTP 403 and SERVICE_UNAVAILABLE (retryable) with 503, both
+// in the AdCP error envelope and without Accept-Signature. reason is for
+// logs only.
+func NewAuthorizationError(code, reason string, wrapped error) *WBAError {
+	status := http.StatusForbidden
+	if code == CodeServiceUnavailable {
+		status = http.StatusServiceUnavailable
+	}
+	return &WBAError{Status: status, Reason: reason, Authorization: true, Code: code, Wrapped: wrapped}
+}
+
+// spendCommittingOperations commit spend (security.mdx's spend-committing
+// row), plus the 3.2 buy and proposal-acceptance tools.
+var spendCommittingOperations = map[string]struct{}{
+	"create_media_buy": {}, "update_media_buy": {}, "buy_products": {}, "accept_proposal": {}, "activate_signal": {},
+}
+
+// IsSpendCommittingOperation reports whether op commits spend: the
+// operations a trust-record or revocation outage fails closed for. It
+// covers create_media_buy, update_media_buy, buy_products, accept_proposal,
+// activate_signal, and every acquire_* operation.
+func IsSpendCommittingOperation(op string) bool {
+	if _, ok := spendCommittingOperations[op]; ok {
+		return true
+	}
+	return strings.HasPrefix(op, "acquire_")
 }
 
 // ResponseHeader returns the headers to send with the failure: for a 403
@@ -215,6 +254,13 @@ type WBAVerifyOptions struct {
 
 	// Revocation checks each verified key against its origin's list.
 	Revocation WBARevocationChecker
+
+	// RevocationOutageAllowed, when set, returns a signer whose revocation
+	// status could not be read with RevocationUnknown set, instead of
+	// failing with SERVICE_UNAVAILABLE. The caller must then fail closed for
+	// spend-committing operations (IsSpendCommittingOperation), as
+	// Middleware does. A revoked key always fails.
+	RevocationOutageAllowed bool
 
 	// Replay records each signature's nonce per identity. The identity, not
 	// the key, scopes the nonce, so key rotation does not reopen a replay.
@@ -424,15 +470,20 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*Verifie
 		if len(body) > 0 && !wbaDigestMatches(r.Header.Get(contentDigestHeader), body) {
 			return nil, labels, wbaFail(http.StatusForbidden, label, "request digest mismatch")
 		}
+		// The signature verified. A revocation status that cannot be read is
+		// an outage, not a signature failure: never 403 with
+		// Accept-Signature. It fails closed (SERVICE_UNAVAILABLE) unless the
+		// caller takes responsibility for failing closed only on spend.
+		revocationUnknown := false
 		revoked, err := opts.Revocation.RevokedWBAKey(r.Context(), origin, keyID)
 		if err != nil {
-			if we := AsWBAError(err); we != nil {
-				if we.Label == "" {
-					we.Label = label
-				}
+			if we := AsWBAError(err); we != nil && we.Authorization {
 				return nil, labels, we
 			}
-			return nil, labels, &WBAError{Status: http.StatusForbidden, Label: label, Reason: "origin revocation status unavailable", Wrapped: err}
+			if !opts.RevocationOutageAllowed {
+				return nil, labels, NewAuthorizationError(CodeServiceUnavailable, "origin revocation status unavailable", err)
+			}
+			revocationUnknown = true
 		}
 		if revoked {
 			return nil, labels, wbaDeny("signing key revoked")
@@ -453,6 +504,7 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*Verifie
 				Label:             label,
 				CoveredComponents: names,
 				Profile:           ProfileTagWebBotAuth,
+				RevocationUnknown: revocationUnknown,
 			},
 			nonce: nonce,
 			ttl:   ttl,
