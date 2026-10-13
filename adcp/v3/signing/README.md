@@ -6,6 +6,8 @@ Optional in AdCP 3.0 and capability-advertised via `request_signing` on `get_adc
 
 Spec: [Signed Requests (Transport Layer)](https://adcontextprotocol.org/docs/building/implementation/security#signed-requests-transport-layer). Rolling out from unsigned to signed, or rotating keys: see [MIGRATION.md](./MIGRATION.md).
 
+> **AdCP 3.3: two signing profiles.** The AdCP RFC 9421 profile (`adcp/request-signing/v1`, keys through brand.json) is **deprecated in AdCP 3.3**. It keeps working through 3.x and is removed in 4.0. The **Web Bot Auth profile** (`web-bot-auth`) is experimental in 3.3 and opt-in here: see [Web Bot Auth](#web-bot-auth-experimental-adcp-33) below and the [agent identity migration guide](../../../docs/agent-identity-3-3-migration.md). `Middleware` logs the deprecation once per process unless `WebBotAuth` is configured.
+
 ## Conformance
 
 The package is validated against the spec's [conformance vectors](https://adcontextprotocol.org/compliance/latest/test-vectors/request-signing/):
@@ -154,6 +156,49 @@ The verifier implements all 14 checks (13 numbered + 9a) of the [verifier checkl
 11. `content-digest` recompute + compare (if covered)
 12. replay dedup on `(keyid, nonce)`
 13. insert into replay cache only after every prior step passed
+
+## Web Bot Auth (experimental, AdCP 3.3)
+
+The [Web Bot Auth profile](https://adcontextprotocol.org/docs/building/by-layer/L1/wba-profile) identifies a signer by its origin. The signer names the origin in a covered `Signature-Agent` member. The verifier fetches the origin's signed key directory at `/.well-known/http-message-signatures-directory` and looks keys up by `(origin, RFC 7638 thumbprint)`. There is no capabilities call and no keyid-to-agent map. Everything here is opt-in, and the default signer never emits or covers `Signature-Agent`.
+
+Buyer side:
+
+```go
+signer, _ := signing.NewSigner(signing.SignerOptions{
+    PrivateKey:  priv,                         // KeyID is derived: the key's thumbprint
+    AgentOrigin: "https://buyer.example.com", // selects Web Bot Auth
+})
+// Publish the key directory on that origin, re-signed before it expires:
+pub, _ := signing.NewDirectoryPublisher(signing.DirectoryPublisherOptions{
+    AgentOrigin: "https://buyer.example.com", PrivateKeys: []any{priv},
+})
+mux.Handle(signing.DirectoryPath, pub)
+```
+
+`NewSignedHTTPClient` takes `AgentOrigin` too. With a `CapabilityProvider` it also needs a `ProfilesProvider`, and it refuses to send (`ErrWebBotAuthNotAdvertised`) unless the seller lists `web-bot-auth` in `request_signing.profiles`. It never falls back to RFC 9421 on its own. `go run github.com/adcontextprotocol/adcp-go/adcp/v3/cmd/adcp-wba-directory` writes a signed directory for static hosting.
+
+Seller side:
+
+```go
+keys := signing.NewDirectoryResolver(signing.DirectoryResolverOptions{})
+revocations, _ := signing.NewOriginRevocationChecker(signing.OriginRevocationCheckerOptions{Keys: keys})
+mw := signing.Middleware(signing.MiddlewareOptions{
+    Resolver: rfc9421Resolver, // the RFC 9421 profile keeps working
+    WebBotAuth: &signing.WebBotAuthOptions{
+        Keys:       keys,
+        Revocation: revocations,
+        Authorizer: &identity.BindingGate{Bindings: bindings, Records: trustRecords},
+    },
+    BoundOrigins: bindings, // no downgrade to RFC 9421 for a bound origin
+})
+```
+
+- **Profile selection.** A request carrying `Signature-Agent` or a `web-bot-auth` tag is verified under Web Bot Auth only, even under `ObserveOnly`. An uncovered `Signature-Agent` member is never attributed.
+- **Verification.** Every `web-bot-auth` signature must verify. A relay must cover the earlier signatures' members and components. Nonces are scoped to the identity, `tag`, `created`/`expires` (300 s, 60 s skew), and digest coverage on a body are enforced, and each key is checked against the origin's signed revocation list.
+- **Errors.** Failures use the profile's statuses, not `request_signature_*` codes: `400` when a field does not parse, `403` with `Accept-Signature`, and `429`. A revoked key or an identity without authority gets a generic `PERMISSION_DENIED` with no `Accept-Signature`.
+- **Authority.** A verified origin with no binding is *identity-established*. It may call only `WebBotAuthOptions.UnboundFor`, which defaults to `get_adcp_capabilities` and `get_principal`. Bindings and trust-record evaluation live in the [`identity`](../identity) package. This package never reads a trust record, and a test enforces that it does not import `identity`.
+
+`VerifyWebBotAuthRequest` is the standalone verifier. `VerifiedSigner.Profile`, `PrincipalID`, and `CoveredComponents` report what verified. The draft vectors under `testdata/wba-profile/` (adcontextprotocol/adcp#7894) all pass, and the signer reproduces their signatures byte for byte.
 
 ## JWKS resolution
 

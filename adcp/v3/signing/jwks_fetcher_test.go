@@ -78,3 +78,23 @@ func TestHTTPJWKSResolverFetchesFromLocalServer(t *testing.T) {
 	require.NotNil(t, e)
 	assert.Equal(t, CodeKeyUnknown, e.Code)
 }
+
+// TestHTTPJWKSResolverIsDeterministic: a kid published by two agents
+// resolves to the same agent on every call (sorted agent-URL order).
+func TestHTTPJWKSResolverIsDeterministic(t *testing.T) {
+	h := NewHTTPJWKSResolver(map[string]string{
+		"https://b.example.com/mcp": "https://b.example.com/jwks.json",
+		"https://a.example.com/mcp": "https://a.example.com/jwks.json",
+		"https://c.example.com/mcp": "https://c.example.com/jwks.json",
+	})
+	shared := &JWKS{Keys: []JWK{{Kid: "dup", Kty: "OKP", Crv: "Ed25519", X: "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}}}
+	for _, u := range h.Agents {
+		h.cache[u] = &jwksCacheEntry{jwks: shared, at: time.Now()}
+	}
+	for range 50 {
+		_, agent, err := h.Resolve(context.Background(), "dup")
+		if err != nil || agent != "https://a.example.com/mcp" {
+			t.Fatalf("got %q, %v", agent, err)
+		}
+	}
+}

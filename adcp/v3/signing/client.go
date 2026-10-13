@@ -68,7 +68,25 @@ type SignedHTTPClientOptions struct {
 	// (the http stdlib default). Most production callers should set one —
 	// 30s is a reasonable default for AdCP RPC.
 	Timeout time.Duration
+
+	// AgentOrigin opts the client into the experimental AdCP 3.3 Web Bot
+	// Auth profile (see SignerOptions.AgentOrigin). KeyID may be empty; it
+	// is derived from the key. Leave empty for RFC 9421 signing.
+	AgentOrigin string
+
+	// ProfilesProvider returns the seller's request_signing.profiles for a
+	// request. It applies only with AgentOrigin and CapabilityProvider set:
+	// a request the capability says to sign is sent only when the seller
+	// lists "web-bot-auth"; otherwise RoundTrip fails with
+	// ErrWebBotAuthNotAdvertised instead of downgrading. Omitted profiles
+	// mean the RFC 9421 profile only, so a nil provider also fails.
+	ProfilesProvider func(*http.Request) []string
 }
+
+// ErrWebBotAuthNotAdvertised is returned by a Web Bot Auth signing client
+// when the seller does not list "web-bot-auth" in request_signing.profiles.
+// The client never falls back to the RFC 9421 profile on its own.
+var ErrWebBotAuthNotAdvertised = errors.New("signing: seller does not advertise the web-bot-auth request-signing profile")
 
 // PathSuffixOperationResolver derives the AdCP operation name from the last
 // segment of the request path (`/adcp/<op>` convention) — the same shape as
@@ -108,7 +126,7 @@ func PathSuffixOperationResolver(r *http.Request) string {
 // For lower-level integration (you already have an http.Client and just want
 // the always-sign signing transport), see (*Signer).RoundTripper.
 func NewSignedHTTPClient(opts SignedHTTPClientOptions) (*http.Client, error) {
-	if opts.KeyID == "" {
+	if opts.KeyID == "" && opts.AgentOrigin == "" {
 		return nil, errors.New("signing.NewSignedHTTPClient: KeyID is required")
 	}
 	if opts.PrivateKey == nil {
@@ -120,6 +138,7 @@ func NewSignedHTTPClient(opts SignedHTTPClientOptions) (*http.Client, error) {
 		Profile:        opts.Profile,
 		Clock:          opts.Clock,
 		ValidityWindow: opts.ValidityWindow,
+		AgentOrigin:    opts.AgentOrigin,
 	}
 	if opts.NonceReader != nil {
 		signerOpts.NonceReader = opts.NonceReader
@@ -148,6 +167,7 @@ func NewSignedHTTPClient(opts SignedHTTPClientOptions) (*http.Client, error) {
 			capabilityProvider:   opts.CapabilityProvider,
 			operationResolver:    opResolver,
 			fallbackCoverContent: opts.CoverContentDigest,
+			profilesProvider:     opts.ProfilesProvider,
 		}
 	}
 
@@ -175,6 +195,7 @@ type capabilityAwareSigningTransport struct {
 	capabilityProvider   CapabilityProvider
 	operationResolver    func(*http.Request) string
 	fallbackCoverContent bool
+	profilesProvider     func(*http.Request) []string
 }
 
 func (t *capabilityAwareSigningTransport) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -197,6 +218,16 @@ func (t *capabilityAwareSigningTransport) RoundTrip(r *http.Request) (*http.Resp
 	op := t.operationResolver(cloned)
 	if !shouldSignByCapability(capability, op) && !shouldSignProtocolMethodByCapability(capability, protocolMethodFromJSONRPC(body)) {
 		return t.inner.RoundTrip(cloned)
+	}
+
+	if t.signer.SigningProfile() == ProfileTagWebBotAuth {
+		var profiles []string
+		if t.profilesProvider != nil {
+			profiles = t.profilesProvider(cloned)
+		}
+		if !slices.Contains(profiles, ProfileTagWebBotAuth) {
+			return nil, ErrWebBotAuthNotAdvertised
+		}
 	}
 
 	cover := t.fallbackCoverContent

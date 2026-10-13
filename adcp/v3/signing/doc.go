@@ -17,6 +17,19 @@
 //
 // Reference: https://adcontextprotocol.org/docs/building/implementation/security#signed-requests-transport-layer
 //
+// # AdCP 3.3: the RFC 9421 profile is deprecated
+//
+// AdCP 3.3 deprecates the RFC 9421 profile. It remains fully supported
+// through 3.x and is removed in 4.0. JWS document signing stays on the
+// RFC 9421 chain until 3.4. The experimental Web Bot Auth profile is opt-in:
+// SignerOptions.AgentOrigin on the signer, and MiddlewareOptions.WebBotAuth
+// (or VerifyWebBotAuthRequest) on the verifier. Under it, identity is the
+// signer's canonical origin and keys come from that origin's key directory
+// (DirectoryResolver). Verification grants no authority by itself; see the
+// identity package for bindings, trust records, and grants. The existing
+// RFC 9421 APIs are not marked Deprecated in the Go sense, so that builds
+// with staticcheck keep passing while 3.x still requires them.
+//
 // # Signer
 //
 //	priv, _, _ := signing.LoadPrivateKey(pemBytes)

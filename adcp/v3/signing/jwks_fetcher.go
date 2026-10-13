@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 )
@@ -111,10 +112,20 @@ func (h *HTTPJWKSResolver) now() time.Time {
 	return time.Now()
 }
 
-// Resolve implements JWKSResolver.
+// Resolve implements JWKSResolver. Agents are consulted in sorted agent-URL
+// order, so a kid published by more than one agent resolves the same way on
+// every call. A kid should be unique across agents; the Web Bot Auth
+// profile's DirectoryResolver avoids the question by looking keys up by
+// (origin, kid).
 func (h *HTTPJWKSResolver) Resolve(ctx context.Context, keyid string) (*JWK, string, error) {
+	agents := make([]string, 0, len(h.Agents))
+	for agentURL := range h.Agents {
+		agents = append(agents, agentURL)
+	}
+	slices.Sort(agents)
 	// First pass: look in cache.
-	for agentURL, jwksURL := range h.Agents {
+	for _, agentURL := range agents {
+		jwksURL := h.Agents[agentURL]
 		jwk, err := h.lookupInCache(jwksURL, keyid)
 		if err != nil {
 			return nil, "", err
@@ -125,7 +136,8 @@ func (h *HTTPJWKSResolver) Resolve(ctx context.Context, keyid string) (*JWK, str
 	}
 	// Kid miss — refetch each (subject to cooldown).
 	var lastFetchErr error
-	for agentURL, jwksURL := range h.Agents {
+	for _, agentURL := range agents {
+		jwksURL := h.Agents[agentURL]
 		if !h.canRefetch(jwksURL) {
 			continue
 		}
@@ -175,11 +187,13 @@ func (h *HTTPJWKSResolver) canRefetch(jwksURL string) bool {
 }
 
 func (h *HTTPJWKSResolver) refetch(ctx context.Context, jwksURL string) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", jwksURL, nil)
+	// jwksURL comes from the operator-configured Agents map, and the default
+	// client's dialer rejects private and loopback addresses.
+	req, err := http.NewRequestWithContext(ctx, "GET", jwksURL, nil) // #nosec G704 -- operator-configured jwks_uri
 	if err != nil {
 		return wrapError(CodeJWKSUnavailable, "build request", err)
 	}
-	resp, err := h.HTTPClient.Do(req)
+	resp, err := h.HTTPClient.Do(req) // #nosec G704 -- operator-configured jwks_uri, SSRF-checked dial
 	if err != nil {
 		// net.OpError with .Op=="dial" on SSRF denial translates to CodeJWKSUntrusted.
 		if errors.Is(err, errSSRFBlocked) {
