@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"io"
+	"maps"
 	"math/big"
 	"net/http"
 	"slices"
@@ -209,6 +210,13 @@ func VerifyRequestSignature(r *http.Request, opts VerifyOptions) (*VerifiedSigne
 	dedupNonce := string(nBytes)
 
 	// Step 6: components.
+	//
+	// The profile fixes a minimum covered set, not an exact one: RFC 9421
+	// lets a signer cover any other HTTP field. A component identifier may
+	// appear only once (RFC 9421 §2.5).
+	if err := rejectDuplicateComponents(parsed.components, profile); err != nil {
+		return nil, err
+	}
 	hasMethod := slices.Contains(parsed.components, componentMethod)
 	hasTargetURI := slices.Contains(parsed.components, componentTargetURI)
 	hasAuthority := slices.Contains(parsed.components, componentAuthority)
@@ -237,6 +245,13 @@ func VerifyRequestSignature(r *http.Request, opts VerifyOptions) (*VerifiedSigne
 		if hasContentDigest {
 			return nil, newError(CodeComponentsUnexpected, "policy forbids content-digest coverage")
 		}
+	}
+	// Every other covered component must be an HTTP field present on this
+	// request. Its value is bound into the signature base like any other
+	// component; the verifier attaches no further meaning to it.
+	additional, err := additionalComponentValues(r, parsed.components)
+	if err != nil {
+		return nil, err
 	}
 
 	// Step 7: JWK resolution.
@@ -312,6 +327,7 @@ func VerifyRequestSignature(r *http.Request, opts VerifyOptions) (*VerifiedSigne
 	if hasContentDigest {
 		values[componentContentDigst] = r.Header.Get(contentDigestHeader)
 	}
+	maps.Copy(values, additional)
 	base, err := buildSignatureBase(parsed.components, values, parsed.paramsText)
 	if err != nil {
 		return nil, wrapError(CodeHeaderMalformed, "build signature base", err)
@@ -374,6 +390,8 @@ func VerifyRequestSignature(r *http.Request, opts VerifyOptions) (*VerifiedSigne
 		VerifiedAt: time.Unix(nowT, 0).UTC(),
 		Algorithm:  alg,
 		Label:      parsed.label,
+
+		CoveredComponents: slices.Clone(parsed.components),
 	}, nil
 }
 

@@ -138,7 +138,7 @@ func parseComponentList(inside string) ([]string, error) {
 	var comps []string
 	i := 0
 	for i < len(inside) {
-		if len(comps) > maxCoveredComponents {
+		if len(comps) >= maxCoveredComponents {
 			return nil, newError(CodeHeaderMalformed, "too many covered components")
 		}
 		// Skip whitespace.

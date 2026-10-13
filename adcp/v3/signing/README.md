@@ -145,7 +145,7 @@ The verifier implements all 14 checks (13 numbered + 9a) of the [verifier checkl
 3. `tag` == `adcp/request-signing/v1`
 4. `alg` ∈ {`ed25519`, `ecdsa-p256-sha256`}
 5. window (`expires > created`, ±60s skew, ≤ 300s max)
-6. covered components (`@method`, `@target-uri`, `@authority`; `content-type` if body; `content-digest` per policy)
+6. covered components (`@method`, `@target-uri`, `@authority`; `content-type` if body; `content-digest` per policy). These are a minimum: a signer may also cover other HTTP fields. Each extra field must be present on the request; its value (every field line, trimmed and joined with `", "` per RFC 9421 §2.1) is bound into the signature like any other component. A header is authenticated only if it appears in `VerifiedSigner.CoveredComponents`. Duplicate components, derived components outside the profile (`@path`, `@query`, ...), and component parameters (including the Web Bot Auth `"signature-agent";key=...` member form, which this RFC 9421 verifier does not handle) are rejected. The `Signer` never covers extra fields.
 7. `keyid` resolves to a JWK via the configured `JWKSResolver`
 8. JWK purpose (`use=sig`, `key_ops` contains `verify`, `adcp_use=request-signing`)
 9. revocation (before crypto)
