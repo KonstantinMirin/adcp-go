@@ -20,9 +20,14 @@ type DirectoryFetcher func(ctx context.Context, url string) (*DirectoryResponse,
 type DirectoryResolverOptions struct {
 	// Fetch defaults to an SSRF-safe HTTPS fetch.
 	Fetch DirectoryFetcher
-	// MaxOrigins bounds cached origins and concurrent discoveries.
-	// Defaults to 256.
+	// MaxOrigins bounds cached origins, cooldown entries, and concurrent
+	// discoveries. Defaults to 256.
 	MaxOrigins int
+	// MaxPendingPerOperator bounds concurrent discoveries for origins of
+	// one registrable domain, so one operator (for example with wildcard
+	// DNS and a stalling server) cannot hold every discovery slot. Defaults
+	// to 8.
+	MaxPendingPerOperator int
 	// Clock defaults to time.Now.
 	Clock func() time.Time
 }
@@ -41,23 +46,24 @@ type DirectoryResolverOptions struct {
 // one origin share a single fetch, and one slow origin does not block
 // another.
 type DirectoryResolver struct {
-	fetch      DirectoryFetcher
-	maxOrigins int
-	clock      func() time.Time
+	fetch          DirectoryFetcher
+	maxOrigins     int
+	maxPerOperator int
+	clock          func() time.Time
 
-	mu      sync.Mutex
-	cache   map[string]*directoryEntry
-	lru     *list.List // front = most recently used origin
-	pending map[string]*directoryCall
+	mu       sync.Mutex
+	cache    map[string]*directoryEntry // verified directories only
+	lru      *list.List                 // front = most recently used origin
+	failures map[string]time.Time       // discovery cooldowns, kept apart so failures never evict successes
+	pending  map[string]*directoryCall
 }
 
 type directoryEntry struct {
-	origin     string
-	resp       *DirectoryResponse
-	keys       map[string]JWK
-	expires    time.Time
-	retryAfter time.Time
-	elem       *list.Element
+	origin  string
+	resp    *DirectoryResponse
+	keys    map[string]JWK
+	expires time.Time
+	elem    *list.Element
 }
 
 type directoryCall struct {
@@ -75,15 +81,20 @@ const (
 // NewDirectoryResolver returns a DirectoryResolver.
 func NewDirectoryResolver(opts DirectoryResolverOptions) *DirectoryResolver {
 	d := &DirectoryResolver{
-		fetch:      opts.Fetch,
-		maxOrigins: opts.MaxOrigins,
-		clock:      opts.Clock,
-		cache:      map[string]*directoryEntry{},
-		lru:        list.New(),
-		pending:    map[string]*directoryCall{},
+		fetch:          opts.Fetch,
+		maxOrigins:     opts.MaxOrigins,
+		maxPerOperator: opts.MaxPendingPerOperator,
+		clock:          opts.Clock,
+		cache:          map[string]*directoryEntry{},
+		lru:            list.New(),
+		failures:       map[string]time.Time{},
+		pending:        map[string]*directoryCall{},
 	}
 	if d.maxOrigins <= 0 {
 		d.maxOrigins = 256
+	}
+	if d.maxPerOperator <= 0 {
+		d.maxPerOperator = 8
 	}
 	if d.clock == nil {
 		d.clock = time.Now
@@ -110,7 +121,7 @@ func (d *DirectoryResolver) ResolveWBAKey(ctx context.Context, origin, keyID str
 	d.mu.Lock()
 	now := d.clock()
 	e := d.cache[origin]
-	if e != nil && e.resp != nil && now.Before(e.expires) {
+	if e != nil && now.Before(e.expires) {
 		d.lru.MoveToFront(e.elem)
 		jwk, ok := e.keys[keyID]
 		d.mu.Unlock()
@@ -119,8 +130,7 @@ func (d *DirectoryResolver) ResolveWBAKey(ctx context.Context, origin, keyID str
 		}
 		return &jwk, nil
 	}
-	if e != nil && now.Before(e.retryAfter) {
-		d.lru.MoveToFront(e.elem)
+	if until, ok := d.failures[origin]; ok && now.Before(until) {
 		d.mu.Unlock()
 		return nil, wbaFail(http.StatusForbidden, "", "key directory discovery is cooling down")
 	}
@@ -129,6 +139,17 @@ func (d *DirectoryResolver) ResolveWBAKey(ctx context.Context, origin, keyID str
 		if len(d.pending) >= d.maxOrigins {
 			d.mu.Unlock()
 			return nil, wbaFail(http.StatusTooManyRequests, "", "key directory discovery capacity exceeded")
+		}
+		op := operatorBucket(origin)
+		n := 0
+		for o := range d.pending {
+			if operatorBucket(o) == op {
+				n++
+			}
+		}
+		if n >= d.maxPerOperator {
+			d.mu.Unlock()
+			return nil, wbaFail(http.StatusTooManyRequests, "", "key directory discovery capacity exceeded for operator")
 		}
 		call = &directoryCall{done: make(chan struct{})}
 		d.pending[origin] = call
@@ -166,17 +187,29 @@ func (d *DirectoryResolver) refresh(ctx context.Context, origin string, call *di
 	delete(d.pending, origin)
 	now := d.clock()
 	if err != nil {
-		// Keep the previous signed snapshot as evidence. A failure never
-		// proves removal, and expired keys never authenticate.
-		e := d.cache[origin]
-		if e == nil {
-			e = &directoryEntry{origin: origin}
+		// A failure never proves removal and never evicts a verified
+		// directory; the previous signed snapshot stays as evidence, and
+		// expired keys never authenticate.
+		d.failures[origin] = now.Add(discoveryNegativeTTL)
+		if len(d.failures) > d.maxOrigins {
+			for o, until := range d.failures {
+				if !now.Before(until) {
+					delete(d.failures, o)
+				}
+			}
+			for o := range d.failures {
+				if len(d.failures) <= d.maxOrigins {
+					break
+				}
+				if o != origin {
+					delete(d.failures, o)
+				}
+			}
 		}
-		e.retryAfter = now.Add(discoveryNegativeTTL)
-		d.store(e)
 		call.err = &WBAError{Status: http.StatusForbidden, Reason: "key directory discovery failed", Wrapped: err}
 		return
 	}
+	delete(d.failures, origin)
 	expires := now.Add(directoryCacheTTL)
 	if exp, ok := directoryExpiry(resp); ok && exp.Before(expires) {
 		expires = exp

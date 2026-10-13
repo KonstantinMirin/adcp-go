@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -298,4 +299,46 @@ func TestDirectoryResolverBounds(t *testing.T) {
 
 	_, err = d.ResolveWBAKey(context.Background(), "http://a.example.com", "k")
 	requireWBAStatus(t, err, http.StatusForbidden)
+}
+
+// TestDirectoryResolverOperatorIsolation: one operator cannot hold every
+// discovery slot, and failed discoveries never evict verified directories.
+func TestDirectoryResolverOperatorIsolation(t *testing.T) {
+	dirs := newFakeDirectories()
+	release := make(chan struct{})
+	good := newEd25519(t)
+	dirs.publish(t, "https://good.example.org", wbaTestNow.Add(-time.Minute), time.Hour, good)
+	d := NewDirectoryResolver(DirectoryResolverOptions{Fetch: dirs.fetch, Clock: wbaClock, MaxOrigins: 4, MaxPendingPerOperator: 2})
+	goodJWK, _ := PublicDirectoryKey(good)
+	_, err := d.ResolveWBAKey(context.Background(), "https://good.example.org", goodJWK.Kid)
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	attackers := []string{"https://a1.attacker.example.com", "https://a2.attacker.example.com"}
+	dirs.mu.Lock()
+	for _, o := range attackers {
+		dirs.block[o] = release
+	}
+	dirs.mu.Unlock()
+	for _, o := range attackers {
+		wg.Add(1)
+		go func() { defer wg.Done(); _, _ = d.ResolveWBAKey(context.Background(), o, "k") }()
+	}
+	require.Eventually(t, func() bool {
+		return dirs.count("https://a1.attacker.example.com") == 1 && dirs.count("https://a2.attacker.example.com") == 1
+	}, time.Second, time.Millisecond)
+	_, err = d.ResolveWBAKey(context.Background(), "https://a3.attacker.example.com", "k")
+	requireWBAStatus(t, err, http.StatusTooManyRequests)
+	close(release)
+	wg.Wait()
+
+	// Many failed discoveries do not push the verified directory out.
+	for i := range 10 {
+		_, _ = d.ResolveWBAKey(context.Background(), fmt.Sprintf("https://f%d.example.net", i), "k")
+	}
+	require.NotNil(t, d.Evidence("https://good.example.org"))
+	got, err := d.ResolveWBAKey(context.Background(), "https://good.example.org", goodJWK.Kid)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Equal(t, 1, dirs.count("https://good.example.org"))
 }

@@ -19,6 +19,11 @@ func TestValidate(t *testing.T) {
 		{"duplicate nested key", `{"x":{"a":1,"a":1}}`, false},
 		{"duplicate after unescape", `{"a":1,"a":2}`, false},
 		{"duplicate in array element", `[{"k":1,"k":2}]`, false},
+		{"case-folded duplicate", `{"name":"a","Name":"b"}`, false},
+		{"nested case-folded duplicate", `{"params":{"name":"a","NAME":"b"}}`, false},
+		{"Kelvin sign folds to k", "{\"k\":1,\"\u212a\":2}", false},
+		{"long s folds to s", "{\"s\":1,\"\u017f\":2}", false},
+		{"distinct keys", `{"name":"a","names":"b"}`, true},
 		{"trailing value", `{"a":1} {"b":2}`, false},
 		{"not json", `{a:1}`, false},
 		{"empty", ``, false},
@@ -54,5 +59,14 @@ func TestUnmarshal(t *testing.T) {
 	}
 	if err := Unmarshal([]byte(`{"A":1,"A":2}`), 0, &v); err == nil {
 		t.Fatal("duplicate accepted")
+	}
+}
+
+func TestFoldMatchesEqualFold(t *testing.T) {
+	pairs := [][2]string{{"name", "NAME"}, {"k", "\u212a"}, {"s", "\u017f"}, {"straße", "STRASSE"}, {"Σ", "ς"}, {"a", "b"}}
+	for _, p := range pairs {
+		if (Fold(p[0]) == Fold(p[1])) != strings.EqualFold(p[0], p[1]) {
+			t.Errorf("Fold disagrees with EqualFold on %q %q", p[0], p[1])
+		}
 	}
 }

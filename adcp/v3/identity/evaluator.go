@@ -120,7 +120,8 @@ type TrustRecordEvaluator struct {
 	lru      *list.List
 	failures map[string]trustFailure
 	pending  map[string]*trustCall
-	seen200  map[string]struct{}
+	seen200  map[string]*list.Element // operators that have served a 200, LRU-bounded
+	seenLRU  *list.List
 
 	responses       map[string]cachedResponse
 	responsePending map[string]*responseCall
@@ -174,7 +175,8 @@ func NewTrustRecordEvaluator(opts TrustRecordEvaluatorOptions) (*TrustRecordEval
 		lru:             list.New(),
 		failures:        map[string]trustFailure{},
 		pending:         map[string]*trustCall{},
-		seen200:         map[string]struct{}{},
+		seen200:         map[string]*list.Element{},
+		seenLRU:         list.New(),
 		responses:       map[string]cachedResponse{},
 		responsePending: map[string]*responseCall{},
 		hostsInflight:   map[string]int{},
@@ -363,7 +365,7 @@ func (e *TrustRecordEvaluator) resolve(ctx context.Context, domain, recordURL st
 			return nil, trustErr(fmt.Sprintf("trust record unavailable (HTTP %d)", status), nil)
 		}
 		e.mu.Lock()
-		e.seen200[domain] = struct{}{}
+		e.markSeen200(domain)
 		e.mu.Unlock()
 		rec, err := ValidateTrustRecord(res.resp.Body, TrustRecordOptions{Mode: Reading, Owner: domain})
 		if err != nil {
@@ -378,6 +380,26 @@ func (e *TrustRecordEvaluator) resolve(ctx context.Context, domain, recordURL st
 		source = rec.AuthoritativeLocation
 	}
 	return nil, trustErr("trust record resolution failed", nil)
+}
+
+// seen200Limit bounds the operators remembered as having served a 200.
+// Evicting one re-allows the legacy fallback for it after a later 404, so
+// the bound is generous; deployments that need the guarantee across
+// restarts persist it themselves.
+const seen200Limit = 1 << 16
+
+// markSeen200 records that domain served a 200. Called with mu held.
+func (e *TrustRecordEvaluator) markSeen200(domain string) {
+	if el, ok := e.seen200[domain]; ok {
+		e.seenLRU.MoveToFront(el)
+		return
+	}
+	e.seen200[domain] = e.seenLRU.PushFront(domain)
+	for e.seenLRU.Len() > seen200Limit {
+		back := e.seenLRU.Back()
+		e.seenLRU.Remove(back)
+		delete(e.seen200, back.Value.(string))
+	}
 }
 
 // fetchResponse shares transport bytes per URL while each owner validates

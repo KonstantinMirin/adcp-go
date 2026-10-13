@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -254,17 +253,45 @@ func TestMiddlewareRFC9421Coexistence(t *testing.T) {
 }
 
 func TestMiddlewareLogsRFC9421Deprecation(t *testing.T) {
-	rfc9421DeprecationOnce = &sync.Once{}
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 	_ = Middleware(MiddlewareOptions{Logger: logger})
-	_ = Middleware(MiddlewareOptions{Logger: logger})
 	require.Equal(t, 1, strings.Count(buf.String(), "deprecated in AdCP 3.3"))
+	require.Contains(t, buf.String(), "level=INFO")
 	buf.Reset()
-	rfc9421DeprecationOnce = &sync.Once{}
 	rig := newWBARig(t)
 	_ = Middleware(MiddlewareOptions{Logger: logger, WebBotAuth: &WebBotAuthOptions{Keys: rig.resolver, Revocation: rig.checker}})
 	require.NotContains(t, buf.String(), "deprecated")
+}
+
+// TestMiddlewareUnboundGateReadsExactKeys: the operation the unbound gate
+// sees is the one the MCP SDK dispatches. A case-variant duplicate key
+// ("Name" beside "name") must not smuggle a tool past the gate.
+func TestMiddlewareUnboundGateReadsExactKeys(t *testing.T) {
+	for name, body := range map[string]string{
+		"name and Name":     `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_media_buy","arguments":{},"Name":"get_principal"}}`,
+		"Name only":         `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"Name":"get_principal","arguments":{}}}`,
+		"Method":            `{"jsonrpc":"2.0","id":1,"Method":"tools/call","params":{"name":"get_principal"}}`,
+		"method and Method": `{"jsonrpc":"2.0","id":1,"method":"tools/call","Method":"initialize","params":{"name":"create_media_buy"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			rig := newWBARig(t)
+			var c captured
+			h := Middleware(MiddlewareOptions{WebBotAuth: &WebBotAuthOptions{Keys: rig.resolver, Revocation: rig.checker, Clock: wbaClock}, Replay: rig.replay, Logger: discardLogger()})(captureHandler(&c))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, rig.signedRequest(t, body))
+			require.NotEqual(t, http.StatusOK, rec.Code)
+			require.False(t, c.called)
+		})
+	}
+	req := func(body string) *http.Request {
+		return httptest.NewRequest(http.MethodPost, "https://s.example.com/mcp", strings.NewReader(body))
+	}
+	require.Equal(t, "get_principal", jsonRPCOperation(req(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_principal"}}`)))
+	require.Equal(t, "tools/list", jsonRPCOperation(req(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)))
+	require.Empty(t, jsonRPCOperation(req(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"Name":"get_principal"}}`)))
+	require.Empty(t, jsonRPCOperation(req(`{"jsonrpc":"1.0","method":"tools/list"}`)))
+	require.Empty(t, jsonRPCOperation(req(`not json`)))
 }
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)) }

@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"maps"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/adcontextprotocol/adcp-go/adcp/v3/internal/strictjson"
+	"github.com/modelcontextprotocol/go-sdk/auth"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // contextKey is the private context key type used to attach VerifiedSigner
@@ -154,8 +158,12 @@ type MiddlewareOptions struct {
 	// verified under Web Bot Auth only and never falls back to the RFC 9421
 	// profile, including under ObserveOnly. Failures are answered with the
 	// profile's statuses (400, 403 with Accept-Signature, 429), not
-	// request_signature_* codes. When nil, the middleware behaves exactly as
-	// before, and logs that the RFC 9421 profile is deprecated in 3.3.
+	// request_signature_* codes. A non-empty Web Bot Auth signed body must be
+	// strict JSON (no duplicate or case-folded duplicate keys) or it is
+	// rejected with 400. With WebBotAuth set, the verified signer also
+	// reaches MCP tool handlers per request (VerifiedSignerFromToolRequest).
+	// When nil, the middleware behaves exactly as before, and logs at INFO
+	// that the RFC 9421 profile is deprecated in 3.3.
 	WebBotAuth *WebBotAuthOptions
 
 	// BoundOrigins enforces "no downgrade": once an origin is bound to a
@@ -185,10 +193,13 @@ type WebBotAuthOptions struct {
 	Authorizer WBAAuthorizer
 
 	// UnboundFor lists the operations (AdCP tool names or JSON-RPC methods)
-	// an identity-established signer may call: what an anonymous caller may
-	// call, plus get_principal. Defaults to get_adcp_capabilities and
-	// get_principal. Add sync_principal only when its handler implements an
-	// explicit open onboarding policy.
+	// an identity-established signer may call. The spec gives it what an
+	// anonymous caller gets, reads included, plus get_principal: set this to
+	// your anonymous permissions plus get_principal. Defaults to
+	// get_adcp_capabilities, get_principal, and the MCP session methods
+	// initialize, notifications/initialized, ping, and tools/list. Add
+	// sync_principal only when its handler implements an explicit open
+	// onboarding policy.
 	UnboundFor []string
 
 	// OnReject, if non-nil, writes the response for a Web Bot Auth failure.
@@ -197,6 +208,10 @@ type WebBotAuthOptions struct {
 
 	// Clock supplies the verifier's wall clock. Defaults to time.Now.
 	Clock func() time.Time
+
+	// Authorities lists the host[:port] values this endpoint serves; see
+	// WBAVerifyOptions.Authorities. Recommended.
+	Authorities []string
 }
 
 // WBAAuthorizer is the binding hook for verified Web Bot Auth origins. It
@@ -230,14 +245,14 @@ func VerifiedSignersFromContext(ctx context.Context) []*VerifiedSigner {
 	return nil
 }
 
-var rfc9421DeprecationOnce = &sync.Once{}
+// rfc9421Deprecation is logged by each Middleware built without WebBotAuth.
+const rfc9421Deprecation = "signing.Middleware: the AdCP RFC 9421 request-signing profile is deprecated in AdCP 3.3; " +
+	"it remains supported through 3.x and is removed in 4.0. Set MiddlewareOptions.WebBotAuth to also accept the Web Bot Auth profile."
 
-func logRFC9421Deprecation(logger *slog.Logger) {
-	rfc9421DeprecationOnce.Do(func() {
-		logger.Warn("signing.Middleware: the AdCP RFC 9421 request-signing profile is deprecated in AdCP 3.3; " +
-			"it remains supported through 3.x and is removed in 4.0. Set MiddlewareOptions.WebBotAuth to also accept the Web Bot Auth profile.")
-	})
-}
+// defaultUnboundFor is what an identity-established signer may call by
+// default: capability discovery, get_principal, and the MCP session
+// methods needed to reach them.
+var defaultUnboundFor = []string{"get_adcp_capabilities", "get_principal", "initialize", "notifications/initialized", "ping", "tools/list"}
 
 // Middleware returns an http.Handler middleware that verifies incoming AdCP
 // request signatures per the profile.
@@ -277,14 +292,15 @@ func Middleware(opts MiddlewareOptions) func(http.Handler) http.Handler {
 	}
 	wba := opts.WebBotAuth
 	if wba == nil {
-		logRFC9421Deprecation(logger)
+		logger.Info(rfc9421Deprecation)
 	}
-	unboundFor := map[string]struct{}{"get_adcp_capabilities": {}, "get_principal": {}}
+	unboundList := defaultUnboundFor
 	if wba != nil && wba.UnboundFor != nil {
-		unboundFor = map[string]struct{}{}
-		for _, op := range wba.UnboundFor {
-			unboundFor[op] = struct{}{}
-		}
+		unboundList = wba.UnboundFor
+	}
+	unboundFor := map[string]struct{}{}
+	for _, op := range unboundList {
+		unboundFor[op] = struct{}{}
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -373,6 +389,10 @@ func Middleware(opts MiddlewareOptions) func(http.Handler) http.Handler {
 			if signer != nil {
 				ctx := context.WithValue(r.Context(), contextKey{}, signer)
 				r = r.WithContext(ctx)
+				if wba != nil {
+					serveWithToolRequestSigner(w, r, next, signer)
+					return
+				}
 			}
 			next.ServeHTTP(w, r)
 		})
@@ -390,6 +410,7 @@ func serveWebBotAuth(w http.ResponseWriter, r *http.Request, next http.Handler, 
 		Scheme:       scheme,
 		MaxBodyBytes: maxBody,
 		Clock:        wba.Clock,
+		Authorities:  wba.Authorities,
 	})
 	if err == nil {
 		// The originating signer is the AdCP caller; relays are verified
@@ -415,7 +436,7 @@ func serveWebBotAuth(w http.ResponseWriter, r *http.Request, next http.Handler, 
 			caller.PrincipalID = principal
 			ctx := context.WithValue(r.Context(), contextKey{}, caller)
 			ctx = context.WithValue(ctx, verifiedSignersKey{}, signers)
-			next.ServeHTTP(w, r.WithContext(ctx))
+			serveWithToolRequestSigner(w, r.WithContext(ctx), next, caller)
 			return
 		}
 	}
@@ -461,28 +482,109 @@ func writeWBAReject(w http.ResponseWriter, r *http.Request, e *WBAError, onRejec
 
 // jsonRPCOperation names the operation of a JSON-RPC request body: the
 // tool name of an MCP tools/call, or otherwise the JSON-RPC method (for
-// example initialize or tools/list). The body has already been buffered and
-// replaced by verification.
+// example initialize or tools/list). It reads members by exact,
+// case-sensitive name, as the MCP SDK does, and returns "" (no operation,
+// so nothing is allowed for an unbound signer) for a body it cannot read
+// unambiguously, including one whose keys collide under case folding.
+// A2A deployments resolve skills with MiddlewareOptions.OperationResolver.
+// The body has already been buffered, and strict-validated, by verification.
 func jsonRPCOperation(r *http.Request) string {
 	if r.Body == nil {
 		return ""
 	}
 	body, err := readAndReplaceBody(r, defaultMaxBodyBytes)
-	if err != nil {
+	if err != nil || strictjson.Validate(body, 0) != nil {
 		return ""
 	}
-	var envelope struct {
-		JSONRPC string `json:"jsonrpc"`
-		Method  string `json:"method"`
-		Params  struct {
-			Name string `json:"name"`
-		} `json:"params"`
-	}
-	if json.Unmarshal(body, &envelope) != nil || envelope.JSONRPC != "2.0" {
+	var envelope map[string]json.RawMessage
+	if json.Unmarshal(body, &envelope) != nil {
 		return ""
 	}
-	if envelope.Method == "tools/call" && envelope.Params.Name != "" {
-		return envelope.Params.Name
+	var version, method string
+	if json.Unmarshal(envelope["jsonrpc"], &version) != nil || version != "2.0" ||
+		json.Unmarshal(envelope["method"], &method) != nil || method == "" {
+		return ""
 	}
-	return envelope.Method
+	if method != "tools/call" {
+		return method
+	}
+	var params map[string]json.RawMessage
+	var name string
+	if json.Unmarshal(envelope["params"], &params) != nil || json.Unmarshal(params["name"], &name) != nil {
+		return ""
+	}
+	return name
+}
+
+// TokenInfoSignerKey is the auth.TokenInfo.Extra key under which Middleware
+// carries the verified signer to MCP tool handlers when WebBotAuth is set.
+// Read it with VerifiedSignerFromToolRequest.
+const TokenInfoSignerKey = "adcp.verified_signer" // #nosec G101 -- a map key, not a credential.
+
+// VerifiedSignerFromToolRequest returns the signer Middleware verified for
+// the HTTP request that carried this MCP tool call, or nil.
+//
+// Use it, not VerifiedSignerFromContext, inside MCP tool handlers: a
+// stateful go-sdk session binds handlers to the context of its initialize
+// request, so a context value can belong to a different, earlier request.
+// The MCP SDK copies auth.TokenInfo from each HTTP request into
+// req.Extra.TokenInfo, and Middleware places the signer there when
+// MiddlewareOptions.WebBotAuth is set. Install Middleware inside (after)
+// any bearer-token middleware, which replaces TokenInfo; if the signer is
+// lost that way, this returns nil and callers fail closed.
+func VerifiedSignerFromToolRequest(req *mcp.CallToolRequest) *VerifiedSigner {
+	if req == nil || req.Extra == nil {
+		return nil
+	}
+	return VerifiedSignerFromTokenInfo(req.Extra.TokenInfo)
+}
+
+// VerifiedSignerFromTokenInfo returns the signer stored under
+// TokenInfoSignerKey, or nil.
+func VerifiedSignerFromTokenInfo(ti *auth.TokenInfo) *VerifiedSigner {
+	if ti == nil {
+		return nil
+	}
+	s, _ := ti.Extra[TokenInfoSignerKey].(*VerifiedSigner)
+	return s
+}
+
+// serveWithToolRequestSigner calls next with signer added to the request's
+// auth.TokenInfo, which the MCP SDK forwards per HTTP request into
+// CallToolRequest.Extra. go-sdk sets TokenInfo only through
+// auth.RequireBearerToken, so this runs it with a verifier that returns the
+// existing TokenInfo (if any) plus the signer, presenting a placeholder
+// bearer value only for that step and restoring the original Authorization
+// header before next runs. The UserID and scopes of an existing TokenInfo
+// are preserved; none are invented.
+func serveWithToolRequestSigner(w http.ResponseWriter, r *http.Request, next http.Handler, signer *VerifiedSigner) {
+	ti := &auth.TokenInfo{}
+	if existing := auth.TokenInfoFromContext(r.Context()); existing != nil {
+		c := *existing
+		ti = &c
+		ti.Extra = maps.Clone(existing.Extra)
+	}
+	if ti.Expiration.IsZero() {
+		ti.Expiration = time.Now().Add(time.Duration(wbaMaxWindowSeconds+skewSeconds) * time.Second)
+	}
+	if ti.Extra == nil {
+		ti.Extra = map[string]any{}
+	}
+	ti.Extra[TokenInfoSignerKey] = signer
+	original, hadAuthorization := r.Header["Authorization"]
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r2 *http.Request) {
+		r2.Header = r2.Header.Clone()
+		if hadAuthorization {
+			r2.Header["Authorization"] = original
+		} else {
+			r2.Header.Del("Authorization")
+		}
+		next.ServeHTTP(w, r2)
+	})
+	staged := r.Clone(r.Context())
+	staged.Body = r.Body
+	staged.Header.Set("Authorization", "Bearer adcp-verified-signer")
+	auth.RequireBearerToken(func(context.Context, string, *http.Request) (*auth.TokenInfo, error) {
+		return ti, nil
+	}, nil)(inner).ServeHTTP(w, staged)
 }

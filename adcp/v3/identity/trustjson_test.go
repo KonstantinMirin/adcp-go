@@ -92,6 +92,11 @@ func TestValidateTrustRecordModesAndOwner(t *testing.T) {
 	rec, err := ValidateTrustRecord([]byte(unknownKind), TrustRecordOptions{Mode: Reading})
 	require.NoError(t, err, "readers keep unknown, advisory requirement kinds")
 	require.Equal(t, AgentOnboardingRequirementKind("future_kind"), rec.Agents[0].Profiles.Adcp.Onboarding.Requirements[0].Kind)
+	oddFields := strings.Replace(unknownKind, `{"kind":"future_kind"}`, `{"kind":"future_kind","verification_modes":"not-an-array"}`, 1)
+	_, err = ValidateTrustRecord([]byte(oddFields), TrustRecordOptions{Mode: Reading})
+	require.NoError(t, err, "a reader does not judge an unknown kind's other members")
+	_, err = ValidateTrustRecord([]byte(`{"agents":[{"url":"https://buyer.example.com","roles":["adcp:buying"],"Roles":["adcp:sales"]}]}`), TrustRecordOptions{Mode: Reading})
+	require.Error(t, err, "keys that differ only in case are duplicates")
 
 	owned := `{"agents":[{"url":"https://buyer.example.com/mcp","roles":["adcp:buying"]}],"grants":[{"grantee":"agency.com","scopes":["adcp:media_buying"]}]}`
 	_, err = ValidateTrustRecord([]byte(owned), TrustRecordOptions{Owner: "example.com"})

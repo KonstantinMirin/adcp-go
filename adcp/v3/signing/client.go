@@ -75,13 +75,21 @@ type SignedHTTPClientOptions struct {
 	AgentOrigin string
 
 	// ProfilesProvider returns the seller's request_signing.profiles for a
-	// request. It applies only with AgentOrigin and CapabilityProvider set:
-	// a request the capability says to sign is sent only when the seller
-	// lists "web-bot-auth"; otherwise RoundTrip fails with
-	// ErrWebBotAuthNotAdvertised instead of downgrading. Omitted profiles
-	// mean the RFC 9421 profile only, so a nil provider also fails.
+	// request (nil when the seller omits them, which means the RFC 9421
+	// profile only). It applies with CapabilityProvider set, to requests the
+	// capability says to sign: with AgentOrigin, the seller must list
+	// "web-bot-auth" (a nil provider fails too) or RoundTrip returns
+	// ErrWebBotAuthNotAdvertised; without it, a non-nil list must include
+	// "adcp/request-signing/v1" or RoundTrip returns
+	// ErrRequestSigningNotAdvertised. The client never switches profiles on
+	// its own.
 	ProfilesProvider func(*http.Request) []string
 }
+
+// ErrRequestSigningNotAdvertised is returned by an RFC 9421 signing client
+// whose ProfilesProvider reports profiles that exclude
+// "adcp/request-signing/v1".
+var ErrRequestSigningNotAdvertised = errors.New("signing: seller does not advertise the adcp/request-signing/v1 request-signing profile")
 
 // ErrWebBotAuthNotAdvertised is returned by a Web Bot Auth signing client
 // when the seller does not list "web-bot-auth" in request_signing.profiles.
@@ -227,6 +235,12 @@ func (t *capabilityAwareSigningTransport) RoundTrip(r *http.Request) (*http.Resp
 		}
 		if !slices.Contains(profiles, ProfileTagWebBotAuth) {
 			return nil, ErrWebBotAuthNotAdvertised
+		}
+	} else if t.profilesProvider != nil {
+		// An RFC 9421 signer refuses a seller whose advertised profiles
+		// exclude it. Omitted profiles (nil) mean the RFC 9421 profile only.
+		if profiles := t.profilesProvider(cloned); profiles != nil && !slices.Contains(profiles, ProfileTagRequestSigning) {
+			return nil, ErrRequestSigningNotAdvertised
 		}
 	}
 

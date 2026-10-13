@@ -197,6 +197,9 @@ func TestCapabilityExtensions(t *testing.T) {
 	profiles, err = AdvertisedRequestSigningProfiles([]byte(`{"request_signing":{"supported":true}}`))
 	require.NoError(t, err)
 	require.Equal(t, []string{"adcp/request-signing/v1"}, profiles, "omitted means the RFC 9421 profile only")
+	profiles, err = AdvertisedRequestSigningProfiles([]byte(`{"request_signing":{"supported":true,"profiles":[]}}`))
+	require.NoError(t, err)
+	require.Empty(t, profiles, "an explicit empty list advertises none")
 	_, err = AdvertisedRequestSigningProfiles([]byte(`not json`))
 	require.Error(t, err)
 

@@ -20,8 +20,10 @@
 //
 // # Authority
 //
-// A verified origin with no binding is identity-established: it gets what an
-// anonymous caller gets. A binding is an explicit seller decision, made only
+// A verified origin with no binding is identity-established. The spec gives
+// it what an anonymous caller gets, reads included, plus get_principal; the
+// signing middleware allows it only WebBotAuthOptions.UnboundFor, which a
+// seller sets to exactly that. A binding is an explicit seller decision, made only
 // after the operator's trust record lists the origin with the required role,
 // re-evaluated at least as often as the revocation polling interval, and it
 // maps an origin to one principal. Binding onto a principal that already

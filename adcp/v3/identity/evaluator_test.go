@@ -177,22 +177,22 @@ func TestEvaluateAuthoritativeLocation(t *testing.T) {
 func TestEvaluateAbsenceAndNoDowngrade(t *testing.T) {
 	r := newEvalRig(t)
 	ctx := context.Background()
-	_, err := r.eval.Evaluate(ctx, "brand.com", "")
+	_, err := r.eval.Evaluate(ctx, "brand-7k3q.com", "")
 	require.True(t, IsTrustRecordAbsent(err), "404 before any 200 is absence")
-	r.server.set(trustURL("brand.com"), http.StatusGone, "")
+	r.server.set(trustURL("brand-7k3q.com"), http.StatusGone, "")
 	r.now = r.now.Add(61 * time.Second)
-	_, err = r.eval.Evaluate(ctx, "brand.com", "")
+	_, err = r.eval.Evaluate(ctx, "brand-7k3q.com", "")
 	require.True(t, IsTrustRecordAbsent(err), "410 too")
 
-	r.server.set(trustURL("brand.com"), 200, `{"grants":[]}`)
+	r.server.set(trustURL("brand-7k3q.com"), 200, `{"grants":[]}`)
 	r.now = r.now.Add(61 * time.Second)
-	_, err = r.eval.Evaluate(ctx, "brand.com", "")
+	_, err = r.eval.Evaluate(ctx, "brand-7k3q.com", "")
 	require.NoError(t, err)
 	// After a 200 the record disappears: that is a failure, not absence, so
 	// no fallback to brand.json is possible.
-	r.server.set(trustURL("brand.com"), http.StatusNotFound, "")
+	r.server.set(trustURL("brand-7k3q.com"), http.StatusNotFound, "")
 	r.now = r.now.Add(2 * time.Minute)
-	_, err = r.eval.Evaluate(ctx, "brand.com", "")
+	_, err = r.eval.Evaluate(ctx, "brand-7k3q.com", "")
 	require.Error(t, err)
 	require.False(t, IsTrustRecordAbsent(err))
 }
@@ -250,10 +250,10 @@ func TestEvaluateRecordExpiringDuringFetchGrantsNothing(t *testing.T) {
 
 func TestEvaluateSingleFlightAndIsolation(t *testing.T) {
 	r := newEvalRig(t)
-	slow, fast := trustURL("slow.com"), trustURL("fast.com")
-	r.server.set(slow, 200, `{"agents":[{"url":"https://a.slow.com","roles":["adcp:buying"]}]}`)
-	r.server.set(fast, 200, `{"agents":[{"url":"https://a.fast.com","roles":["adcp:buying"]}]}`)
-	_, err := r.eval.Evaluate(context.Background(), "https://a.fast.com", RoleBuying)
+	slow, fast := trustURL("slow-7k3q.com"), trustURL("fast-7k3q.com")
+	r.server.set(slow, 200, `{"agents":[{"url":"https://a.slow-7k3q.com","roles":["adcp:buying"]}]}`)
+	r.server.set(fast, 200, `{"agents":[{"url":"https://a.fast-7k3q.com","roles":["adcp:buying"]}]}`)
+	_, err := r.eval.Evaluate(context.Background(), "https://a.fast-7k3q.com", RoleBuying)
 	require.NoError(t, err)
 	release := make(chan struct{})
 	r.server.block[slow] = release
@@ -262,16 +262,16 @@ func TestEvaluateSingleFlightAndIsolation(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := r.eval.Evaluate(context.Background(), "https://a.slow.com", RoleBuying)
+			_, err := r.eval.Evaluate(context.Background(), "https://a.slow-7k3q.com", RoleBuying)
 			require.NoError(t, err)
 		}()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err = r.eval.Evaluate(ctx, "https://a.slow.com", RoleBuying)
+	_, err = r.eval.Evaluate(ctx, "https://a.slow-7k3q.com", RoleBuying)
 	require.ErrorIs(t, err, context.Canceled, "a waiter that gives up does not cancel the shared fetch")
 	// One slow operator does not block another operator's cached record.
-	_, err = r.eval.Evaluate(context.Background(), "https://a.fast.com", RoleBuying)
+	_, err = r.eval.Evaluate(context.Background(), "https://a.fast-7k3q.com", RoleBuying)
 	require.NoError(t, err)
 	close(release)
 	wg.Wait()
@@ -281,33 +281,33 @@ func TestEvaluateSingleFlightAndIsolation(t *testing.T) {
 func TestEvaluateSharedHopCannotExtendFreshness(t *testing.T) {
 	r := newEvalRig(t)
 	hosted := "https://records.host.example.net/shared/trust.json"
-	r.server.set(trustURL("one.com"), 200, `{"authoritative_location":"`+hosted+`"}`)
-	r.server.set(trustURL("two.com"), 200, `{"authoritative_location":"`+hosted+`"}`)
+	r.server.set(trustURL("one-7k3q.com"), 200, `{"authoritative_location":"`+hosted+`"}`)
+	r.server.set(trustURL("two-7k3q.com"), 200, `{"authoritative_location":"`+hosted+`"}`)
 	r.server.set(hosted, 200, `{"grants":[]}`)
-	a, err := r.eval.Evaluate(context.Background(), "one.com", "")
+	a, err := r.eval.Evaluate(context.Background(), "one-7k3q.com", "")
 	require.NoError(t, err)
 	r.now = r.now.Add(40 * time.Second)
-	b, err := r.eval.Evaluate(context.Background(), "two.com", "")
+	b, err := r.eval.Evaluate(context.Background(), "two-7k3q.com", "")
 	require.NoError(t, err)
 	require.Equal(t, 1, r.server.count(hosted), "hop bytes are shared")
-	require.Equal(t, "two.com", b.OperatorDomain, "authority is not shared")
+	require.Equal(t, "two-7k3q.com", b.OperatorDomain, "authority is not shared")
 	require.Equal(t, a.ExpiresAt, b.ExpiresAt, "a cached hop response bounds the later record's freshness")
 }
 
 func TestEvaluateHostFailureCooldownIsNotAbsence(t *testing.T) {
 	r := newEvalRig(t)
 	hosted := "https://records.host.example.net/a/trust.json"
-	r.server.set(trustURL("one.com"), 200, `{"authoritative_location":"`+hosted+`"}`)
+	r.server.set(trustURL("one-7k3q.com"), 200, `{"authoritative_location":"`+hosted+`"}`)
 	r.server.set(hosted, 503, ``)
-	_, err := r.eval.Evaluate(context.Background(), "one.com", "")
+	_, err := r.eval.Evaluate(context.Background(), "one-7k3q.com", "")
 	require.Error(t, err)
 	// Another operator hosted on the same host, whose own derived URL 404s
 	// on the first try, still gets "absent" only from its own URL.
-	_, err = r.eval.Evaluate(context.Background(), "two.com", "")
+	_, err = r.eval.Evaluate(context.Background(), "two-7k3q.com", "")
 	require.True(t, IsTrustRecordAbsent(err))
 	// But a different path on the cooling host fails without being absence.
-	r.server.set(trustURL("three.com"), 200, `{"authoritative_location":"https://records.host.example.net/b/trust.json"}`)
-	_, err = r.eval.Evaluate(context.Background(), "three.com", "")
+	r.server.set(trustURL("three-7k3q.com"), 200, `{"authoritative_location":"https://records.host.example.net/b/trust.json"}`)
+	_, err = r.eval.Evaluate(context.Background(), "three-7k3q.com", "")
 	require.Error(t, err)
 	require.False(t, IsTrustRecordAbsent(err))
 	require.Zero(t, r.server.count("https://records.host.example.net/b/trust.json"), "the host is cooling down")
@@ -316,18 +316,20 @@ func TestEvaluateHostFailureCooldownIsNotAbsence(t *testing.T) {
 func TestEvaluateBoundsPending(t *testing.T) {
 	server := newTrustServer()
 	release := make(chan struct{})
-	for _, d := range []string{"a.com", "b.com"} {
+	for _, d := range []string{"a-7k3q.com", "b-7k3q.com"} {
 		server.set(trustURL(d), 200, `{"grants":[]}`)
 		server.block[trustURL(d)] = release
 	}
 	eval, _ := NewTrustRecordEvaluator(TrustRecordEvaluatorOptions{Fetch: server.fetch, MaxRecords: 2, Clock: func() time.Time { return testNow }})
 	var wg sync.WaitGroup
-	for _, d := range []string{"a.com", "b.com"} {
+	for _, d := range []string{"a-7k3q.com", "b-7k3q.com"} {
 		wg.Add(1)
 		go func() { defer wg.Done(); _, _ = eval.Evaluate(context.Background(), d, "") }()
 	}
-	require.Eventually(t, func() bool { return server.count(trustURL("a.com")) == 1 && server.count(trustURL("b.com")) == 1 }, time.Second, time.Millisecond)
-	_, err := eval.Evaluate(context.Background(), "c.com", "")
+	require.Eventually(t, func() bool {
+		return server.count(trustURL("a-7k3q.com")) == 1 && server.count(trustURL("b-7k3q.com")) == 1
+	}, time.Second, time.Millisecond)
+	_, err := eval.Evaluate(context.Background(), "c-7k3q.com", "")
 	require.Error(t, err)
 	close(release)
 	wg.Wait()

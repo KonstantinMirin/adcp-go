@@ -9,6 +9,7 @@ import (
 	"github.com/adcontextprotocol/adcp-go/adcp/v3"
 	"github.com/adcontextprotocol/adcp-go/adcp/v3/internal/psl"
 	"github.com/adcontextprotocol/adcp-go/adcp/v3/signing"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // GrantRequest is an acts-for claim to evaluate (DR-0025): the signer at
@@ -51,6 +52,9 @@ type GrantAuthorization struct {
 	LegacyFallbackAllowed bool
 	// ExpiresAt bounds how long an authorization may be reused: the
 	// earliest of the records' cache lifetimes and each link's valid_until.
+	// It is set on every authorization, including a SellerAuthorization or
+	// LegacyAuthorization approval (bounded by one polling interval), and
+	// zero only on a denial.
 	ExpiresAt time.Time
 }
 
@@ -130,6 +134,9 @@ func (g *GrantEvaluator) now() time.Time {
 
 // Check evaluates req. The error is non-nil only for a malformed request.
 func (g *GrantEvaluator) Check(ctx context.Context, req GrantRequest) (GrantAuthorization, error) {
+	if g.Records == nil {
+		return GrantAuthorization{}, errNoRecords
+	}
 	if req.Scope == "" {
 		req.Scope = ScopeMediaBuying
 	}
@@ -172,7 +179,9 @@ func (g *GrantEvaluator) Check(ctx context.Context, req GrantRequest) (GrantAuth
 				if !ok {
 					return denied(GrantReasonAbsent, true)
 				}
-				return GrantAuthorization{Authorized: true, LegacyFallbackAllowed: true}, nil
+				// Bound like any trust-record result: re-check after one
+				// polling interval.
+				return GrantAuthorization{Authorized: true, LegacyFallbackAllowed: true, ExpiresAt: g.now().Add(g.Records.PollingInterval())}, nil
 			}
 			return denied(GrantReasonTrustRecordAbsent, true)
 		}
@@ -250,7 +259,7 @@ func (g *GrantEvaluator) Check(ctx context.Context, req GrantRequest) (GrantAuth
 				return denied(GrantReasonAuthorizationHookFailure, false)
 			}
 			if ok {
-				return GrantAuthorization{Authorized: true}, nil
+				return GrantAuthorization{Authorized: true, ExpiresAt: brandRec.ExpiresAt}, nil
 			}
 		}
 		return denied(GrantReasonAbsent, false)
@@ -296,7 +305,10 @@ type grantError string
 
 func (e grantError) Error() string { return string(e) }
 
-const errUnsupportedProfile = grantError("identity: unsupported authenticated signing profile")
+const (
+	errUnsupportedProfile = grantError("identity: unsupported authenticated signing profile")
+	errNoRecords          = grantError("identity: GrantEvaluator requires Records")
+)
 
 func scopeCovers(scopes []string, scope string) bool {
 	for _, s := range scopes {
@@ -381,10 +393,16 @@ type GrantGate struct {
 	// ExistingAccountClaim resolves the claim for an account_id from
 	// seller-owned state. Nil denies account_id-only references.
 	ExistingAccountClaim func(ctx context.Context, accountID string) (GrantClaim, error)
+	// OperationClaim, when set, resolves the claim for an account and an
+	// operation, choosing the scope the operation needs.
+	OperationClaim func(ctx context.Context, accountID, operation string) (GrantClaim, error)
 }
 
 // RequireClaim authorizes claim for signer. A nil signer (no established
 // identity) is denied without details, under the cross-tenant oracle clamp.
+// A Web Bot Auth signer must also be bound to a principal: an
+// identity-established signer gets no account authority (it may not
+// provision accounts), so it is denied before any grant is read.
 func (g *GrantGate) RequireClaim(ctx context.Context, claim GrantClaim, signer *signing.VerifiedSigner) error {
 	if signer == nil || signer.AgentURL == "" {
 		return unestablishedDenial()
@@ -392,6 +410,9 @@ func (g *GrantGate) RequireClaim(ctx context.Context, claim GrantClaim, signer *
 	profile := signing.ProfileTagRequestSigning
 	if signer.Profile == signing.ProfileTagWebBotAuth {
 		profile = signing.ProfileTagWebBotAuth
+		if signer.PrincipalID == "" {
+			return unboundDenial()
+		}
 	}
 	res, err := g.Evaluator.Check(ctx, GrantRequest{
 		AgentOrigin:     signer.AgentURL,
@@ -408,17 +429,62 @@ func (g *GrantGate) RequireClaim(ctx context.Context, claim GrantClaim, signer *
 	return res.Err()
 }
 
-// RequireAccount authorizes an existing account for signer.
+// unboundDenial is PERMISSION_DENIED for an identity-established signer.
+// Its identity is known, but grant_absent would misstate the cause.
+func unboundDenial() error {
+	return adcp.NewError("PERMISSION_DENIED", adcp.ErrorOptions{
+		Message:  "Agent identity is not approved by this seller",
+		Recovery: "correctable",
+	})
+}
+
+// mediaBuyingOperations may use the default adcp:media_buying scope: buys,
+// their account provisioning, and the reads and creative work around them
+// (the same set as the Python SDK). Other operations need an explicit
+// scope from the seller, so a media-buying grant never authorizes, say,
+// creative generation merely because both calls name an account.
+var mediaBuyingOperations = map[string]struct{}{
+	"sync_accounts": {}, "get_products": {}, "list_products": {}, "request_proposals": {},
+	"refine_proposals": {}, "decline_proposals": {}, "buy_products": {}, "accept_proposal": {},
+	"create_media_buy": {}, "update_media_buy": {}, "control_media_buy": {}, "get_media_buys": {},
+	"get_media_buy_delivery": {}, "get_reporting_status": {}, "sync_reporting_receipts": {},
+	"provide_performance_feedback": {}, "sync_creatives": {}, "list_creatives": {}, "list_creative_formats": {},
+}
+
+// RequireAccount authorizes an existing account for signer, under the
+// default adcp:media_buying scope. Use RequireAccountForOperation when the
+// operation is known.
 func (g *GrantGate) RequireAccount(ctx context.Context, accountID string, signer *signing.VerifiedSigner) error {
+	return g.RequireAccountForOperation(ctx, accountID, "", signer)
+}
+
+// RequireAccountForOperation authorizes an existing account for signer and
+// operation. The claim comes from OperationClaim when set, otherwise from
+// ExistingAccountClaim. An operation outside the media-buying set whose
+// claim keeps the default adcp:media_buying scope is denied: the seller
+// must choose its scope explicitly. Call it before every spend-committing
+// call; the evaluator's cache keeps the check fresh.
+func (g *GrantGate) RequireAccountForOperation(ctx context.Context, accountID, operation string, signer *signing.VerifiedSigner) error {
 	if signer == nil || signer.AgentURL == "" {
 		return unestablishedDenial()
 	}
-	if g.ExistingAccountClaim == nil {
+	var claim GrantClaim
+	var err error
+	switch {
+	case g.OperationClaim != nil && operation != "":
+		claim, err = g.OperationClaim(ctx, accountID, operation)
+	case g.ExistingAccountClaim != nil:
+		claim, err = g.ExistingAccountClaim(ctx, accountID)
+	default:
 		return grantAbsentError()
 	}
-	claim, err := g.ExistingAccountClaim(ctx, accountID)
 	if err != nil {
 		return grantAbsentError()
+	}
+	if operation != "" && (claim.Scope == "" || claim.Scope == ScopeMediaBuying) {
+		if _, ok := mediaBuyingOperations[operation]; !ok {
+			return grantAbsentError()
+		}
 	}
 	return g.RequireClaim(ctx, claim, signer)
 }
@@ -439,17 +505,20 @@ func (g *GrantGate) RequireDeclaration(ctx context.Context, account adcp.Account
 		}, signer)
 	}
 	if account.AccountID != "" {
-		return g.RequireAccount(ctx, account.AccountID, signer)
+		return g.RequireAccountForOperation(ctx, account.AccountID, "sync_accounts", signer)
 	}
 	return grantAbsentError()
 }
 
-// SyncAccountsAuthorizer returns a hook for adcp.SellerConfig's
-// SyncAccountsAuthorizer: every entry must be authorized, for the verified
-// signer the signing middleware attached to ctx, before any upsert.
-func (g *GrantGate) SyncAccountsAuthorizer() func(ctx context.Context, accounts []adcp.AccountInput) error {
-	return func(ctx context.Context, accounts []adcp.AccountInput) error {
-		signer := signing.VerifiedSignerFromContext(ctx)
+// SyncAccountsAuthorizer returns a hook for adcp.Config.SyncAccountsAuthorizer:
+// every entry must be authorized, for the signer the signing middleware
+// verified on this tool call's HTTP request, before any upsert. It reads
+// the signer from the tool request (signing.VerifiedSignerFromToolRequest),
+// never from ctx, which in a stateful MCP session belongs to the session's
+// initialize request. This requires signing.MiddlewareOptions.WebBotAuth.
+func (g *GrantGate) SyncAccountsAuthorizer() func(ctx context.Context, req *mcp.CallToolRequest, accounts []adcp.AccountInput) error {
+	return func(ctx context.Context, req *mcp.CallToolRequest, accounts []adcp.AccountInput) error {
+		signer := signing.VerifiedSignerFromToolRequest(req)
 		for _, a := range accounts {
 			if err := g.RequireDeclaration(ctx, a, signer); err != nil {
 				return err

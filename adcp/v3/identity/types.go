@@ -324,7 +324,8 @@ type WebhookSigningCapabilities struct {
 
 // AdvertisedRequestSigningProfiles reads request_signing.profiles from a
 // get_adcp_capabilities response body. A response without the member
-// advertises the RFC 9421 profile only. Use it to build
+// advertises the RFC 9421 profile only; an explicit empty list advertises
+// none. Use it to build
 // signing.SignedHTTPClientOptions.ProfilesProvider.
 func AdvertisedRequestSigningProfiles(capabilities []byte) ([]string, error) {
 	var doc struct {
@@ -333,7 +334,7 @@ func AdvertisedRequestSigningProfiles(capabilities []byte) ([]string, error) {
 	if err := json.Unmarshal(capabilities, &doc); err != nil {
 		return nil, err
 	}
-	if doc.RequestSigning == nil || len(doc.RequestSigning.Profiles) == 0 {
+	if doc.RequestSigning == nil || doc.RequestSigning.Profiles == nil {
 		return []string{signing.ProfileTagRequestSigning}, nil
 	}
 	return doc.RequestSigning.Profiles, nil

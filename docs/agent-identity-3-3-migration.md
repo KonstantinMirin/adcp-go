@@ -69,27 +69,35 @@ mw := signing.Middleware(signing.MiddlewareOptions{
     Resolver: rfc9421Resolver,                 // RFC 9421 keeps working through 3.x
     Replay:   sharedReplayStore,               // shared by both profiles
     WebBotAuth: &signing.WebBotAuthOptions{
-        Keys:       keys,
-        Revocation: revocations,
-        Authorizer: &identity.BindingGate{Bindings: bindings, Records: records},
-        UnboundFor: []string{"get_adcp_capabilities", "get_principal"},
+        Keys:        keys,
+        Revocation:  revocations,
+        Authorizer:  &identity.BindingGate{Bindings: bindings, Records: records},
+        Authorities: []string{"seller.example.com"}, // the host names this endpoint serves
     },
     BoundOrigins: bindings,                    // refuse RFC 9421 for a bound origin
 })
+// Install mw inside (after) any bearer-token middleware.
 ```
 
 - **Profile selection.** A request with `Signature-Agent` or a `web-bot-auth` tag is verified under Web Bot Auth only, including under `ObserveOnly`. An uncovered `Signature-Agent` member is never attributed.
+- **Body.** A non-empty signed body must be strict JSON: no duplicate keys, including keys that differ only in case. Anything else is `400`.
+- **Authorities.** Set `Authorities` so that a signature captured at another seller cannot be replayed to this endpoint under that seller's `Host`.
 - **Errors.** Failures are `400`, `403` with `Accept-Signature`, or `429`. A revoked key or an origin without authority gets a generic `PERMISSION_DENIED` and no `Accept-Signature`. `request_signature_*` codes remain for the RFC 9421 profile.
-- **Identity-established.** A verified origin with no binding may call only `UnboundFor`; match it to your anonymous permissions. `get_principal` should return `unconfigured`, with `relationship` (an `identity.PrincipalRelationship`) when an application is in progress. Add `sync_principal` only when its handler implements an explicit `open` policy.
+- **Identity-established.** A verified origin with no binding may call only `UnboundFor`. It defaults to `get_adcp_capabilities`, `get_principal`, and the MCP session methods (`initialize`, `notifications/initialized`, `ping`, `tools/list`). Set it to your anonymous permissions plus `get_principal`; A2A deployments resolve skills with `OperationResolver`.
+  - `get_principal` should return `unconfigured`, with `relationship` (an `identity.PrincipalRelationship`) when an application is in progress.
+  - Add `sync_principal` only when its handler implements an explicit `open` policy.
 - **Binding.** This is an explicit seller decision: `records.Bind(ctx, signer, principalID, bindings, identity.BindOptions{})`. The operator's trust record must list exactly one agent at the origin with `adcp:buying`.
-  - An origin maps to one principal. Binding onto a principal that already uses RFC 9421 needs `ExistingRFC9421Principal: true, MigrationApproved: true`.
-  - `BindingGate` re-evaluates the trust record on every request, through the evaluator's cache, which is bounded by the polling interval. When the operator delists the origin, authority ends while the binding still blocks an RFC 9421 downgrade.
-- **The trust record is never read on the signature path.** The `signing` package does not import `identity`, and a test enforces that.
+  - An origin maps to one principal. Binding onto a principal that already uses RFC 9421 needs `ExistingRFC9421Principal: true, MigrationApproved: true`. Set those from your own records: the zero value treats the principal as new, as in the Python SDK.
+  - `BindingGate` re-evaluates the trust record on every request, through the evaluator's cache, which is bounded by the polling interval. When the operator delists the origin, or its record cannot be fetched, the bound origin is denied every operation, including the `UnboundFor` ones. This matches the Python SDK and is raised upstream. The binding stays, so the origin still cannot downgrade to RFC 9421.
+- **The trust record is never read on the signature path.** The `signing` package cannot import `identity`, because `identity` imports `signing`.
+- **MCP tool handlers.** Read the signer with `signing.VerifiedSignerFromToolRequest(req)`. A stateful go-sdk session binds handlers to the context of its `initialize` request, so `VerifiedSignerFromContext` can return another request's signer there. With `WebBotAuth` set, the middleware places the signer in the per-request `auth.TokenInfo`, which the MCP SDK copies into `req.Extra`.
 - **Grants.** Set `adcp.Config.SyncAccountsAuthorizer = gate.SyncAccountsAuthorizer()`, with `gate := &identity.GrantGate{Evaluator: &identity.GrantEvaluator{Records: records}, ExistingAccountClaim: ...}`.
-  - Every entry is checked before the handler runs. A missing grant is `PERMISSION_DENIED` with `{scope: "agent", reason: "grant_absent"}`, or with no details when no identity is established.
-  - Call `gate.RequireAccount` before spend-committing calls too.
+  - The hook reads the per-request signer and checks every entry before the handler runs.
+  - An identity-established Web Bot Auth signer (no `PrincipalID`) never provisions accounts.
+  - A missing grant is `PERMISSION_DENIED` with `{scope: "agent", reason: "grant_absent"}`, or with no details when no identity is established.
+  - Before spend-committing calls, call `gate.RequireAccountForOperation`. An operation outside media buying needs an explicit scope (`OperationClaim`).
   - `GrantEvaluator.LegacyAuthorization` (brand.json `authorized_operators`) runs only while the brand has never served a trust.json. `SellerAuthorization` is your discretion for uncovered claims and is disabled by `exclusive_grants`.
-- **Revocation.** `OriginRevocationChecker` keeps every revocation it has seen, keeps `keyCompromise` and the earliest `invalidity_date`, and refuses older lists. `RevocationDetails.Exposes(receivedAt)` tells you which accepted buys came from suspect requests; never unwind them automatically. State is in memory, so persist it for durable deployments.
+- **Revocation.** `OriginRevocationChecker` retains every thumbprint-shaped revoked kid, at most 1024 per origin. It keeps `keyCompromise` and the earliest `invalidity_date`, and refuses older lists, including after an origin is evicted. Supply `RevocationHistory` to make that durable. At capacity it evicts the least recently used origin rather than refusing new ones. `RevocationDetails.Exposes(receivedAt)` tells you which accepted buys came from suspect requests; never unwind them automatically.
 - **Advertising.** Advertise the profile with `identity.RequestSigningCapabilities{Profiles: []string{signing.ProfileTagRequestSigning, signing.ProfileTagWebBotAuth}}`, and advertise onboarding with `identity.AccountCapabilities.AgentOnboarding` (list `account.agent_onboarding` in `experimental_features`).
 
 ## Deprecation
@@ -98,12 +106,12 @@ AdCP 3.3 deprecates the RFC 9421 profile. It stays fully functional through 3.x 
 
 ## Rollback
 
-- **Signers:** clear `AgentOrigin` to sign with RFC 9421 again. A seller that has bound your origin refuses that until it unbinds.
+- **Signers:** clear `AgentOrigin` and set `KeyID` to your brand.json kid to sign with RFC 9421 again. A seller that has bound your origin refuses that until it unbinds.
 - **Sellers:** remove `WebBotAuth`. Bindings remain in your store and still block RFC 9421 for those origins through `BoundOrigins`, so unbind them first.
 
 ## Not covered yet
 
 - **Legacy module.** These features ship in `adcp/v3` only. The legacy `adcp` module is frozen at v2 (see MIGRATING.md) and received only the covered-header tolerance.
 - **Webhooks.** Web Bot Auth webhooks are ordinary signed requests and verify with the same middleware. The `adcp/v3/webhook` publisher does not sign them yet, and the `signing_profile` registration field is not modeled.
-- **Durable state.** Bindings, revocation history, and replay state are in memory. Persistent stores are the application's.
+- **Durable state.** These are in memory: bindings, revocation history (beyond a bounded LRU), replay state, and the record of which operators have served a trust.json (which keeps a later 404 from re-enabling the brand.json fallback). Persistent stores are the application's, behind `BindingStore`, `RevocationHistory`, and `ReplayStore`.
 - **Released inputs.** The final 3.3 schema bundle and the P7 trust-record and grant-chain vectors are upstream release dependencies. Re-pin and rerun conformance when they land.

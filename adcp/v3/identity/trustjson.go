@@ -72,6 +72,13 @@ func ValidateTrustRecord(data []byte, opts TrustRecordOptions) (*TrustRecord, er
 	if v.err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidTrustRecord, v.err)
 	}
+	if opts.Mode == Reading {
+		// The validator may have trimmed unknown requirement kinds.
+		var err error
+		if data, err = json.Marshal(tree); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidTrustRecord, err)
+		}
+	}
 	var rec TrustRecord
 	if err := json.Unmarshal(data, &rec); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidTrustRecord, err)
@@ -590,8 +597,19 @@ func (v *trustValidator) requirement(path string, x any) {
 	if m == nil {
 		return
 	}
-	if s, ok := v.str(path+".kind", m["kind"]); ok && v.mode == Authoring && !KnownRequirementKind(AgentOnboardingRequirementKind(s)) {
-		v.fail(path+".kind", "is not a known requirement kind")
+	if s, ok := v.str(path+".kind", m["kind"]); ok && !KnownRequirementKind(AgentOnboardingRequirementKind(s)) {
+		if v.mode == Authoring {
+			v.fail(path+".kind", "is not a known requirement kind")
+		}
+		// A reader keeps an unknown kind (the posture's message and url are
+		// the fallback) and, like the Python SDK, does not judge its other
+		// members; it keeps only the kind, so the typed form can hold it.
+		for k := range m {
+			if k != "kind" {
+				delete(m, k)
+			}
+		}
+		return
 	}
 	v.optStr(path, m, "role")
 	v.stringArray(path, m, "verification_modes", 1, false, nil)

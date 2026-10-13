@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -153,18 +156,20 @@ func TestOriginRevocationCheckerLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	ctx := context.Background()
 	jwk, _ := PublicDirectoryKey(rig.key)
+	oldKid := strings.Repeat("o", 43) // thumbprint-shaped
 	updated := now.Add(-time.Minute)
-	rig.revs.set(t, revocationPayload{Updated: rfc3339(updated), NextUpdate: rfc3339(updated.Add(5 * time.Minute)), RevokedKids: []string{"old-kid"},
-		Details: map[string]map[string]string{"old-kid": {"reason": "keyCompromise", "invalidity_date": "2026-01-01T00:00:00Z"}}})
+	rig.revs.set(t, revocationPayload{Updated: rfc3339(updated), NextUpdate: rfc3339(updated.Add(5 * time.Minute)), RevokedKids: []string{oldKid, "operator-chosen-kid"},
+		Details: map[string]map[string]string{oldKid: {"reason": "keyCompromise", "invalidity_date": "2026-01-01T00:00:00Z"}}})
 
 	revoked, err := checker.RevokedWBAKey(ctx, rig.origin, jwk.Kid)
 	require.NoError(t, err)
 	require.False(t, revoked)
-	revoked, err = checker.RevokedWBAKey(ctx, rig.origin, "old-kid")
+	revoked, err = checker.RevokedWBAKey(ctx, rig.origin, oldKid)
 	require.NoError(t, err)
 	require.True(t, revoked)
 	require.Equal(t, 1, rig.revs.fetches, "served from cache before next_update")
-	d, ok := checker.Details(rig.origin, "old-kid")
+	require.Equal(t, []string{oldKid}, checker.RevokedKids(rig.origin), "only thumbprint-shaped kids, which a WBA keyid can match, are retained")
+	d, ok := checker.Details(rig.origin, oldKid)
 	require.True(t, ok)
 	require.True(t, d.Exposes(now))
 
@@ -174,14 +179,14 @@ func TestOriginRevocationCheckerLifecycle(t *testing.T) {
 	updated = now.Add(-10 * time.Second)
 	rig.revs.set(t, revocationPayload{Updated: rfc3339(updated), NextUpdate: rfc3339(updated.Add(5 * time.Minute)), RevokedKids: []string{jwk.Kid},
 		Details: map[string]map[string]string{jwk.Kid: {"reason": "superseded"}}})
-	revoked, err = checker.RevokedWBAKey(ctx, rig.origin, "old-kid")
+	revoked, err = checker.RevokedWBAKey(ctx, rig.origin, oldKid)
 	require.NoError(t, err)
 	require.True(t, revoked, "an origin cannot un-revoke a key")
 	revoked, _ = checker.RevokedWBAKey(ctx, rig.origin, jwk.Kid)
 	require.True(t, revoked)
-	d, _ = checker.Details(rig.origin, "old-kid")
+	d, _ = checker.Details(rig.origin, oldKid)
 	require.Equal(t, RevocationReasonKeyCompromise, d.Reason)
-	require.ElementsMatch(t, []string{"old-kid", jwk.Kid}, checker.RevokedKids(rig.origin))
+	require.ElementsMatch(t, []string{oldKid, jwk.Kid}, checker.RevokedKids(rig.origin))
 	require.True(t, slices.IsSorted(checker.RevokedKids(rig.origin)))
 
 	// A list older than the cached one is refused (no rollback); within
@@ -223,59 +228,78 @@ func TestOriginRevocationCheckerAdmission(t *testing.T) {
 	dirs := newFakeDirectories()
 	resolver := NewDirectoryResolver(DirectoryResolverOptions{Fetch: dirs.fetch, Clock: clock})
 	servers := map[string]*revocationServer{}
+	var mu sync.Mutex
 	fetch := func(ctx context.Context, url, inm, ims string) (*RevocationFetchResult, error) {
-		origin := strings.TrimSuffix(url, RevocationListPath)
-		s := servers[origin]
+		mu.Lock()
+		s := servers[strings.TrimSuffix(url, RevocationListPath)]
+		mu.Unlock()
 		if s == nil {
 			return &RevocationFetchResult{Status: http.StatusNotFound}, nil
 		}
 		return s.fetch(ctx, url, inm, ims)
 	}
-	publish := func(origin string) {
+	revokedKid := strings.Repeat("r", 43)
+	publish := func(origin string, revoked ...string) {
 		key := newEd25519(t)
 		dirs.publish(t, origin, now.Add(-time.Minute), time.Hour, key)
 		s := newRevocationServer(t, origin, key)
-		s.set(t, revocationPayload{Updated: rfc3339(now.Add(-time.Minute)), NextUpdate: rfc3339(now.Add(30 * time.Minute))})
+		s.set(t, revocationPayload{Updated: rfc3339(now.Add(-time.Minute)), NextUpdate: rfc3339(now.Add(30 * time.Minute)), RevokedKids: revoked})
+		mu.Lock()
 		servers[origin] = s
+		mu.Unlock()
 	}
 	checker, _ := NewOriginRevocationChecker(OriginRevocationCheckerOptions{Keys: resolver, Fetch: fetch, Clock: clock, MaxOrigins: 3, MaxOriginsPerOperator: 2})
 	ctx := context.Background()
+	admitted := func() int { checker.mu.Lock(); defer checker.mu.Unlock(); return len(checker.origins) }
 
 	// A failed first discovery (no list published) costs a cooldown, not an
 	// admission slot.
-	for range 5 {
+	for range 3 {
 		_, err := checker.RevokedWBAKey(ctx, "https://missing.example.net", "k")
 		requireWBAStatus(t, err, http.StatusForbidden)
 	}
-	publish("https://a.example.com")
-	publish("https://b.example.com")
-	publish("https://c.example.com")
-	publish("https://d.example.org")
-	publish("https://e.example.org")
-	for _, o := range []string{"https://a.example.com", "https://b.example.com"} {
-		_, err := checker.RevokedWBAKey(ctx, o, "k")
-		require.NoError(t, err)
-	}
-	// One operator cannot take more than its quota.
-	_, err := checker.RevokedWBAKey(ctx, "https://c.example.com", "k")
-	requireWBAStatus(t, err, http.StatusTooManyRequests)
-	// Other operators still get room, up to the global cap.
-	_, err = checker.RevokedWBAKey(ctx, "https://d.example.org", "k")
-	require.NoError(t, err)
-	_, err = checker.RevokedWBAKey(ctx, "https://e.example.org", "k")
-	requireWBAStatus(t, err, http.StatusTooManyRequests)
+	require.Zero(t, admitted())
 
-	// The cooldown expires, and a now-published list is admitted... once
-	// capacity allows.
-	publish("https://missing.example.net")
-	now = now.Add(61 * time.Second)
-	_, err = checker.RevokedWBAKey(ctx, "https://missing.example.net", "k")
-	requireWBAStatus(t, err, http.StatusTooManyRequests)
+	publish("https://a.example.com", revokedKid)
+	for _, o := range []string{"https://b.example.com", "https://c.example.com", "https://d.example.org", "https://e.example.org", "https://f.example.edu"} {
+		publish(o)
+	}
+	revoked, err := checker.RevokedWBAKey(ctx, "https://a.example.com", revokedKid)
+	require.NoError(t, err)
+	require.True(t, revoked)
+	for _, o := range []string{"https://b.example.com", "https://c.example.com"} {
+		_, err := checker.RevokedWBAKey(ctx, o, "k")
+		require.NoError(t, err, "an operator over its quota evicts its own oldest origin, never locks out")
+	}
+	require.Equal(t, 2, admitted())
+	for _, o := range []string{"https://d.example.org", "https://e.example.org", "https://f.example.edu"} {
+		_, err := checker.RevokedWBAKey(ctx, o, "k")
+		require.NoError(t, err, "a full checker evicts its least recently used origin")
+	}
+	require.Equal(t, 3, admitted())
+
+	// The evicted origin's revocations are retained: an attacker who
+	// regains it cannot serve an older list to un-revoke a key.
+	mu.Lock()
+	servers["https://a.example.com"].set(t, revocationPayload{Updated: rfc3339(now.Add(-time.Hour)), NextUpdate: rfc3339(now.Add(time.Hour))})
+	mu.Unlock()
+	revoked, err = checker.RevokedWBAKey(ctx, "https://a.example.com", revokedKid)
+	require.NoError(t, err)
+	require.True(t, revoked, "history survives eviction")
+	require.Equal(t, []string{revokedKid}, checker.RevokedKids("https://a.example.com"))
+
+	// A list over the retained-entry bound fails that origin closed.
+	many := make([]string, maxRetainedRevocations+1)
+	for i := range many {
+		many[i] = fmt.Sprintf("%043d", i)
+	}
+	publish("https://g.example.info", many...)
+	_, err = checker.RevokedWBAKey(ctx, "https://g.example.info", "k")
+	requireWBAStatus(t, err, http.StatusForbidden)
 
 	// A list signed by a key outside the origin's directory is refused.
 	dirs2 := newFakeDirectories()
-	key := newEd25519(t)
-	dirs2.publish(t, "https://x.example.com", now.Add(-time.Minute), time.Hour, key)
+	dirs2.publish(t, "https://x.example.com", now.Add(-time.Minute), time.Hour, newEd25519(t))
 	s := newRevocationServer(t, "https://x.example.com", newEd25519(t))
 	s.set(t, revocationPayload{Updated: rfc3339(now.Add(-time.Minute)), NextUpdate: rfc3339(now.Add(30 * time.Minute))})
 	c2, _ := NewOriginRevocationChecker(OriginRevocationCheckerOptions{Keys: NewDirectoryResolver(DirectoryResolverOptions{Fetch: dirs2.fetch, Clock: clock}), Fetch: s.fetch, Clock: clock})
@@ -284,4 +308,39 @@ func TestOriginRevocationCheckerAdmission(t *testing.T) {
 
 	_, err = NewOriginRevocationChecker(OriginRevocationCheckerOptions{})
 	require.Error(t, err)
+}
+
+// TestOriginRevocationRefreshIsDetachedFromTheCaller: a caller that gives
+// up does not abort the shared refresh, and the refresh holds no lock
+// across I/O, so a concurrent check returns as soon as it completes.
+func TestOriginRevocationRefreshIsDetachedFromTheCaller(t *testing.T) {
+	now := wbaTestNow
+	clock := func() time.Time { return now }
+	rig := newWBARig(t)
+	rig.resolver = NewDirectoryResolver(DirectoryResolverOptions{Fetch: rig.dirs.fetch, Clock: clock})
+	release := make(chan struct{})
+	var fetches atomic.Int32
+	fetch := func(ctx context.Context, url, inm, ims string) (*RevocationFetchResult, error) {
+		fetches.Add(1)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return rig.revs.fetch(ctx, url, inm, ims)
+	}
+	checker, _ := NewOriginRevocationChecker(OriginRevocationCheckerOptions{Keys: rig.resolver, Fetch: fetch, Clock: clock})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error)
+	go func() { _, err := checker.RevokedWBAKey(ctx, rig.origin, "k"); done <- err }()
+	require.Eventually(t, func() bool { return fetches.Load() == 1 }, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	close(release)
+	// The shared discovery completed despite the cancellation.
+	require.Eventually(t, func() bool {
+		_, err := checker.RevokedWBAKey(context.Background(), rig.origin, "k")
+		return err == nil
+	}, time.Second, time.Millisecond)
+	require.Equal(t, int32(1), fetches.Load())
 }

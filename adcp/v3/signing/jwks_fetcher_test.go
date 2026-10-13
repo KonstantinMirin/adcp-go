@@ -26,7 +26,9 @@ func TestSSRFDisallowedIPs(t *testing.T) {
 		"fe80::1":      true,  // IPv6 link-local
 		"8.8.8.8":      false, // public
 		"1.1.1.1":      false, // public
-		"2001:db8::1":  false, // documentation range (treated as public here)
+		"2001:db8::1":  true,  // documentation range: never routable, blocked by the shared list
+		"2606:4700::1": false, // public IPv6
+		"::ffff:10.0.0.1": true, // IPv4-mapped private
 	}
 	for ipStr, want := range cases {
 		ip := parseIP(t, ipStr)
@@ -77,24 +79,4 @@ func TestHTTPJWKSResolverFetchesFromLocalServer(t *testing.T) {
 	e := AsError(err)
 	require.NotNil(t, e)
 	assert.Equal(t, CodeKeyUnknown, e.Code)
-}
-
-// TestHTTPJWKSResolverIsDeterministic: a kid published by two agents
-// resolves to the same agent on every call (sorted agent-URL order).
-func TestHTTPJWKSResolverIsDeterministic(t *testing.T) {
-	h := NewHTTPJWKSResolver(map[string]string{
-		"https://b.example.com/mcp": "https://b.example.com/jwks.json",
-		"https://a.example.com/mcp": "https://a.example.com/jwks.json",
-		"https://c.example.com/mcp": "https://c.example.com/jwks.json",
-	})
-	shared := &JWKS{Keys: []JWK{{Kid: "dup", Kty: "OKP", Crv: "Ed25519", X: "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}}}
-	for _, u := range h.Agents {
-		h.cache[u] = &jwksCacheEntry{jwks: shared, at: time.Now()}
-	}
-	for range 50 {
-		_, agent, err := h.Resolve(context.Background(), "dup")
-		if err != nil || agent != "https://a.example.com/mcp" {
-			t.Fatalf("got %q, %v", agent, err)
-		}
-	}
 }

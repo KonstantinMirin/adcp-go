@@ -1,6 +1,7 @@
 package identity
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -10,24 +11,26 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"strings"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/adcontextprotocol/adcp-go/adcp/v3"
 	"github.com/adcontextprotocol/adcp-go/adcp/v3/signing"
+	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/require"
 )
 
 // The grant fixtures model DR-0025's parties:
-//   - brand.com, the brand, which publishes grants;
-//   - agency.com, an agency named as account.operator;
-//   - platform.com, a platform hosting the agency's buying agent;
-//   - buyer agents at https://buy.agency.com and https://agent.platform.com.
+//   - brand-7k3q.com, the brand, which publishes grants;
+//   - agency-7k3q.com, an agency named as account.operator;
+//   - platform-7k3q.com, a platform hosting the agency's buying agent;
+//   - buyer agents at https://buy.agency-7k3q.com and https://agent.platform-7k3q.com.
 const (
-	agencyAgent   = "https://buy.agency.com"
-	platformAgent = "https://agent.platform.com"
+	agencyAgent   = "https://buy.agency-7k3q.com"
+	platformAgent = "https://agent.platform-7k3q.com"
 )
 
 func grantRig(t *testing.T, records map[string]string) *evalRig {
@@ -40,8 +43,8 @@ func grantRig(t *testing.T, records map[string]string) *evalRig {
 }
 
 var baseRecords = map[string]string{
-	"agency.com":   `{"agents":[{"url":"https://buy.agency.com/mcp","roles":["adcp:buying"]}]}`,
-	"platform.com": `{"agents":[{"url":"https://agent.platform.com/mcp","roles":["adcp:buying"]}]}`,
+	"agency-7k3q.com":   `{"agents":[{"url":"https://buy.agency-7k3q.com/mcp","roles":["adcp:buying"]}]}`,
+	"platform-7k3q.com": `{"agents":[{"url":"https://agent.platform-7k3q.com/mcp","roles":["adcp:buying"]}]}`,
 }
 
 func with(records map[string]string, extra map[string]string) map[string]string {
@@ -56,7 +59,7 @@ func with(records map[string]string, extra map[string]string) map[string]string 
 }
 
 func TestGrantEvaluation(t *testing.T) {
-	brandGrantsAgency := `{"grants":[{"grantee":"agency.com","scopes":["adcp:media_buying"],"countries":["US","CA"],"profiles":{"adcp":{"brands":["nova"]}},"valid_until":"2027-06-30T00:00:00Z"}]}`
+	brandGrantsAgency := `{"grants":[{"grantee":"agency-7k3q.com","scopes":["adcp:media_buying"],"countries":["US","CA"],"profiles":{"adcp":{"brands":["nova"]}},"valid_until":"2027-06-30T00:00:00Z"}]}`
 	cases := []struct {
 		name    string
 		records map[string]string
@@ -66,141 +69,141 @@ func TestGrantEvaluation(t *testing.T) {
 	}{
 		{
 			name:    "implicit when operator, brand, and signer share a registrable domain",
-			records: map[string]string{"agency.com": baseRecords["agency.com"]},
-			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "house.agency.com", AccountOperator: "agency.com"},
+			records: map[string]string{"agency-7k3q.com": baseRecords["agency-7k3q.com"]},
+			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "house.agency-7k3q.com", AccountOperator: "agency-7k3q.com"},
 			want:    true,
 		},
 		{
 			name:    "direct grant to the signer's operator, which is account.operator",
-			records: with(baseRecords, map[string]string{"brand.com": brandGrantsAgency}),
-			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand.com", AccountOperator: "agency.com", BrandID: "nova", Countries: []string{"US"}},
+			records: with(baseRecords, map[string]string{"brand-7k3q.com": brandGrantsAgency}),
+			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com", BrandID: "nova", Countries: []string{"US"}},
 			want:    true,
 		},
 		{
 			name:    "a grant does not cover a brand it does not list",
-			records: with(baseRecords, map[string]string{"brand.com": brandGrantsAgency}),
-			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand.com", AccountOperator: "agency.com", BrandID: "other", Countries: []string{"US"}},
+			records: with(baseRecords, map[string]string{"brand-7k3q.com": brandGrantsAgency}),
+			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com", BrandID: "other", Countries: []string{"US"}},
 			reason:  GrantReasonAbsent,
 		},
 		{
 			name:    "a country-limited grant covers no claim outside it",
-			records: with(baseRecords, map[string]string{"brand.com": brandGrantsAgency}),
-			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand.com", AccountOperator: "agency.com", BrandID: "nova", Countries: []string{"US", "MX"}},
+			records: with(baseRecords, map[string]string{"brand-7k3q.com": brandGrantsAgency}),
+			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com", BrandID: "nova", Countries: []string{"US", "MX"}},
 			reason:  GrantReasonAbsent,
 		},
 		{
 			name:    "a country-limited grant covers no claim without countries",
-			records: with(baseRecords, map[string]string{"brand.com": brandGrantsAgency}),
-			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand.com", AccountOperator: "agency.com", BrandID: "nova"},
+			records: with(baseRecords, map[string]string{"brand-7k3q.com": brandGrantsAgency}),
+			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com", BrandID: "nova"},
 			reason:  GrantReasonAbsent,
 		},
 		{
 			name:    "the scope must be covered",
-			records: with(baseRecords, map[string]string{"brand.com": brandGrantsAgency}),
-			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand.com", AccountOperator: "agency.com", BrandID: "nova", Countries: []string{"US"}, Scope: ScopeCreativeGeneration},
+			records: with(baseRecords, map[string]string{"brand-7k3q.com": brandGrantsAgency}),
+			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com", BrandID: "nova", Countries: []string{"US"}, Scope: ScopeCreativeGeneration},
 			reason:  GrantReasonAbsent,
 		},
 		{
 			name: "adcp:all covers adcp scopes and * covers everything",
-			records: with(baseRecords, map[string]string{"brand.com": `{"grants":[{"grantee":"agency.com","scopes":["adcp:all"]}]}`,
-				"other.com": `{"grants":[{"grantee":"agency.com","scopes":["*"]}]}`}),
-			req:  GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand.com", AccountOperator: "agency.com", Scope: ScopeCreativeGeneration},
+			records: with(baseRecords, map[string]string{"brand-7k3q.com": `{"grants":[{"grantee":"agency-7k3q.com","scopes":["adcp:all"]}]}`,
+				"other-7k3q.com": `{"grants":[{"grantee":"agency-7k3q.com","scopes":["*"]}]}`}),
+			req:  GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com", Scope: ScopeCreativeGeneration},
 			want: true,
 		},
 		{
 			name:    "account.operator must be on the chain",
-			records: with(baseRecords, map[string]string{"brand.com": brandGrantsAgency}),
-			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand.com", AccountOperator: "someone-else.com", BrandID: "nova", Countries: []string{"US"}},
+			records: with(baseRecords, map[string]string{"brand-7k3q.com": brandGrantsAgency}),
+			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "someone-else-7k3q.com", BrandID: "nova", Countries: []string{"US"}},
 			reason:  GrantReasonAbsent,
 		},
 		{
 			name: "chain through account.operator to the hosting platform",
 			records: with(baseRecords, map[string]string{
-				"brand.com":  brandGrantsAgency,
-				"agency.com": `{"agents":[{"url":"https://buy.agency.com/mcp","roles":["adcp:buying"]}],"grants":[{"grantee":"platform.com","scopes":["adcp:media_buying"],"agents":[{"url":"https://agent.platform.com/mcp"}]}]}`,
+				"brand-7k3q.com":  brandGrantsAgency,
+				"agency-7k3q.com": `{"agents":[{"url":"https://buy.agency-7k3q.com/mcp","roles":["adcp:buying"]}],"grants":[{"grantee":"platform-7k3q.com","scopes":["adcp:media_buying"],"agents":[{"url":"https://agent.platform-7k3q.com/mcp"}]}]}`,
 			}),
-			req:  GrantRequest{AgentOrigin: platformAgent, BrandDomain: "brand.com", AccountOperator: "agency.com", BrandID: "nova", Countries: []string{"CA"}},
+			req:  GrantRequest{AgentOrigin: platformAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com", BrandID: "nova", Countries: []string{"CA"}},
 			want: true,
 		},
 		{
 			name: "intersection: the second link must cover the claim's countries too",
 			records: with(baseRecords, map[string]string{
-				"brand.com":  brandGrantsAgency,
-				"agency.com": `{"agents":[{"url":"https://buy.agency.com/mcp","roles":["adcp:buying"]}],"grants":[{"grantee":"platform.com","scopes":["adcp:media_buying"],"countries":["US"]}]}`,
+				"brand-7k3q.com":  brandGrantsAgency,
+				"agency-7k3q.com": `{"agents":[{"url":"https://buy.agency-7k3q.com/mcp","roles":["adcp:buying"]}],"grants":[{"grantee":"platform-7k3q.com","scopes":["adcp:media_buying"],"countries":["US"]}]}`,
 			}),
-			req:    GrantRequest{AgentOrigin: platformAgent, BrandDomain: "brand.com", AccountOperator: "agency.com", BrandID: "nova", Countries: []string{"CA"}},
+			req:    GrantRequest{AgentOrigin: platformAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com", BrandID: "nova", Countries: []string{"CA"}},
 			reason: GrantReasonAbsent,
 		},
 		{
 			name: "agents[] narrowing is matched by canonical origin",
 			records: with(baseRecords, map[string]string{
-				"brand.com":  brandGrantsAgency,
-				"agency.com": `{"agents":[{"url":"https://buy.agency.com/mcp","roles":["adcp:buying"]}],"grants":[{"grantee":"platform.com","scopes":["adcp:media_buying"],"agents":[{"url":"https://other.platform.com/mcp"}]}]}`,
+				"brand-7k3q.com":  brandGrantsAgency,
+				"agency-7k3q.com": `{"agents":[{"url":"https://buy.agency-7k3q.com/mcp","roles":["adcp:buying"]}],"grants":[{"grantee":"platform-7k3q.com","scopes":["adcp:media_buying"],"agents":[{"url":"https://other.platform-7k3q.com/mcp"}]}]}`,
 			}),
-			req:    GrantRequest{AgentOrigin: platformAgent, BrandDomain: "brand.com", AccountOperator: "agency.com", BrandID: "nova", Countries: []string{"CA"}},
+			req:    GrantRequest{AgentOrigin: platformAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com", BrandID: "nova", Countries: []string{"CA"}},
 			reason: GrantReasonAbsent,
 		},
 		{
 			name: "no third link: a grant to account.operator's grantee's grantee is not followed",
 			records: with(baseRecords, map[string]string{
-				"brand.com":    `{"grants":[{"grantee":"agency.com","scopes":["adcp:media_buying"]}]}`,
-				"agency.com":   `{"agents":[{"url":"https://buy.agency.com/mcp","roles":["adcp:buying"]}],"grants":[{"grantee":"middle.com","scopes":["adcp:media_buying"]}]}`,
-				"middle.com":   `{"grants":[{"grantee":"platform.com","scopes":["adcp:media_buying"]}]}`,
-				"platform.com": baseRecords["platform.com"],
+				"brand-7k3q.com":    `{"grants":[{"grantee":"agency-7k3q.com","scopes":["adcp:media_buying"]}]}`,
+				"agency-7k3q.com":   `{"agents":[{"url":"https://buy.agency-7k3q.com/mcp","roles":["adcp:buying"]}],"grants":[{"grantee":"middle-7k3q.com","scopes":["adcp:media_buying"]}]}`,
+				"middle-7k3q.com":   `{"grants":[{"grantee":"platform-7k3q.com","scopes":["adcp:media_buying"]}]}`,
+				"platform-7k3q.com": baseRecords["platform-7k3q.com"],
 			}),
-			req:    GrantRequest{AgentOrigin: platformAgent, BrandDomain: "brand.com", AccountOperator: "agency.com"},
+			req:    GrantRequest{AgentOrigin: platformAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"},
 			reason: GrantReasonAbsent,
 		},
 		{
 			name: "the buyer operator's record never authorizes a brand outside its domain",
 			records: with(baseRecords, map[string]string{
-				"brand.com":  `{"grants":[]}`,
-				"agency.com": `{"agents":[{"url":"https://buy.agency.com/mcp","roles":["adcp:buying"]}],"grants":[{"grantee":"agency.com","scopes":["*"]}]}`,
+				"brand-7k3q.com":  `{"grants":[]}`,
+				"agency-7k3q.com": `{"agents":[{"url":"https://buy.agency-7k3q.com/mcp","roles":["adcp:buying"]}],"grants":[{"grantee":"agency-7k3q.com","scopes":["*"]}]}`,
 			}),
-			req:    GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand.com", AccountOperator: "agency.com"},
+			req:    GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"},
 			reason: GrantReasonAbsent,
 		},
 		{
 			name:    "an expired grant",
-			records: with(baseRecords, map[string]string{"brand.com": `{"grants":[{"grantee":"agency.com","scopes":["adcp:media_buying"],"valid_until":"2026-10-13T11:00:00Z"}]}`}),
-			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand.com", AccountOperator: "agency.com"},
+			records: with(baseRecords, map[string]string{"brand-7k3q.com": `{"grants":[{"grantee":"agency-7k3q.com","scopes":["adcp:media_buying"],"valid_until":"2026-10-13T11:00:00Z"}]}`}),
+			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"},
 			reason:  GrantReasonAbsent,
 		},
 		{
 			name:    "a grant not yet valid",
-			records: with(baseRecords, map[string]string{"brand.com": `{"grants":[{"grantee":"agency.com","scopes":["adcp:media_buying"],"valid_from":"2026-10-14T00:00:00Z"}]}`}),
-			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand.com", AccountOperator: "agency.com"},
+			records: with(baseRecords, map[string]string{"brand-7k3q.com": `{"grants":[{"grantee":"agency-7k3q.com","scopes":["adcp:media_buying"],"valid_from":"2026-10-14T00:00:00Z"}]}`}),
+			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"},
 			reason:  GrantReasonAbsent,
 		},
 		{
 			name:    "Web Bot Auth: the signer's operator must list the origin with adcp:buying",
-			records: map[string]string{"agency.com": `{"agents":[{"url":"https://buy.agency.com/mcp","roles":["adcp:sales"]}]}`},
-			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "agency.com", AccountOperator: "agency.com"},
+			records: map[string]string{"agency-7k3q.com": `{"agents":[{"url":"https://buy.agency-7k3q.com/mcp","roles":["adcp:sales"]}]}`},
+			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "agency-7k3q.com", AccountOperator: "agency-7k3q.com"},
 			reason:  GrantReasonSignerRecordUnavailable,
 		},
 		{
 			name:    "a brand trust record that cannot be fetched is not absence",
 			records: baseRecords,
-			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "down.com", AccountOperator: "agency.com"},
+			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "down-7k3q.com", AccountOperator: "agency-7k3q.com"},
 			reason:  GrantReasonTrustRecordUnavailable,
 		},
 		{
 			name:    "a brand that publishes no trust record and no legacy hook",
 			records: baseRecords,
-			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand.com", AccountOperator: "agency.com"},
+			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"},
 			reason:  GrantReasonTrustRecordAbsent,
 		},
 		{
 			name:    "no registrable domain",
 			records: baseRecords,
-			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand.example", AccountOperator: "agency.com"},
+			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand.example", AccountOperator: "agency-7k3q.com"},
 			reason:  GrantReasonAbsent,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := grantRig(t, tc.records)
-			r.server.fail(trustURL("down.com"), errors.New("timeout"))
+			r.server.fail(trustURL("down-7k3q.com"), errors.New("timeout"))
 			g := &GrantEvaluator{Records: r.eval}
 			res, err := g.Check(context.Background(), tc.req)
 			require.NoError(t, err)
@@ -218,11 +221,11 @@ func TestGrantEvaluation(t *testing.T) {
 
 func TestGrantExpiryIsTheEarliestOnTheChain(t *testing.T) {
 	r := grantRig(t, with(baseRecords, map[string]string{
-		"brand.com":  `{"grants":[{"grantee":"agency.com","scopes":["adcp:media_buying"],"valid_until":"2026-10-13T12:00:50Z"}]}`,
-		"agency.com": `{"agents":[{"url":"https://buy.agency.com/mcp","roles":["adcp:buying"]}],"grants":[{"grantee":"platform.com","scopes":["adcp:media_buying"],"valid_until":"2026-10-13T12:00:30Z"},{"grantee":"platform.com","scopes":["adcp:media_buying"],"valid_until":"2026-10-13T12:00:40Z"}]}`,
+		"brand-7k3q.com":  `{"grants":[{"grantee":"agency-7k3q.com","scopes":["adcp:media_buying"],"valid_until":"2026-10-13T12:00:50Z"}]}`,
+		"agency-7k3q.com": `{"agents":[{"url":"https://buy.agency-7k3q.com/mcp","roles":["adcp:buying"]}],"grants":[{"grantee":"platform-7k3q.com","scopes":["adcp:media_buying"],"valid_until":"2026-10-13T12:00:30Z"},{"grantee":"platform-7k3q.com","scopes":["adcp:media_buying"],"valid_until":"2026-10-13T12:00:40Z"}]}`,
 	}))
 	g := &GrantEvaluator{Records: r.eval}
-	res, err := g.Check(context.Background(), GrantRequest{AgentOrigin: platformAgent, BrandDomain: "brand.com", AccountOperator: "agency.com"})
+	res, err := g.Check(context.Background(), GrantRequest{AgentOrigin: platformAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"})
 	require.NoError(t, err)
 	require.True(t, res.Authorized)
 	require.Equal(t, time.Date(2026, 10, 13, 12, 0, 40, 0, time.UTC), res.ExpiresAt, "min over links of each link's latest valid_until")
@@ -230,27 +233,27 @@ func TestGrantExpiryIsTheEarliestOnTheChain(t *testing.T) {
 
 func TestGrantExpiringDuringIntermediaryFetchIsNotAuthorized(t *testing.T) {
 	r := grantRig(t, with(baseRecords, map[string]string{
-		"brand.com":  `{"grants":[{"grantee":"agency.com","scopes":["adcp:media_buying"],"valid_until":"2026-10-13T12:00:05Z"}]}`,
-		"agency.com": `{"agents":[{"url":"https://buy.agency.com/mcp","roles":["adcp:buying"]}],"grants":[{"grantee":"platform.com","scopes":["adcp:media_buying"]}]}`,
+		"brand-7k3q.com":  `{"grants":[{"grantee":"agency-7k3q.com","scopes":["adcp:media_buying"],"valid_until":"2026-10-13T12:00:05Z"}]}`,
+		"agency-7k3q.com": `{"agents":[{"url":"https://buy.agency-7k3q.com/mcp","roles":["adcp:buying"]}],"grants":[{"grantee":"platform-7k3q.com","scopes":["adcp:media_buying"]}]}`,
 	}))
 	// Evaluate brand and signer first so only the intermediary fetch runs
 	// during Check, and advance the clock as it happens.
-	_, _ = r.eval.Evaluate(context.Background(), "brand.com", "")
+	_, _ = r.eval.Evaluate(context.Background(), "brand-7k3q.com", "")
 	_, _ = r.eval.Evaluate(context.Background(), platformAgent, RoleBuying)
 	fetch := r.server.fetch
 	eval, _ := NewTrustRecordEvaluator(TrustRecordEvaluatorOptions{
 		Clock: func() time.Time { return r.now }, PollingInterval: time.Minute,
 		Fetch: func(ctx context.Context, url string) (*TrustResponse, error) {
-			if url == trustURL("agency.com") {
+			if url == trustURL("agency-7k3q.com") {
 				r.now = r.now.Add(10 * time.Second)
 			}
 			return fetch(ctx, url)
 		},
 	})
-	_, _ = eval.Evaluate(context.Background(), "brand.com", "")
+	_, _ = eval.Evaluate(context.Background(), "brand-7k3q.com", "")
 	_, _ = eval.Evaluate(context.Background(), platformAgent, RoleBuying)
 	g := &GrantEvaluator{Records: eval}
-	res, err := g.Check(context.Background(), GrantRequest{AgentOrigin: platformAgent, BrandDomain: "brand.com", AccountOperator: "agency.com"})
+	res, err := g.Check(context.Background(), GrantRequest{AgentOrigin: platformAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"})
 	require.NoError(t, err)
 	require.False(t, res.Authorized)
 }
@@ -258,19 +261,19 @@ func TestGrantExpiringDuringIntermediaryFetchIsNotAuthorized(t *testing.T) {
 func TestGrantExclusiveAndHooks(t *testing.T) {
 	yes := func(context.Context, GrantRequest) (bool, error) { return true, nil }
 	fail := func(context.Context, GrantRequest) (bool, error) { return false, errors.New("db down") }
-	req := GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand.com", AccountOperator: "agency.com"}
+	req := GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"}
 	ctx := context.Background()
 
 	// Without exclusive_grants, an uncovered claim is at the seller's
 	// discretion.
-	r := grantRig(t, with(baseRecords, map[string]string{"brand.com": `{"grants":[{"grantee":"x.com","scopes":["adcp:media_buying"]}]}`}))
+	r := grantRig(t, with(baseRecords, map[string]string{"brand-7k3q.com": `{"grants":[{"grantee":"x-7k3q.com","scopes":["adcp:media_buying"]}]}`}))
 	res, _ := (&GrantEvaluator{Records: r.eval, SellerAuthorization: yes}).Check(ctx, req)
 	require.True(t, res.Authorized)
 	res, _ = (&GrantEvaluator{Records: r.eval, SellerAuthorization: fail}).Check(ctx, req)
 	require.False(t, res.Authorized, "a hook error fails closed")
 
 	// exclusive_grants makes grants[] exhaustive for the scopes it names...
-	r = grantRig(t, with(baseRecords, map[string]string{"brand.com": `{"grants":[{"grantee":"x.com","scopes":["adcp:media_buying"]}],"exclusive_grants":true}`}))
+	r = grantRig(t, with(baseRecords, map[string]string{"brand-7k3q.com": `{"grants":[{"grantee":"x-7k3q.com","scopes":["adcp:media_buying"]}],"exclusive_grants":true}`}))
 	res, _ = (&GrantEvaluator{Records: r.eval, SellerAuthorization: yes}).Check(ctx, req)
 	require.False(t, res.Authorized)
 	require.Equal(t, GrantReasonAbsent, res.Reason)
@@ -283,7 +286,7 @@ func TestGrantExclusiveAndHooks(t *testing.T) {
 	// A 200 from the brand's trust.json disables the legacy brand.json hook.
 	legacyCalled := false
 	legacy := func(context.Context, GrantRequest) (bool, error) { legacyCalled = true; return true, nil }
-	r = grantRig(t, with(baseRecords, map[string]string{"brand.com": `{"grants":[]}`}))
+	r = grantRig(t, with(baseRecords, map[string]string{"brand-7k3q.com": `{"grants":[]}`}))
 	res, _ = (&GrantEvaluator{Records: r.eval, LegacyAuthorization: legacy}).Check(ctx, req)
 	require.False(t, res.Authorized)
 	require.False(t, legacyCalled)
@@ -299,7 +302,7 @@ func TestGrantExclusiveAndHooks(t *testing.T) {
 	legacyCalled = false
 	sellerCalled := false
 	r = grantRig(t, baseRecords)
-	r.server.fail(trustURL("brand.com"), errors.New("timeout"))
+	r.server.fail(trustURL("brand-7k3q.com"), errors.New("timeout"))
 	res, _ = (&GrantEvaluator{Records: r.eval, LegacyAuthorization: legacy, SellerAuthorization: func(context.Context, GrantRequest) (bool, error) {
 		sellerCalled = true
 		return true, nil
@@ -315,13 +318,13 @@ func TestGrantExclusiveAndHooks(t *testing.T) {
 func TestGrantRFC9421Signer(t *testing.T) {
 	ctx := context.Background()
 	legacy := func(context.Context, GrantRequest) (bool, error) { return true, nil }
-	req := GrantRequest{AgentOrigin: "https://legacy.agency.com/mcp", BrandDomain: "brand.com", AccountOperator: "agency.com", SigningProfile: signing.ProfileTagRequestSigning}
+	req := GrantRequest{AgentOrigin: "https://legacy.agency-7k3q.com/mcp", BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com", SigningProfile: signing.ProfileTagRequestSigning}
 
 	r := grantRig(t, nil) // the agency publishes no trust record either
 	res, _ := (&GrantEvaluator{Records: r.eval, LegacyAuthorization: legacy}).Check(ctx, req)
 	require.True(t, res.Authorized, "no new operator record is needed before the brand publishes")
 
-	r = grantRig(t, map[string]string{"brand.com": `{"grants":[{"grantee":"agency.com","scopes":["adcp:media_buying"]}]}`})
+	r = grantRig(t, map[string]string{"brand-7k3q.com": `{"grants":[{"grantee":"agency-7k3q.com","scopes":["adcp:media_buying"]}]}`})
 	res, _ = (&GrantEvaluator{Records: r.eval, LegacyAuthorization: legacy}).Check(ctx, req)
 	require.False(t, res.Authorized)
 	require.Equal(t, GrantReasonSignerRecordUnavailable, res.Reason)
@@ -351,7 +354,7 @@ func permissionDetails(t *testing.T, err error) (string, map[string]any) {
 			handlerCalled = true
 			return nil, nil
 		},
-		SyncAccountsAuthorizer: func(context.Context, []adcp.AccountInput) error { return err },
+		SyncAccountsAuthorizer: func(context.Context, *mcp.CallToolRequest, []adcp.AccountInput) error { return err },
 	})
 	require.True(t, result.IsError)
 	require.False(t, handlerCalled, "no account is created when the gate denies")
@@ -380,7 +383,7 @@ func callSyncAccounts(t *testing.T, cfg adcp.Config) *mcp.CallToolResult {
 	defer func() { _ = cs.Close() }()
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "sync_accounts", Arguments: map[string]any{
 		"idempotency_key": "4f6c1a0e-8d2b-4b7e-9c3a-2e5d7f1b0a96",
-		"accounts":        []map[string]any{{"brand": map[string]any{"domain": "brand.com"}, "operator": "agency.com", "billing": "operator"}},
+		"accounts":        []map[string]any{{"brand": map[string]any{"domain": "brand-7k3q.com"}, "operator": "agency-7k3q.com", "billing": "operator"}},
 	}})
 	require.NoError(t, err)
 	return res
@@ -399,74 +402,187 @@ type noRevocations struct{}
 
 func (noRevocations) RevokedWBAKey(context.Context, string, string) (bool, error) { return false, nil }
 
-// contextWithSigner returns the request context the signing middleware
-// produces for a Web Bot Auth request verified from origin.
-func contextWithSigner(t *testing.T, origin string) context.Context {
+type stubAuthorizer map[string]string
+
+func (s stubAuthorizer) AuthorizeWBA(_ context.Context, signer *signing.VerifiedSigner, _ string) (string, error) {
+	return s[signer.AgentURL], nil
+}
+
+// wbaAgent is a Web Bot Auth signer for tests: an origin and its key.
+type wbaAgent struct {
+	origin string
+	key    ed25519.PrivateKey
+	jwk    signing.JWK
+}
+
+func newWBAAgent(t *testing.T, origin string) wbaAgent {
 	t.Helper()
 	_, key, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
 	jwk, err := signing.PublicDirectoryKey(key)
 	require.NoError(t, err)
-	var got context.Context
-	h := signing.Middleware(signing.MiddlewareOptions{
-		OperationResolver: signing.DefaultOperationResolver,
-		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		WebBotAuth: &signing.WebBotAuthOptions{
-			Keys:       stubKeys{origin: jwk},
-			Revocation: noRevocations{},
-			UnboundFor: []string{"sync_accounts"},
+	return wbaAgent{origin: origin, key: key, jwk: jwk}
+}
+
+// signingTransport WBA-signs every outbound request as the current agent.
+type signingTransport struct {
+	mu      sync.Mutex
+	current wbaAgent
+}
+
+func (s *signingTransport) use(a wbaAgent) { s.mu.Lock(); s.current = a; s.mu.Unlock() }
+
+func (s *signingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	s.mu.Lock()
+	a := s.current
+	s.mu.Unlock()
+	clone := r.Clone(r.Context())
+	if r.Body != nil {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		_ = r.Body.Close()
+		clone.Body = io.NopCloser(bytes.NewReader(b))
+	}
+	if err := signing.SignWebBotAuthRequest(clone, a.key, signing.WBASignOptions{AgentOrigin: a.origin}); err != nil {
+		return nil, err
+	}
+	return http.DefaultTransport.RoundTrip(clone)
+}
+
+// TestSyncAccountsGateUsesThePerRequestSigner drives a stateful MCP
+// session over HTTP: initialize is signed by one agent and tools/call by
+// another. The gate must evaluate the agent that signed the call, never the
+// session's initialize request.
+func TestSyncAccountsGateUsesThePerRequestSigner(t *testing.T) {
+	agentA := newWBAAgent(t, "https://buy.agency-7k3q.com")
+	agentB := newWBAAgent(t, "https://agent.platform-7k3q.com")
+	var seen []*signing.VerifiedSigner
+	var ctxSigners []*signing.VerifiedSigner
+	server := mcp.NewServer(&mcp.Implementation{Name: "seller", Version: "v0"}, nil)
+	adcp.Register(server, adcp.Config{
+		IdempotencyReplayTTL: 24 * time.Hour,
+		SyncAccounts: func(context.Context, *adcp.SyncAccountsRequest) ([]adcp.AccountResult, error) {
+			return []adcp.AccountResult{{AccountID: "acc_1", Status: "active"}}, nil
 		},
-	})(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { got = r.Context() }))
-	r := httptest.NewRequest(http.MethodPost, "https://seller.example.com/adcp/sync_accounts", strings.NewReader(`{}`))
-	r.Header.Set("Content-Type", "application/json")
-	require.NoError(t, signing.SignWebBotAuthRequest(r, key, signing.WBASignOptions{AgentOrigin: origin}))
-	h.ServeHTTP(httptest.NewRecorder(), r)
-	require.NotNil(t, got)
-	s := signing.VerifiedSignerFromContext(got)
-	require.NotNil(t, s)
-	require.Equal(t, origin, s.AgentURL)
-	return got
+		SyncAccountsAuthorizer: func(ctx context.Context, req *mcp.CallToolRequest, _ []adcp.AccountInput) error {
+			seen = append(seen, signing.VerifiedSignerFromToolRequest(req))
+			ctxSigners = append(ctxSigners, signing.VerifiedSignerFromContext(ctx))
+			return nil
+		},
+	})
+	handler := signing.Middleware(signing.MiddlewareOptions{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WebBotAuth: &signing.WebBotAuthOptions{
+			Keys:       stubKeys{agentA.origin: agentA.jwk, agentB.origin: agentB.jwk},
+			Revocation: noRevocations{},
+			Authorizer: stubAuthorizer{agentA.origin: "principal_a", agentB.origin: "principal_b"},
+		},
+	})(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	rt := &signingTransport{current: agentA}
+	ctx := context.Background()
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: "buyer", Version: "v0"}, nil).Connect(ctx,
+		&mcp.StreamableClientTransport{Endpoint: srv.URL, HTTPClient: &http.Client{Transport: rt}}, nil)
+	require.NoError(t, err)
+	defer func() { _ = cs.Close() }()
+
+	call := func() {
+		res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "sync_accounts", Arguments: map[string]any{
+			"idempotency_key": "4f6c1a0e-8d2b-4b7e-9c3a-2e5d7f1b0a9" + strconv.Itoa(len(seen)),
+			"accounts":        []map[string]any{{"brand": map[string]any{"domain": "brand-7k3q.com"}, "operator": "agency-7k3q.com", "billing": "operator"}},
+		}})
+		require.NoError(t, err)
+		require.False(t, res.IsError)
+	}
+	rt.use(agentB)
+	call()
+	rt.use(agentA)
+	call()
+	require.Len(t, seen, 2)
+	require.Equal(t, agentB.origin, seen[0].AgentURL)
+	require.Equal(t, "principal_b", seen[0].PrincipalID)
+	require.Equal(t, agentA.origin, seen[1].AgentURL)
+	require.Equal(t, "principal_a", seen[1].PrincipalID)
+	// The handler's ctx is the session's initialize request's (signed by A),
+	// so a ctx-based lookup would have evaluated the wrong agent for B.
+	require.NotNil(t, ctxSigners[0])
+	require.Equal(t, agentA.origin, ctxSigners[0].AgentURL, "the trap this API avoids")
+}
+
+// toolRequestWithSigner builds the CallToolRequest a tool handler receives
+// after Middleware verified signer.
+func toolRequestWithSigner(signer *signing.VerifiedSigner) *mcp.CallToolRequest {
+	if signer == nil {
+		return &mcp.CallToolRequest{}
+	}
+	return &mcp.CallToolRequest{Extra: &mcp.RequestExtra{TokenInfo: &auth.TokenInfo{Extra: map[string]any{signing.TokenInfoSignerKey: signer}}}}
 }
 
 func TestGrantGate(t *testing.T) {
 	ctx := context.Background()
-	r := grantRig(t, with(baseRecords, map[string]string{"brand.com": `{"grants":[{"grantee":"agency.com","scopes":["adcp:media_buying"]}]}`}))
+	r := grantRig(t, with(baseRecords, map[string]string{"brand-7k3q.com": `{"grants":[{"grantee":"agency-7k3q.com","scopes":["adcp:media_buying"]}]}`}))
 	gate := &GrantGate{
 		Evaluator: &GrantEvaluator{Records: r.eval},
 		ExistingAccountClaim: func(_ context.Context, id string) (GrantClaim, error) {
 			if id == "acc_brand" {
-				return GrantClaim{BrandDomain: "brand.com", AccountOperator: "agency.com"}, nil
+				return GrantClaim{BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"}, nil
 			}
 			return GrantClaim{}, errors.New("unknown account")
 		},
 	}
-	signer := &signing.VerifiedSigner{AgentURL: agencyAgent, Profile: signing.ProfileTagWebBotAuth}
-	stranger := &signing.VerifiedSigner{AgentURL: platformAgent, Profile: signing.ProfileTagWebBotAuth}
+	signer := &signing.VerifiedSigner{AgentURL: agencyAgent, Profile: signing.ProfileTagWebBotAuth, PrincipalID: "p_agency"}
+	stranger := &signing.VerifiedSigner{AgentURL: platformAgent, Profile: signing.ProfileTagWebBotAuth, PrincipalID: "p_platform"}
+	unbound := &signing.VerifiedSigner{AgentURL: agencyAgent, Profile: signing.ProfileTagWebBotAuth}
+	decl := adcp.AccountInput{Brand: &adcp.BrandReference{Domain: "brand-7k3q.com"}, Operator: "agency-7k3q.com"}
 
-	require.NoError(t, gate.RequireDeclaration(ctx, adcp.AccountInput{Brand: &adcp.BrandReference{Domain: "brand.com"}, Operator: "agency.com"}, signer))
+	require.NoError(t, gate.RequireDeclaration(ctx, decl, signer))
 	require.NoError(t, gate.RequireDeclaration(ctx, adcp.AccountInput{AccountID: "acc_brand"}, signer))
 
-	code, details := permissionDetails(t, gate.RequireDeclaration(ctx, adcp.AccountInput{Brand: &adcp.BrandReference{Domain: "brand.com"}, Operator: "agency.com"}, stranger))
+	code, details := permissionDetails(t, gate.RequireDeclaration(ctx, decl, stranger))
 	require.Equal(t, "PERMISSION_DENIED", code)
 	require.Equal(t, map[string]any{"scope": "agent", "reason": "grant_absent"}, details)
 	_, details = permissionDetails(t, gate.RequireDeclaration(ctx, adcp.AccountInput{AccountID: "acc_unknown"}, signer))
 	require.Equal(t, "grant_absent", details["reason"])
-	_, details = permissionDetails(t, gate.RequireDeclaration(ctx, adcp.AccountInput{Operator: "agency.com"}, signer))
+	_, details = permissionDetails(t, gate.RequireDeclaration(ctx, adcp.AccountInput{Operator: "agency-7k3q.com"}, signer))
 	require.Equal(t, "grant_absent", details["reason"], "an entry with no brand has no grant authority")
 
-	// No established identity: PERMISSION_DENIED without details (the
-	// cross-tenant oracle clamp).
-	code, details = permissionDetails(t, gate.RequireDeclaration(ctx, adcp.AccountInput{Brand: &adcp.BrandReference{Domain: "brand.com"}, Operator: "agency.com"}, nil))
+	// An identity-established (unbound) Web Bot Auth signer never
+	// provisions accounts, even when a grant would cover it.
+	code, details = permissionDetails(t, gate.RequireDeclaration(ctx, decl, unbound))
 	require.Equal(t, "PERMISSION_DENIED", code)
 	require.Nil(t, details)
 
-	// The seller hook rejects the whole request before any upsert.
+	// No established identity: PERMISSION_DENIED without details (the
+	// cross-tenant oracle clamp).
+	code, details = permissionDetails(t, gate.RequireDeclaration(ctx, decl, nil))
+	require.Equal(t, "PERMISSION_DENIED", code)
+	require.Nil(t, details)
+
+	// Operation scope: a media-buying grant covers media-buying operations
+	// only, unless the seller names the operation's scope.
+	require.NoError(t, gate.RequireAccountForOperation(ctx, "acc_brand", "create_media_buy", signer))
+	_, details = permissionDetails(t, gate.RequireAccountForOperation(ctx, "acc_brand", "build_creative", signer))
+	require.Equal(t, "grant_absent", details["reason"])
+	gate.OperationClaim = func(_ context.Context, id, op string) (GrantClaim, error) {
+		return GrantClaim{BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com", Scope: ScopeCreativeGeneration}, nil
+	}
+	_, details = permissionDetails(t, gate.RequireAccountForOperation(ctx, "acc_brand", "build_creative", signer))
+	require.Equal(t, "grant_absent", details["reason"], "the grant does not cover creative generation")
+
+	// The seller hook reads the per-request signer and rejects the whole
+	// request before any upsert.
 	authorize := gate.SyncAccountsAuthorizer()
-	ctxSigned := contextWithSigner(t, agencyAgent)
-	require.NoError(t, authorize(ctxSigned, []adcp.AccountInput{{Brand: &adcp.BrandReference{Domain: "brand.com"}, Operator: "agency.com"}}))
-	require.Error(t, authorize(ctxSigned, []adcp.AccountInput{
-		{Brand: &adcp.BrandReference{Domain: "brand.com"}, Operator: "agency.com"},
-		{Brand: &adcp.BrandReference{Domain: "elsewhere.com"}, Operator: "agency.com"},
+	require.NoError(t, authorize(ctx, toolRequestWithSigner(signer), []adcp.AccountInput{decl}))
+	require.Error(t, authorize(ctx, toolRequestWithSigner(signer), []adcp.AccountInput{
+		decl, {Brand: &adcp.BrandReference{Domain: "elsewhere-7k3q.com"}, Operator: "agency-7k3q.com"},
 	}))
-	require.Error(t, authorize(ctx, []adcp.AccountInput{{Brand: &adcp.BrandReference{Domain: "brand.com"}, Operator: "agency.com"}}))
+	require.Error(t, authorize(ctx, toolRequestWithSigner(nil), []adcp.AccountInput{decl}))
+	require.Error(t, authorize(ctx, nil, []adcp.AccountInput{decl}))
+
+	_, err := (&GrantEvaluator{}).Check(ctx, GrantRequest{})
+	require.Error(t, err, "a GrantEvaluator without Records")
 }

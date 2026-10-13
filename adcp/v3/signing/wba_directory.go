@@ -20,6 +20,11 @@ const (
 	// DefaultDirectoryLifetime is how long SignKeyDirectory's signatures
 	// stay valid when no lifetime is given.
 	DefaultDirectoryLifetime = 24 * time.Hour
+
+	// DirectorySkewAllowance is how far SignKeyDirectory and
+	// DirectoryPublisher backdate created, because directory signature
+	// verification allows no clock skew.
+	DirectorySkewAllowance = 5 * time.Minute
 )
 
 // DirectoryResponse is a key directory HTTP response: the exact body bytes
@@ -176,8 +181,8 @@ func parseDirectoryKeys(body []byte) (map[string]JWK, error) {
 // (ed25519.PrivateKey or P-256 *ecdsa.PrivateKey) is published as its
 // PublicDirectoryKey and signs the response once, covering "@authority";req
 // and content-digest. created is the signatures' created time (time.Now
-// when zero) and lifetime their validity (DefaultDirectoryLifetime when
-// zero). Serve Body byte for byte with Header, and re-sign before the
+// minus DirectorySkewAllowance when zero) and lifetime their validity from
+// created (DefaultDirectoryLifetime when zero). Serve Body byte for byte with Header, and re-sign before the
 // signatures expire; DirectoryPublisher does both.
 func SignKeyDirectory(agentOrigin string, privateKeys []any, created time.Time, lifetime time.Duration) (*DirectoryResponse, error) {
 	origin, err := webBotAuthOrigin(agentOrigin)
@@ -194,7 +199,10 @@ func SignKeyDirectory(agentOrigin string, privateKeys []any, created time.Time, 
 		return nil, errors.New("signing: directory lifetime must be positive")
 	}
 	if created.IsZero() {
-		created = time.Now()
+		// Verifiers allow no clock skew on directory signatures, so a
+		// verifier slightly behind would reject a just-signed directory and
+		// cool down for 60 s. Backdate created to absorb skew.
+		created = time.Now().Add(-DirectorySkewAllowance)
 	}
 	jwks := make([]JWK, len(privateKeys))
 	seen := map[string]struct{}{}
@@ -315,7 +323,8 @@ func (p *DirectoryPublisher) Current() (*DirectoryResponse, error) {
 	if p.current != nil && now.Before(p.expires.Add(-p.refresh)) {
 		return p.current, nil
 	}
-	resp, err := SignKeyDirectory(p.origin, p.keys, now, p.lifetime)
+	created := now.Add(-DirectorySkewAllowance)
+	resp, err := SignKeyDirectory(p.origin, p.keys, created, p.lifetime+DirectorySkewAllowance)
 	if err != nil {
 		return nil, err
 	}

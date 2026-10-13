@@ -23,8 +23,10 @@ import (
 // verifier path uses it unless configured to.
 //
 // Verification establishes an identity, never authority. A verified origin
-// the seller has not bound is identity-established and gets what an
-// anonymous caller gets. Nothing on the signature path reads a trust record.
+// the seller has not bound is identity-established: Middleware allows it
+// only WebBotAuthOptions.UnboundFor, which a seller sets to its anonymous
+// permissions plus get_principal. Nothing on the signature path reads a
+// trust record.
 
 const (
 	// ProfileTagWebBotAuth is the Signature-Input tag, and the
@@ -216,6 +218,8 @@ type WBAVerifyOptions struct {
 
 	// Replay records each signature's nonce per identity. The identity, not
 	// the key, scopes the nonce, so key rotation does not reopen a replay.
+	// A store that implements ReplayClaimer (MemoryReplayStore does) records
+	// atomically, so concurrent copies of one request cannot both pass.
 	Replay ReplayStore
 
 	// Clock supplies the verifier's wall clock. Defaults to time.Now.
@@ -228,6 +232,13 @@ type WBAVerifyOptions struct {
 	// MaxBodyBytes caps the body read for the digest check. 0 selects
 	// 32 MiB.
 	MaxBodyBytes int64
+
+	// Authorities, when set, lists the authorities (host[:port]) this
+	// verifier serves. A request whose @authority is not among them is
+	// rejected, so a signature captured at one seller cannot be replayed to
+	// another seller that accepts any Host. Recommended for any verifier
+	// reachable under more than one name or behind a default backend.
+	Authorities []string
 }
 
 // errWBANotConfigured reports a verifier missing a required dependency.
@@ -241,6 +252,10 @@ var errWBANotConfigured = errors.New("signing: Web Bot Auth verification require
 //
 // A failure is a *WBAError carrying the status to answer. The function
 // verifies identity only: it reads no trust record and grants no authority.
+//
+// A non-empty signed body must be strict JSON (AdCP bodies are JSON-RPC
+// or JSON): one value, no duplicate keys, including keys that differ only
+// in case, so every reader sees the same members. Anything else is 400.
 func VerifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*VerifiedSigner, error) {
 	signers, labels, err := verifyWebBotAuthRequest(r, opts)
 	if we := AsWBAError(err); we != nil && we.labels == nil {
@@ -274,9 +289,14 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*Verifie
 	if err != nil {
 		return nil, labels, wbaFail(http.StatusBadRequest, "", "Signature does not parse")
 	}
-	agents, err := parseSFDictionary(r.Header.Get(signatureAgentHeader))
-	if err != nil {
-		return nil, labels, wbaFail(http.StatusBadRequest, "", "Signature-Agent does not parse")
+	// A missing Signature-Agent (selection by tag alone) leaves every
+	// member absent, which fails each signature with 403 below; a present
+	// field that does not parse is 400.
+	var agents sfDict
+	if raw := r.Header.Get(signatureAgentHeader); raw != "" {
+		if agents, err = parseSFDictionary(raw); err != nil {
+			return nil, labels, wbaFail(http.StatusBadRequest, "", "Signature-Agent does not parse")
+		}
 	}
 	type wbaInput struct {
 		label  string
@@ -310,6 +330,12 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*Verifie
 		return nil, labels, wbaFail(http.StatusForbidden, wba[0].label, "request body unreadable or too large")
 	}
 	requestURL := reconstructRequestURL(r, scheme)
+	if len(opts.Authorities) > 0 {
+		u, err := url.Parse(requestURL)
+		if err != nil || !authorityAllowed(canonicalAuthority(u.Host, strings.ToLower(u.Scheme)), strings.ToLower(u.Scheme), opts.Authorities) {
+			return nil, labels, wbaFail(http.StatusForbidden, wba[0].label, "request authority is not served by this verifier")
+		}
+	}
 
 	type claim struct {
 		signer *VerifiedSigner
@@ -412,9 +438,11 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*Verifie
 			return nil, labels, wbaDeny("signing key revoked")
 		}
 		expires, _ := intParam(member.params, "expires")
-		ttl := time.Duration(expires-now+skewSeconds) * time.Second
-		if ttl < 0 {
-			ttl = 0
+		// One extra second keeps the entry alive through the last second
+		// of the window.
+		ttl := time.Duration(expires-now+skewSeconds+1) * time.Second
+		if ttl < time.Second {
+			ttl = time.Second
 		}
 		verified = append(verified, claim{
 			signer: &VerifiedSigner{
@@ -432,14 +460,28 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*Verifie
 		earlier = append(earlier, label)
 	}
 	// Record nonces only once every signature verified, so a request that
-	// fails on a later signature leaves no replay state behind.
+	// fails on a later signature leaves no replay state behind. Check every
+	// signer before recording any, so a replayed relay signature does not
+	// consume the originator's nonce.
 	for _, c := range verified {
 		id := wbaReplayIdentity(c.signer.AgentURL)
+		if opts.Replay.Seen(id, c.nonce) {
+			return nil, labels, wbaFail(http.StatusForbidden, c.signer.Label, "replayed nonce")
+		}
 		if opts.Replay.HitCap(id) {
 			return nil, labels, wbaFail(http.StatusTooManyRequests, c.signer.Label, "replay store capacity exceeded")
 		}
-		if opts.Replay.Seen(id, c.nonce) {
-			return nil, labels, wbaFail(http.StatusForbidden, c.signer.Label, "replayed nonce")
+	}
+	for _, c := range verified {
+		id := wbaReplayIdentity(c.signer.AgentURL)
+		if claimer, ok := opts.Replay.(ReplayClaimer); ok {
+			switch claimer.Claim(id, c.nonce, c.ttl) {
+			case ReplayReplayed:
+				return nil, labels, wbaFail(http.StatusForbidden, c.signer.Label, "replayed nonce")
+			case ReplayCapacity:
+				return nil, labels, wbaFail(http.StatusTooManyRequests, c.signer.Label, "replay store capacity exceeded")
+			}
+			continue
 		}
 		if !opts.Replay.Insert(id, c.nonce, c.ttl) {
 			return nil, labels, wbaFail(http.StatusTooManyRequests, c.signer.Label, "replay store capacity exceeded")
@@ -455,6 +497,15 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*Verifie
 		out[i] = c.signer
 	}
 	return out, labels, nil
+}
+
+func authorityAllowed(authority, scheme string, allowed []string) bool {
+	for _, a := range allowed {
+		if canonicalAuthority(a, scheme) == authority {
+			return true
+		}
+	}
+	return false
 }
 
 // wbaReplayIdentity scopes a nonce to an identity in a ReplayStore shared

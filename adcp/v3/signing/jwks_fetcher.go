@@ -7,9 +7,11 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"slices"
+	"net/netip"
 	"sync"
 	"time"
+
+	"github.com/adcontextprotocol/adcp-go/adcp/v3/internal/safefetch"
 )
 
 // JWKSResolver resolves a keyid to a JWK and the agent URL declaring it.
@@ -112,20 +114,10 @@ func (h *HTTPJWKSResolver) now() time.Time {
 	return time.Now()
 }
 
-// Resolve implements JWKSResolver. Agents are consulted in sorted agent-URL
-// order, so a kid published by more than one agent resolves the same way on
-// every call. A kid should be unique across agents; the Web Bot Auth
-// profile's DirectoryResolver avoids the question by looking keys up by
-// (origin, kid).
+// Resolve implements JWKSResolver.
 func (h *HTTPJWKSResolver) Resolve(ctx context.Context, keyid string) (*JWK, string, error) {
-	agents := make([]string, 0, len(h.Agents))
-	for agentURL := range h.Agents {
-		agents = append(agents, agentURL)
-	}
-	slices.Sort(agents)
 	// First pass: look in cache.
-	for _, agentURL := range agents {
-		jwksURL := h.Agents[agentURL]
+	for agentURL, jwksURL := range h.Agents {
 		jwk, err := h.lookupInCache(jwksURL, keyid)
 		if err != nil {
 			return nil, "", err
@@ -136,8 +128,7 @@ func (h *HTTPJWKSResolver) Resolve(ctx context.Context, keyid string) (*JWK, str
 	}
 	// Kid miss — refetch each (subject to cooldown).
 	var lastFetchErr error
-	for _, agentURL := range agents {
-		jwksURL := h.Agents[agentURL]
+	for agentURL, jwksURL := range h.Agents {
 		if !h.canRefetch(jwksURL) {
 			continue
 		}
@@ -187,13 +178,11 @@ func (h *HTTPJWKSResolver) canRefetch(jwksURL string) bool {
 }
 
 func (h *HTTPJWKSResolver) refetch(ctx context.Context, jwksURL string) error {
-	// jwksURL comes from the operator-configured Agents map, and the default
-	// client's dialer rejects private and loopback addresses.
-	req, err := http.NewRequestWithContext(ctx, "GET", jwksURL, nil) // #nosec G704 -- operator-configured jwks_uri
+	req, err := http.NewRequestWithContext(ctx, "GET", jwksURL, nil)
 	if err != nil {
 		return wrapError(CodeJWKSUnavailable, "build request", err)
 	}
-	resp, err := h.HTTPClient.Do(req) // #nosec G704 -- operator-configured jwks_uri, SSRF-checked dial
+	resp, err := h.HTTPClient.Do(req)
 	if err != nil {
 		// net.OpError with .Op=="dial" on SSRF denial translates to CodeJWKSUntrusted.
 		if errors.Is(err, errSSRFBlocked) {
@@ -265,34 +254,11 @@ func newSafeHTTPClient() *http.Client {
 
 // isDisallowedIP returns true for IPs that must not be dialed per the AdCP
 // webhook SSRF rules (also applied to JWKS fetch per the spec cross-reference).
+// It shares one blocklist with the Web Bot Auth and trust-record fetches.
 func isDisallowedIP(ip net.IP) bool {
-	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
 		return true
 	}
-	// Private RFC 1918 / ULA.
-	if ip4 := ip.To4(); ip4 != nil {
-		switch {
-		case ip4[0] == 0: // 0.0.0.0/8 — this-network; routes to loopback on Linux
-			return true
-		case ip4[0] == 10:
-			return true
-		case ip4[0] == 172 && ip4[1]&0xf0 == 16:
-			return true
-		case ip4[0] == 192 && ip4[1] == 168:
-			return true
-		case ip4[0] == 169 && ip4[1] == 254:
-			return true
-		case ip4[0] == 100 && ip4[1]&0xc0 == 64: // CGNAT 100.64.0.0/10
-			return true
-		case ip4[0] == 198 && ip4[1]&0xfe == 18: // 198.18.0.0/15 benchmark
-			return true
-		}
-	}
-	if ip.To4() == nil && len(ip) == net.IPv6len {
-		if ip[0]&0xfe == 0xfc { // fc00::/7 ULA
-			return true
-		}
-	}
-	return false
+	return safefetch.Blocked(addr)
 }

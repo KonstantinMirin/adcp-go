@@ -1,8 +1,11 @@
 // Package strictjson validates JSON documents that carry authority: trust
-// records, key directories, and revocation lists. Go's encoding/json keeps
-// the last of two duplicate object keys, and another parser may keep the
-// first, so a document with duplicate keys could mean different things to
-// different readers. Validate rejects it before any field is read.
+// records, key directories, revocation lists, and Web Bot Auth signed
+// bodies. Go's encoding/json keeps the last of two duplicate object keys and
+// matches struct fields case-insensitively, while other parsers (including
+// the MCP SDK, which decodes case-sensitively) may keep the first or match
+// exactly. A document with keys that are equal, or equal under Unicode case
+// folding, could therefore mean different things to different readers.
+// Validate rejects it before any field is read.
 package strictjson
 
 import (
@@ -11,6 +14,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
+	"unicode"
 )
 
 // DefaultMaxDepth is the nesting limit AdCP applies to trust records
@@ -21,8 +26,10 @@ const DefaultMaxDepth = 32
 var ErrInvalid = errors.New("strictjson: invalid document")
 
 // Validate reports whether data is exactly one JSON value with no duplicate
-// object keys (compared after unescaping) and nesting no deeper than
-// maxDepth. maxDepth <= 0 selects DefaultMaxDepth.
+// object keys and nesting no deeper than maxDepth. Keys are compared after
+// unescaping and under Unicode simple case folding, the comparison
+// encoding/json uses to match struct fields, so "name" and "Name" in one
+// object are duplicates. maxDepth <= 0 selects DefaultMaxDepth.
 func Validate(data []byte, maxDepth int) error {
 	if maxDepth <= 0 {
 		maxDepth = DefaultMaxDepth
@@ -59,10 +66,11 @@ func Validate(data []byte, maxDepth int) error {
 			if !ok {
 				return fmt.Errorf("%w: object key is not a string", ErrInvalid)
 			}
-			if _, dup := top.keys[key]; dup {
-				return fmt.Errorf("%w: duplicate object key", ErrInvalid)
+			folded := Fold(key)
+			if _, dup := top.keys[folded]; dup {
+				return fmt.Errorf("%w: duplicate object key (keys are compared case-insensitively)", ErrInvalid)
 			}
-			top.keys[key] = struct{}{}
+			top.keys[folded] = struct{}{}
 			top.wantKey = false
 			continue
 		}
@@ -82,6 +90,24 @@ func Validate(data []byte, maxDepth int) error {
 		}
 	}
 	return nil
+}
+
+// Fold maps s to a canonical form such that Fold(a) == Fold(b) exactly when
+// strings.EqualFold(a, b): each rune becomes the smallest rune in its
+// Unicode simple-folding orbit.
+func Fold(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		m := r
+		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+			if f < m {
+				m = f
+			}
+		}
+		b.WriteRune(m)
+	}
+	return b.String()
 }
 
 // Unmarshal validates data with Validate, then decodes it into v.

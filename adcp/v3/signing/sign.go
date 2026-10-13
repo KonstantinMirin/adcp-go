@@ -168,11 +168,10 @@ func (s *Signer) SignRequest(r *http.Request, opts SignOptions) error {
 		return fmt.Errorf("signing: nil request")
 	}
 	if s.opts.AgentOrigin != "" {
-		// A Signer may be reused across retries: drop any signature this
-		// signer attached to the same request before re-signing.
-		for _, h := range []string{signatureHeader, signatureInputHeader, signatureAgentHeader} {
-			r.Header.Del(h)
-		}
+		// Like SignWebBotAuthRequest, refuses a request that already carries
+		// signature fields (another party's included): use
+		// SignWebBotAuthRelay to add a signature. RoundTripper signs a fresh
+		// clone of the caller's request on every attempt.
 		return SignWebBotAuthRequest(r, s.opts.PrivateKey, WBASignOptions{
 			AgentOrigin:     s.opts.AgentOrigin,
 			Label:           s.opts.SignatureLabel,

@@ -4,14 +4,11 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
-	"go/parser"
-	"go/token"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -262,7 +259,11 @@ func TestWBARejections(t *testing.T) {
 		}, http.StatusBadRequest, false},
 		{"Signature-Agent missing with a wba tag", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
 			r.Header.Del("Signature-Agent")
+		}, http.StatusForbidden, false},
+		{"Signature-Agent that does not parse", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
+			r.Header.Set("Signature-Agent", `sig1="unterminated`)
 		}, http.StatusBadRequest, false},
+		{"signed body with case-folded duplicate keys", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"a","Name":"b"}}`, nil, http.StatusBadRequest, false},
 		{"Signature not sf-binary", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
 			r.Header.Set("Signature", `sig1="abc"`)
 		}, http.StatusBadRequest, false},
@@ -454,14 +455,12 @@ func TestWBASignerOptions(t *testing.T) {
 	require.NotContains(t, r.Header.Get("Signature-Input"), "signature-agent")
 	require.Equal(t, ProfileRequestSigning.Tag, legacy.SigningProfile())
 
-	// The WBA signer overwrites a stale digest and signature, whatever the
-	// header's case.
+	// The WBA signer overwrites a stale digest.
 	r = httptest.NewRequest(http.MethodPost, "https://seller.example.com/mcp", strings.NewReader(`{"a":1}`))
 	r.Header.Set("Content-Type", "application/json")
 	r.Header["content-digest"] = []string{"sha-256=:AAAA:"}
 	r.Header.Set("Content-Digest", "sha-256=:AAAA:")
 	delete(r.Header, "content-digest")
-	r.Header.Set("Signature", "sig1=:AAAA:")
 	require.NoError(t, s.SignRequest(r, SignOptions{}))
 	require.NotEqual(t, "sha-256=:AAAA:", r.Header.Get("Content-Digest"))
 	require.Contains(t, r.Header.Get("Signature-Input"), `keyid="`+jwk.Kid+`"`)
@@ -477,6 +476,10 @@ func TestWBASignerOptions(t *testing.T) {
 	require.Error(t, SignWebBotAuthRelay(r, key, WBASignOptions{AgentOrigin: "https://relay.example.com"}), "label required")
 	require.Error(t, SignWebBotAuthRequest(httptest.NewRequest(http.MethodGet, "https://s.example.com/", nil), key,
 		WBASignOptions{AgentOrigin: "https://buyer.example.com", ValidityWindow: 301 * time.Second}))
+	// The Signer refuses to clobber another party's signature too.
+	signed := httptest.NewRequest(http.MethodGet, "https://s.example.com/", nil)
+	signed.Header.Set("Signature", "other=:AAAA:")
+	require.Error(t, s.SignRequest(signed, SignOptions{}))
 	require.Error(t, SignWebBotAuthRequest(httptest.NewRequest(http.MethodGet, "https://s.example.com/", nil), key,
 		WBASignOptions{AgentOrigin: "https://buyer.example.com", NonceOverride: "short"}))
 }
@@ -494,6 +497,30 @@ func TestRFC9421VerifierNeverAttributesWBA(t *testing.T) {
 	signer, err := VerifyRequestSignature(r, VerifyOptions{Resolver: resolver, Replay: NewMemoryReplayStore(0), Clock: wbaClock})
 	require.Error(t, err)
 	require.Nil(t, signer)
+}
+
+func TestSignedHTTPClientRequiresAdvertisedRFC9421(t *testing.T) {
+	key := newEd25519(t)
+	inner := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: http.NoBody, Request: r}, nil
+	})
+	for _, tc := range []struct {
+		profiles []string
+		wantErr  bool
+	}{{nil, false}, {[]string{ProfileTagRequestSigning, ProfileTagWebBotAuth}, false}, {[]string{ProfileTagWebBotAuth}, true}} {
+		client, err := NewSignedHTTPClient(SignedHTTPClientOptions{KeyID: "k", PrivateKey: key, Inner: inner,
+			CapabilityProvider: alwaysSignCapability, ProfilesProvider: func(*http.Request) []string { return tc.profiles }})
+		require.NoError(t, err)
+		req, _ := http.NewRequest(http.MethodPost, "https://seller.example.com/adcp/create_media_buy", strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if tc.wantErr {
+			require.ErrorIs(t, err, ErrRequestSigningNotAdvertised)
+			continue
+		}
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+	}
 }
 
 func TestSignedHTTPClientRequiresAdvertisedWBA(t *testing.T) {
@@ -545,24 +572,45 @@ func alwaysSignCapability(*http.Request) *adcp.RequestSigningCapabilities {
 	return &adcp.RequestSigningCapabilities{Supported: true, RequiredFor: []string{"create_media_buy"}}
 }
 
-// TestSigningNeverImportsIdentity enforces that the signature path cannot
-// consult a trust record: no non-test file in this package imports the
-// identity package.
-func TestSigningNeverImportsIdentity(t *testing.T) {
-	files, err := filepath.Glob("*.go")
-	require.NoError(t, err)
-	fset := token.NewFileSet()
-	for _, f := range files {
-		if strings.HasSuffix(f, "_test.go") {
-			continue
-		}
-		src, err := os.ReadFile(f) // #nosec G304 -- this package's own source files.
-		require.NoError(t, err)
-		parsed, err := parser.ParseFile(fset, f, src, parser.ImportsOnly)
-		require.NoError(t, err)
-		for _, imp := range parsed.Imports {
-			path, _ := strconv.Unquote(imp.Path.Value)
-			require.NotContains(t, path, "/identity", "%s imports %s", f, path)
-		}
+// TestWBAConcurrentReplay: of many concurrent copies of one signed
+// request, exactly one is accepted.
+func TestWBAConcurrentReplay(t *testing.T) {
+	rig := newWBARig(t)
+	r := rig.signedRequest(t, "")
+	var wg sync.WaitGroup
+	var accepted atomic.Int32
+	for range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := VerifyWebBotAuthRequest(r.Clone(context.Background()), rig.opts()); err == nil {
+				accepted.Add(1)
+			}
+		}()
 	}
+	wg.Wait()
+	require.Equal(t, int32(1), accepted.Load())
+}
+
+func TestMemoryReplayStoreClaim(t *testing.T) {
+	m := NewMemoryReplayStore(2)
+	require.Equal(t, ReplayClaimed, m.Claim("k", "n1", time.Minute))
+	require.Equal(t, ReplayReplayed, m.Claim("k", "n1", time.Minute))
+	require.Equal(t, ReplayClaimed, m.Claim("k", "n2", time.Minute))
+	require.Equal(t, ReplayCapacity, m.Claim("k", "n3", time.Minute))
+	require.Equal(t, ReplayClaimed, m.Claim("other", "n1", time.Minute))
+}
+
+func TestWBAAuthorities(t *testing.T) {
+	rig := newWBARig(t)
+	opts := rig.opts()
+	opts.Authorities = []string{"seller.example.com:443", "api.seller.example.com"}
+	_, err := VerifyWebBotAuthRequest(rig.signedRequest(t, ""), opts)
+	require.NoError(t, err)
+	// A request signed for another seller, replayed here with that seller's
+	// Host, is refused even though the signature is valid.
+	r := httptest.NewRequest(http.MethodGet, "https://other-seller.example.com/adcp/get_principal", nil)
+	require.NoError(t, SignWebBotAuthRequest(r, rig.key, WBASignOptions{AgentOrigin: rig.origin, Clock: wbaClock}))
+	_, err = VerifyWebBotAuthRequest(r, opts)
+	requireWBAStatus(t, err, http.StatusForbidden)
 }

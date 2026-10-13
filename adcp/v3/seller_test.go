@@ -804,7 +804,7 @@ func structuredContentMap(t *testing.T, result *mcp.CallToolResult) map[string]a
 func TestSyncAccountsAuthorizerRunsBeforeTheHandler(t *testing.T) {
 	args := map[string]any{
 		"idempotency_key": "4f6c1a0e-8d2b-4b7e-9c3a-2e5d7f1b0a96",
-		"accounts":        []map[string]any{{"brand": map[string]any{"domain": "brand.com"}, "operator": "agency.com", "billing": "operator"}},
+		"accounts":        []map[string]any{{"brand": map[string]any{"domain": "brand-7k3q.com"}, "operator": "agency-7k3q.com", "billing": "operator"}},
 	}
 	var seen []AccountInput
 	handlerCalled := false
@@ -814,7 +814,8 @@ func TestSyncAccountsAuthorizerRunsBeforeTheHandler(t *testing.T) {
 			handlerCalled = true
 			return []AccountResult{{AccountID: "acc_1", Status: "active"}}, nil
 		},
-		SyncAccountsAuthorizer: func(_ context.Context, accounts []AccountInput) error {
+		SyncAccountsAuthorizer: func(_ context.Context, req *mcp.CallToolRequest, accounts []AccountInput) error {
+			require.NotNil(t, req)
 			seen = accounts
 			return NewError("PERMISSION_DENIED", ErrorOptions{
 				Message: "Agent has no authority for this brand", Recovery: "correctable",
@@ -826,12 +827,12 @@ func TestSyncAccountsAuthorizerRunsBeforeTheHandler(t *testing.T) {
 	require.True(t, result.IsError)
 	require.False(t, handlerCalled, "a denied request never reaches the handler")
 	require.Len(t, seen, 1)
-	require.Equal(t, "brand.com", seen[0].Brand.Domain)
+	require.Equal(t, "brand-7k3q.com", seen[0].Brand.Domain)
 	adcpErr := structuredContentMap(t, result)["adcp_error"].(map[string]any)
 	require.Equal(t, "PERMISSION_DENIED", adcpErr["code"])
 	require.Equal(t, map[string]any{"scope": "agent", "reason": "grant_absent"}, adcpErr["details"])
 
-	cfg.SyncAccountsAuthorizer = func(context.Context, []AccountInput) error { return nil }
+	cfg.SyncAccountsAuthorizer = func(context.Context, *mcp.CallToolRequest, []AccountInput) error { return nil }
 	result = callRegisteredTool(t, cfg, "sync_accounts", args)
 	require.False(t, result.IsError)
 	require.True(t, handlerCalled)
