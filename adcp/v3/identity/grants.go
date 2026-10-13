@@ -400,6 +400,9 @@ type GrantGate struct {
 
 // RequireClaim authorizes claim for signer. A nil signer (no established
 // identity) is denied without details, under the cross-tenant oracle clamp.
+// In an MCP tool handler, take signer from
+// signing.VerifiedSignerFromToolRequest(req), never from ctx: a stateful
+// session runs handlers with its initialize request's context.
 // A Web Bot Auth signer must also be bound to a principal: an
 // identity-established signer gets no account authority (it may not
 // provision accounts), so it is denied before any grant is read.
@@ -463,7 +466,8 @@ func (g *GrantGate) RequireAccount(ctx context.Context, accountID string, signer
 // ExistingAccountClaim. An operation outside the media-buying set whose
 // claim keeps the default adcp:media_buying scope is denied: the seller
 // must choose its scope explicitly. Call it before every spend-committing
-// call; the evaluator's cache keeps the check fresh.
+// call; the evaluator's cache keeps the check fresh. In MCP tool handlers
+// use RequireAccountForToolRequest, which takes the per-request signer.
 func (g *GrantGate) RequireAccountForOperation(ctx context.Context, accountID, operation string, signer *signing.VerifiedSigner) error {
 	if signer == nil || signer.AgentURL == "" {
 		return unestablishedDenial()
@@ -487,6 +491,17 @@ func (g *GrantGate) RequireAccountForOperation(ctx context.Context, accountID, o
 		}
 	}
 	return g.RequireClaim(ctx, claim, signer)
+}
+
+// RequireAccountForToolRequest is RequireAccountForOperation for the signer
+// the signing middleware verified on this MCP tool call's HTTP request,
+// with the tool name as the operation.
+func (g *GrantGate) RequireAccountForToolRequest(ctx context.Context, req *mcp.CallToolRequest, accountID string) error {
+	operation := ""
+	if req != nil && req.Params != nil {
+		operation = req.Params.Name
+	}
+	return g.RequireAccountForOperation(ctx, accountID, operation, signing.VerifiedSignerFromToolRequest(req))
 }
 
 // RequireDeclaration authorizes one sync_accounts entry for signer: a

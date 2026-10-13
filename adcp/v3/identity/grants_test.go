@@ -573,6 +573,14 @@ func TestGrantGate(t *testing.T) {
 	_, details = permissionDetails(t, gate.RequireAccountForOperation(ctx, "acc_brand", "build_creative", signer))
 	require.Equal(t, "grant_absent", details["reason"], "the grant does not cover creative generation")
 
+	gate.OperationClaim = nil
+	callReq := toolRequestWithSigner(signer)
+	callReq.Params = &mcp.CallToolParamsRaw{Name: "create_media_buy"}
+	require.NoError(t, gate.RequireAccountForToolRequest(ctx, callReq, "acc_brand"))
+	callReq.Params.Name = "build_creative"
+	require.Error(t, gate.RequireAccountForToolRequest(ctx, callReq, "acc_brand"))
+	require.Error(t, gate.RequireAccountForToolRequest(ctx, &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{Name: "create_media_buy"}}, "acc_brand"))
+
 	// The seller hook reads the per-request signer and rejects the whole
 	// request before any upsert.
 	authorize := gate.SyncAccountsAuthorizer()

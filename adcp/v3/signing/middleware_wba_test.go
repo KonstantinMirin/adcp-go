@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/stretchr/testify/require"
 )
 
@@ -268,30 +269,95 @@ func TestMiddlewareLogsRFC9421Deprecation(t *testing.T) {
 // sees is the one the MCP SDK dispatches. A case-variant duplicate key
 // ("Name" beside "name") must not smuggle a tool past the gate.
 func TestMiddlewareUnboundGateReadsExactKeys(t *testing.T) {
-	for name, body := range map[string]string{
-		"name and Name":     `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_media_buy","arguments":{},"Name":"get_principal"}}`,
-		"Name only":         `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"Name":"get_principal","arguments":{}}}`,
-		"Method":            `{"jsonrpc":"2.0","id":1,"Method":"tools/call","params":{"name":"get_principal"}}`,
-		"method and Method": `{"jsonrpc":"2.0","id":1,"method":"tools/call","Method":"initialize","params":{"name":"create_media_buy"}}`,
+	for _, tc := range []struct {
+		name, body string
+		status     int
+	}{
+		{"exact get_principal (positive control)", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_principal","arguments":{}}}`, http.StatusOK},
+		{"name and Name", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_media_buy","arguments":{},"Name":"get_principal"}}`, http.StatusBadRequest},
+		{"method and Method", `{"jsonrpc":"2.0","id":1,"method":"tools/call","Method":"initialize","params":{"name":"create_media_buy"}}`, http.StatusBadRequest},
+		{"Name only", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"Name":"get_principal","arguments":{}}}`, http.StatusForbidden},
+		{"Method only", `{"jsonrpc":"2.0","id":1,"Method":"tools/call","params":{"name":"get_principal"}}`, http.StatusForbidden},
 	} {
-		t.Run(name, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			rig := newWBARig(t)
 			var c captured
 			h := Middleware(MiddlewareOptions{WebBotAuth: &WebBotAuthOptions{Keys: rig.resolver, Revocation: rig.checker, Clock: wbaClock}, Replay: rig.replay, Logger: discardLogger()})(captureHandler(&c))
 			rec := httptest.NewRecorder()
-			h.ServeHTTP(rec, rig.signedRequest(t, body))
-			require.NotEqual(t, http.StatusOK, rec.Code)
-			require.False(t, c.called)
+			h.ServeHTTP(rec, rig.signedRequest(t, tc.body))
+			require.Equal(t, tc.status, rec.Code, rec.Body.String())
+			require.Equal(t, tc.status == http.StatusOK, c.called)
 		})
 	}
 	req := func(body string) *http.Request {
 		return httptest.NewRequest(http.MethodPost, "https://s.example.com/mcp", strings.NewReader(body))
 	}
-	require.Equal(t, "get_principal", jsonRPCOperation(req(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_principal"}}`)))
-	require.Equal(t, "tools/list", jsonRPCOperation(req(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)))
-	require.Empty(t, jsonRPCOperation(req(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"Name":"get_principal"}}`)))
-	require.Empty(t, jsonRPCOperation(req(`{"jsonrpc":"1.0","method":"tools/list"}`)))
-	require.Empty(t, jsonRPCOperation(req(`not json`)))
+	require.Equal(t, "get_principal", jsonRPCOperation(req(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_principal"}}`), 0))
+	require.Equal(t, "tools/list", jsonRPCOperation(req(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`), 0))
+	require.Empty(t, jsonRPCOperation(req(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"Name":"get_principal"}}`), 0))
+	require.Empty(t, jsonRPCOperation(req(`{"jsonrpc":"1.0","method":"tools/list"}`), 0))
+	require.Empty(t, jsonRPCOperation(req(`not json`), 0))
 }
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)) }
+
+// TestMiddlewareSessionMethodsAndTransportRequests: an identity-established
+// signer can always open and close an MCP session, whatever UnboundFor
+// lists, but a bodyless request that names an operation is still gated.
+func TestMiddlewareSessionMethodsAndTransportRequests(t *testing.T) {
+	rig := newWBARig(t)
+	var c captured
+	h := Middleware(MiddlewareOptions{
+		WebBotAuth: &WebBotAuthOptions{Keys: rig.resolver, Revocation: rig.checker, Clock: wbaClock, UnboundFor: []string{"get_products"}},
+		Replay:     rig.replay, Logger: discardLogger(), OperationResolver: DefaultOperationResolver,
+	})(captureHandler(&c))
+	serve := func(r *http.Request) int {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		return rec.Code
+	}
+	for _, body := range []string{`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`, `{"jsonrpc":"2.0","method":"notifications/initialized"}`, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`} {
+		require.Equal(t, http.StatusOK, serve(rig.signedRequest(t, body)), body)
+	}
+	require.Equal(t, http.StatusForbidden, serve(rig.signedRequest(t, mcpCall("get_principal"))), "UnboundFor replaced the default")
+	for _, method := range []string{http.MethodGet, http.MethodDelete} {
+		r := httptest.NewRequest(method, "https://seller.example.com/mcp", nil)
+		require.NoError(t, SignWebBotAuthRequest(r, rig.key, WBASignOptions{AgentOrigin: rig.origin, Clock: wbaClock}))
+		require.Equal(t, http.StatusOK, serve(r), method)
+	}
+	r := httptest.NewRequest(http.MethodGet, "https://seller.example.com/adcp/create_media_buy", nil)
+	require.NoError(t, SignWebBotAuthRequest(r, rig.key, WBASignOptions{AgentOrigin: rig.origin, Clock: wbaClock}))
+	require.Equal(t, http.StatusForbidden, serve(r), "a resolved operation is gated even without a body")
+}
+
+// TestMiddlewareCarriesSignerToToolRequests: every verified signer, under
+// either profile, is placed in the request's auth.TokenInfo for MCP tool
+// handlers, without inventing a UserID or disturbing the Authorization
+// header.
+func TestMiddlewareCarriesSignerToToolRequests(t *testing.T) {
+	res, err := GenerateSigningKey(AlgEd25519, "legacy-key")
+	require.NoError(t, err)
+	priv, _, _ := LoadPrivateKey(res.PrivateKeyPEM)
+	resolver := NewStaticJWKSResolver()
+	jwk := res.PublicJWK
+	resolver.Put("legacy-key", &jwk, "https://buyer.example.com/mcp")
+	legacy, _ := NewSigner(SignerOptions{KeyID: "legacy-key", PrivateKey: priv})
+	var ti *auth.TokenInfo
+	var authz string
+	h := Middleware(MiddlewareOptions{Resolver: resolver, SchemeOverride: "https", Logger: discardLogger()})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ti = auth.TokenInfoFromContext(r.Context())
+		authz = r.Header.Get("Authorization")
+	}))
+	r := httptest.NewRequest(http.MethodPost, "https://seller.example.com/adcp/x", strings.NewReader(`{}`))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Authorization", "Basic abc")
+	require.NoError(t, legacy.SignRequest(r, SignOptions{CoverContentDigest: true}))
+	h.ServeHTTP(httptest.NewRecorder(), r)
+	require.NotNil(t, ti)
+	require.Empty(t, ti.UserID)
+	s := VerifiedSignerFromTokenInfo(ti)
+	require.NotNil(t, s)
+	require.Equal(t, "legacy-key", s.KeyID)
+	require.Equal(t, "Basic abc", authz, "the original Authorization header is restored")
+	require.Nil(t, VerifiedSignerFromToolRequest(nil))
+}

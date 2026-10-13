@@ -114,21 +114,18 @@ func (h *HTTPJWKSResolver) now() time.Time {
 	return time.Now()
 }
 
-// Resolve implements JWKSResolver.
+// Resolve implements JWKSResolver. A kid published by more than one
+// configured agent is ambiguous and resolves to none of them
+// (CodeKeyUnknown): attributing it to whichever agent a map scan reached
+// first would be nondeterministic. The Web Bot Auth profile's
+// DirectoryResolver avoids the question by looking keys up by (origin, kid).
 func (h *HTTPJWKSResolver) Resolve(ctx context.Context, keyid string) (*JWK, string, error) {
-	// First pass: look in cache.
-	for agentURL, jwksURL := range h.Agents {
-		jwk, err := h.lookupInCache(jwksURL, keyid)
-		if err != nil {
-			return nil, "", err
-		}
-		if jwk != nil {
-			return jwk, agentURL, nil
-		}
+	if jwk, agentURL, err := h.findUnique(keyid); err != nil || jwk != nil {
+		return jwk, agentURL, err
 	}
 	// Kid miss — refetch each (subject to cooldown).
 	var lastFetchErr error
-	for agentURL, jwksURL := range h.Agents {
+	for _, jwksURL := range h.Agents {
 		if !h.canRefetch(jwksURL) {
 			continue
 		}
@@ -136,12 +133,8 @@ func (h *HTTPJWKSResolver) Resolve(ctx context.Context, keyid string) (*JWK, str
 			lastFetchErr = err
 			continue
 		}
-		jwk, err := h.lookupInCache(jwksURL, keyid)
-		if err != nil {
-			return nil, "", err
-		}
-		if jwk != nil {
-			return jwk, agentURL, nil
+		if jwk, agentURL, err := h.findUnique(keyid); err != nil || jwk != nil {
+			return jwk, agentURL, err
 		}
 	}
 	if lastFetchErr != nil {
@@ -151,6 +144,27 @@ func (h *HTTPJWKSResolver) Resolve(ctx context.Context, keyid string) (*JWK, str
 		return nil, "", wrapError(CodeJWKSUnavailable, "all JWKS fetches failed", lastFetchErr)
 	}
 	return nil, "", newError(CodeKeyUnknown, "keyid not found in any agent JWKS")
+}
+
+// findUnique scans every agent's cached JWKS for keyid. A kid cached under
+// more than one agent is an error (CodeKeyUnknown).
+func (h *HTTPJWKSResolver) findUnique(keyid string) (*JWK, string, error) {
+	var found *JWK
+	var foundAgent string
+	for agentURL, jwksURL := range h.Agents {
+		jwk, err := h.lookupInCache(jwksURL, keyid)
+		if err != nil {
+			return nil, "", err
+		}
+		if jwk == nil {
+			continue
+		}
+		if found != nil && foundAgent != agentURL {
+			return nil, "", newError(CodeKeyUnknown, "keyid published by more than one agent")
+		}
+		found, foundAgent = jwk, agentURL
+	}
+	return found, foundAgent, nil
 }
 
 func (h *HTTPJWKSResolver) lookupInCache(jwksURL, keyid string) (*JWK, error) {

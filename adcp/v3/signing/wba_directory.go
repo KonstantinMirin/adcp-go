@@ -182,8 +182,9 @@ func parseDirectoryKeys(body []byte) (map[string]JWK, error) {
 // PublicDirectoryKey and signs the response once, covering "@authority";req
 // and content-digest. created is the signatures' created time (time.Now
 // minus DirectorySkewAllowance when zero) and lifetime their validity from
-// created (DefaultDirectoryLifetime when zero). Serve Body byte for byte with Header, and re-sign before the
-// signatures expire; DirectoryPublisher does both.
+// created (DefaultDirectoryLifetime when zero). Serve Body byte for byte
+// with Header, and re-sign before the signatures expire; DirectoryPublisher
+// does both.
 func SignKeyDirectory(agentOrigin string, privateKeys []any, created time.Time, lifetime time.Duration) (*DirectoryResponse, error) {
 	origin, err := webBotAuthOrigin(agentOrigin)
 	if err != nil {

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"slices"
@@ -368,7 +369,9 @@ type OriginRevocationCheckerOptions struct {
 	// many polling intervals. Defaults to 2, as in the Python SDK.
 	GraceMultiplier float64
 	// History persists retained revocations. Defaults to an in-memory
-	// history of 4 x MaxOrigins origins; durable deployments supply one.
+	// history of 4 x MaxOrigins origins with per-operator quotas. That
+	// default is not monotonic under hostile load (many registrable domains
+	// can flush it), so public deployments should supply a durable one.
 	History RevocationHistory
 	// Clock defaults to time.Now.
 	Clock func() time.Time
@@ -380,8 +383,9 @@ type OriginRevocationCheckerOptions struct {
 // implements WBARevocationChecker.
 //
 // Revocation is monotonic: every revoked key and detail seen for an origin
-// is retained across refreshes and evictions (through History), a list
-// older than the retained one is refused, and keyCompromise and the
+// is retained across refreshes and across evictions through History (with
+// the default in-memory History, only while the origin stays within its
+// bounds), a list older than the retained one is refused, and keyCompromise and the
 // earliest invalidity_date win. Only thumbprint-shaped kids (the only kids
 // a Web Bot Auth keyid can match) are retained, at most 1024 per origin; a
 // list over the bound fails that origin closed. Refreshes are single-flight
@@ -612,6 +616,7 @@ func (c *OriginRevocationChecker) discover(ctx context.Context, origin string, c
 	hist, err := c.history.LoadRevocations(ctx, origin)
 	if err == nil && hist != nil {
 		state.current = hist
+		state.interval = min(hist.NextUpdate.Sub(hist.Updated), revocationMaxInterval)
 	}
 	if err == nil {
 		_, err = state.fresh(ctx, c)
@@ -834,24 +839,43 @@ func (s *originRevocations) commit(c *OriginRevocationChecker, l *RevocationList
 	return nil
 }
 
-// memoryRevocationHistory is the default RevocationHistory: a bounded LRU.
-// An origin that falls out of it can be re-admitted without its history,
-// so durable deployments supply their own.
+// memoryRevocationHistory is the default RevocationHistory: a bounded LRU
+// with a per-operator (registrable domain) quota on origins and retained
+// kids, so one operator evicts only its own entries. It is not monotonic
+// under hostile load: an attacker with many registrable domains (cheap
+// through public-suffix tenants) can still push other origins out of the
+// global bound. Public deployments should supply a durable History.
 type memoryRevocationHistory struct {
-	mu    sync.Mutex
-	limit int
-	kids  int // retained kids across all origins, bounded by historyKidBudget
-	lists map[string]*list.Element
-	lru   *list.List
+	mu        sync.Mutex
+	limit     int // origins
+	budget    int // retained kids across all origins
+	opLimit   int // origins per operator
+	opBudget  int // retained kids per operator
+	kids      int
+	lists     map[string]*list.Element
+	lru       *list.List
+	opKids    map[string]int
+	opOrigins map[string]int
 }
 
 type historyEntry struct {
-	origin string
-	list   *RevocationList
+	origin   string
+	operator string
+	list     *RevocationList
 }
 
+const (
+	historyOriginsPerOperator = 32
+	historyKidsPerOperator    = 8 * maxRetainedRevocations
+)
+
 func newMemoryRevocationHistory(limit int) *memoryRevocationHistory {
-	return &memoryRevocationHistory{limit: limit, lists: map[string]*list.Element{}, lru: list.New()}
+	return &memoryRevocationHistory{
+		limit: limit, budget: historyKidBudget,
+		opLimit: historyOriginsPerOperator, opBudget: historyKidsPerOperator,
+		lists: map[string]*list.Element{}, lru: list.New(),
+		opKids: map[string]int{}, opOrigins: map[string]int{},
+	}
 }
 
 func (h *memoryRevocationHistory) LoadRevocations(_ context.Context, origin string) (*RevocationList, error) {
@@ -864,24 +888,84 @@ func (h *memoryRevocationHistory) LoadRevocations(_ context.Context, origin stri
 	return nil, nil
 }
 
+// StoreRevocations merges l into what is retained for origin: never
+// withdrawing a revocation or weakening a detail, and keeping the newer
+// updated time, so a late write from an older refresh cannot roll the
+// history back. A list that revokes nothing is not stored.
 func (h *memoryRevocationHistory) StoreRevocations(_ context.Context, origin string, l *RevocationList) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if e, ok := h.lists[origin]; ok {
-		entry := e.Value.(*historyEntry)
-		h.kids += len(l.RevokedKids) - len(entry.list.RevokedKids)
-		entry.list = l
-		h.lru.MoveToFront(e)
-	} else {
-		h.lists[origin] = h.lru.PushFront(&historyEntry{origin: origin, list: l})
-		h.kids += len(l.RevokedKids)
+	e, exists := h.lists[origin]
+	if !exists && len(l.RevokedKids) == 0 {
+		return nil
 	}
-	for h.lru.Len() > 1 && (h.lru.Len() > h.limit || h.kids > historyKidBudget) {
-		back := h.lru.Back()
-		h.lru.Remove(back)
-		entry := back.Value.(*historyEntry)
-		h.kids -= len(entry.list.RevokedKids)
-		delete(h.lists, entry.origin)
+	merged := cloneRevocationList(l)
+	if exists {
+		old := e.Value.(*historyEntry)
+		if l.Updated.Before(old.list.Updated) {
+			merged = cloneRevocationList(old.list)
+			if err := merged.Retain(l); err != nil {
+				return err
+			}
+		} else if err := merged.Retain(old.list); err != nil {
+			return err
+		}
+		h.remove(e)
+	}
+	op := operatorBucket(origin)
+	// An operator over its quota evicts its own oldest entries, never
+	// another operator's.
+	for h.opOrigins[op] >= h.opLimit || h.opKids[op]+len(merged.RevokedKids) > h.opBudget {
+		victim := h.oldestOf(op)
+		if victim == nil {
+			break
+		}
+		h.remove(victim)
+	}
+	h.lists[origin] = h.lru.PushFront(&historyEntry{origin: origin, operator: op, list: merged})
+	h.kids += len(merged.RevokedKids)
+	h.opKids[op] += len(merged.RevokedKids)
+	h.opOrigins[op]++
+	for h.lru.Len() > 1 && (h.lru.Len() > h.limit || h.kids > h.budget) {
+		h.remove(h.lru.Back())
 	}
 	return nil
+}
+
+func (h *memoryRevocationHistory) oldestOf(op string) *list.Element {
+	for e := h.lru.Back(); e != nil; e = e.Prev() {
+		if e.Value.(*historyEntry).operator == op {
+			return e
+		}
+	}
+	return nil
+}
+
+func (h *memoryRevocationHistory) remove(e *list.Element) {
+	entry := e.Value.(*historyEntry)
+	h.lru.Remove(e)
+	delete(h.lists, entry.origin)
+	h.kids -= len(entry.list.RevokedKids)
+	h.opKids[entry.operator] -= len(entry.list.RevokedKids)
+	if h.opOrigins[entry.operator]--; h.opOrigins[entry.operator] <= 0 {
+		delete(h.opOrigins, entry.operator)
+		delete(h.opKids, entry.operator)
+	}
+}
+
+func cloneRevocationList(l *RevocationList) *RevocationList {
+	c := *l
+	c.RevokedKids = maps.Clone(l.RevokedKids)
+	c.RevokedJTIs = maps.Clone(l.RevokedJTIs)
+	c.Details = maps.Clone(l.Details)
+	if c.RevokedKids == nil {
+		c.RevokedKids = map[string]struct{}{}
+	}
+	if c.RevokedJTIs == nil {
+		c.RevokedJTIs = map[string]struct{}{}
+	}
+	if c.Details == nil {
+		c.Details = map[string]RevocationDetails{}
+	}
+	return &c
 }

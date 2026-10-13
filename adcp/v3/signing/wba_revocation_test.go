@@ -287,6 +287,15 @@ func TestOriginRevocationCheckerAdmission(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, revoked, "history survives eviction")
 	require.Equal(t, []string{revokedKid}, checker.RevokedKids("https://a.example.com"))
+	// Past next_update the checker refetches; the older list is refused, the
+	// key stays revoked within the grace window, then checks fail closed.
+	now = now.Add(31 * time.Minute)
+	revoked, err = checker.RevokedWBAKey(ctx, "https://a.example.com", revokedKid)
+	require.NoError(t, err)
+	require.True(t, revoked, "an older list cannot un-revoke the key")
+	now = now.Add(61 * time.Minute) // past next_update + 2 x interval
+	_, err = checker.RevokedWBAKey(ctx, "https://a.example.com", revokedKid)
+	requireWBAStatus(t, err, http.StatusForbidden)
 
 	// A list over the retained-entry bound fails that origin closed.
 	many := make([]string, maxRetainedRevocations+1)
@@ -334,6 +343,15 @@ func TestOriginRevocationRefreshIsDetachedFromTheCaller(t *testing.T) {
 	done := make(chan error)
 	go func() { _, err := checker.RevokedWBAKey(ctx, rig.origin, "k"); done <- err }()
 	require.Eventually(t, func() bool { return fetches.Load() == 1 }, time.Second, time.Millisecond)
+	// While the fetch is blocked, other callers are not stuck behind a lock:
+	// a second check honors its own deadline and inspection returns at once.
+	short, cancelShort := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelShort()
+	start := time.Now()
+	_, err := checker.RevokedWBAKey(short, rig.origin, "k")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Less(t, time.Since(start), time.Second)
+	require.Empty(t, checker.RevokedKids(rig.origin))
 	cancel()
 	require.ErrorIs(t, <-done, context.Canceled)
 	close(release)
@@ -343,4 +361,43 @@ func TestOriginRevocationRefreshIsDetachedFromTheCaller(t *testing.T) {
 		return err == nil
 	}, time.Second, time.Millisecond)
 	require.Equal(t, int32(1), fetches.Load())
+}
+
+func TestMemoryRevocationHistory(t *testing.T) {
+	ctx := context.Background()
+	h := newMemoryRevocationHistory(100)
+	kid := func(i int) string { return fmt.Sprintf("%043d", i) }
+	mk := func(origin string, updated time.Time, kids ...string) *RevocationList {
+		l := &RevocationList{Issuer: origin, Updated: updated, NextUpdate: updated.Add(time.Hour),
+			RevokedKids: map[string]struct{}{}, RevokedJTIs: map[string]struct{}{}, Details: map[string]RevocationDetails{}}
+		for _, k := range kids {
+			l.RevokedKids[k] = struct{}{}
+		}
+		return l
+	}
+	o := "https://a.example.com"
+	require.NoError(t, h.StoreRevocations(ctx, "https://empty.example.com", mk("https://empty.example.com", wbaTestNow)))
+	got, _ := h.LoadRevocations(ctx, "https://empty.example.com")
+	require.Nil(t, got, "a list that revokes nothing is not stored")
+
+	require.NoError(t, h.StoreRevocations(ctx, o, mk(o, wbaTestNow, kid(1))))
+	// A late write from an older refresh cannot roll the history back.
+	require.NoError(t, h.StoreRevocations(ctx, o, mk(o, wbaTestNow.Add(-time.Hour), kid(2))))
+	got, _ = h.LoadRevocations(ctx, o)
+	require.Equal(t, wbaTestNow, got.Updated)
+	require.Contains(t, got.RevokedKids, kid(1))
+	require.Contains(t, got.RevokedKids, kid(2))
+	// A newer list that drops a kid keeps it.
+	require.NoError(t, h.StoreRevocations(ctx, o, mk(o, wbaTestNow.Add(time.Hour), kid(3))))
+	got, _ = h.LoadRevocations(ctx, o)
+	require.Len(t, got.RevokedKids, 3)
+
+	// One operator over its origin quota evicts only its own entries.
+	for i := range historyOriginsPerOperator + 5 {
+		origin := fmt.Sprintf("https://t%d.attacker.example.net", i)
+		require.NoError(t, h.StoreRevocations(ctx, origin, mk(origin, wbaTestNow, kid(100+i))))
+	}
+	got, _ = h.LoadRevocations(ctx, o)
+	require.NotNil(t, got, "another operator's history is not evicted")
+	require.LessOrEqual(t, h.opOrigins["example.net"], historyOriginsPerOperator)
 }

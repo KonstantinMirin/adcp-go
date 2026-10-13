@@ -472,7 +472,10 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*Verifie
 			return nil, labels, wbaFail(http.StatusTooManyRequests, c.signer.Label, "replay store capacity exceeded")
 		}
 	}
-	for _, c := range verified {
+	// Claim relays before the originator, so a relay that loses a race does
+	// not burn the originator's nonce.
+	for i := len(verified) - 1; i >= 0; i-- {
+		c := verified[i]
 		id := wbaReplayIdentity(c.signer.AgentURL)
 		if claimer, ok := opts.Replay.(ReplayClaimer); ok {
 			switch claimer.Claim(id, c.nonce, c.ttl) {
