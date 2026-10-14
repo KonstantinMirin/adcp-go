@@ -57,11 +57,16 @@ type SignedHTTPClientOptions struct {
 	// `/adcp/<op>`. Only consulted when CapabilityProvider is also set.
 	OperationResolver func(*http.Request) string
 
-	// Inner is the transport the signing layer wraps. Defaults to
-	// http.DefaultTransport. http.DefaultTransport honors HTTP_PROXY env
-	// vars and shares its connection pool process-wide; pass a custom
-	// transport when you need isolation (per-tenant proxies, custom mTLS,
-	// retry middleware, telemetry).
+	// Inner is the transport the signing layer wraps. Defaults to a clone of
+	// http.DefaultTransport with MaxResponseHeaderBytes lowered to
+	// DefaultMaxResponseHeaderBytes — net/http's own 10 MiB ceiling would
+	// let a peer spend megabytes above the response-size cap, which only
+	// covers the body. The clone keeps http.DefaultTransport's settings
+	// (including HTTP_PROXY handling) but carries its own connection pool,
+	// so reuse the returned client per peer rather than building one per
+	// call. Pass a custom transport when you need different limits or
+	// isolation (per-tenant proxies, custom mTLS, retry middleware,
+	// telemetry) — a transport you supply is used exactly as given.
 	Inner http.RoundTripper
 
 	// Timeout is set on the returned *http.Client. Zero means no timeout
@@ -84,6 +89,24 @@ type SignedHTTPClientOptions struct {
 	// ErrRequestSigningNotAdvertised. The client never switches profiles on
 	// its own.
 	ProfilesProvider func(*http.Request) []string
+
+	// MaxResponseBytes caps the cumulative bytes read from any one agent
+	// response. Zero selects DefaultMaxResponseBytes (4 MiB); a negative
+	// value (UnlimitedResponseBytes) turns the cap off.
+	//
+	// The cap is enforced while the body streams — an oversized
+	// Content-Length is rejected before the body is read, and otherwise the
+	// read that crosses the limit fails with a *ResponseTooLargeError. The
+	// body is never silently truncated. Override it for a single call with
+	// WithResponseLimits.
+	MaxResponseBytes int64
+
+	// MaxSSEEventBytes caps a single event in a text/event-stream response.
+	// Zero inherits MaxResponseBytes, which also stays in force as the
+	// cumulative per-call cap, so a peer cannot evade the limit by
+	// answering with an SSE stream. Set this lower than MaxResponseBytes
+	// for a long-lived stream of small events.
+	MaxSSEEventBytes int64
 }
 
 // ErrRequestSigningNotAdvertised is returned by an RFC 9421 signing client
@@ -131,8 +154,17 @@ func PathSuffixOperationResolver(r *http.Request) string {
 //     Timeout:            30 * time.Second,
 //     })
 //
+// Both modes cap the size of every agent response at
+// DefaultMaxResponseBytes (4 MiB) unless MaxResponseBytes says otherwise.
+// Agent responses are untrusted input, and an oversized one is rejected with
+// a *ResponseTooLargeError while it streams rather than buffered and
+// truncated. See ResponseLimitTransport for the enforcement rules and
+// WithResponseLimits for the per-call override.
+//
 // For lower-level integration (you already have an http.Client and just want
-// the always-sign signing transport), see (*Signer).RoundTripper.
+// the always-sign signing transport), see (*Signer).RoundTripper — it does
+// not cap responses on its own; wrap it in NewResponseLimitTransport to get
+// the same protection.
 func NewSignedHTTPClient(opts SignedHTTPClientOptions) (*http.Client, error) {
 	if opts.KeyID == "" && opts.AgentOrigin == "" {
 		return nil, errors.New("signing.NewSignedHTTPClient: KeyID is required")
@@ -158,7 +190,7 @@ func NewSignedHTTPClient(opts SignedHTTPClientOptions) (*http.Client, error) {
 
 	inner := opts.Inner
 	if inner == nil {
-		inner = http.DefaultTransport
+		inner = newBoundedHeaderTransport()
 	}
 
 	var transport http.RoundTripper
@@ -178,6 +210,13 @@ func NewSignedHTTPClient(opts SignedHTTPClientOptions) (*http.Client, error) {
 			profilesProvider:     opts.ProfilesProvider,
 		}
 	}
+
+	// Outermost so it counts the bytes the caller actually reads, including
+	// anything net/http transparently decompressed.
+	transport = NewResponseLimitTransport(transport, ResponseLimits{
+		MaxResponseBytes: opts.MaxResponseBytes,
+		MaxSSEEventBytes: opts.MaxSSEEventBytes,
+	})
 
 	return &http.Client{
 		Transport: transport,

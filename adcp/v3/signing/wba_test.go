@@ -595,10 +595,6 @@ func TestSignedHTTPClientRequiresAdvertisedWBA(t *testing.T) {
 	}
 }
 
-type roundTripFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
-
 func alwaysSignCapability(*http.Request) *adcp.RequestSigningCapabilities {
 	return &adcp.RequestSigningCapabilities{Supported: true, RequiredFor: []string{"create_media_buy"}}
 }
