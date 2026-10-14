@@ -117,6 +117,11 @@ type TrustRecordEvaluatorOptions struct {
 	MaxRecords int
 	// MaxFetchesPerHost bounds concurrent fetches to one host. Defaults to 4.
 	MaxFetchesPerHost int
+	// History persists authority history (which operators have served a
+	// trust.json, and the last record read from each). Defaults to a
+	// bounded in-memory history; public deployments must supply a durable
+	// one. See AuthorityHistory.
+	History AuthorityHistory
 	// Clock defaults to time.Now.
 	Clock func() time.Time
 }
@@ -132,8 +137,8 @@ type TrustRecordEvaluatorOptions struct {
 // Fetch failures, invalid records, and expired results fail closed. Fetches
 // are single-flighted per operator and per URL, bounded per host, and a
 // failed fetch is negatively cached for 60 s. A 200 from an operator's
-// derived URL is remembered for the evaluator's lifetime, so a later 404
-// is never treated as absence (no downgrade to brand.json).
+// derived URL is remembered in History, so a later 404 is never treated
+// as absence (no downgrade to brand.json).
 type TrustRecordEvaluator struct {
 	fetch      TrustFetcher
 	interval   time.Duration
@@ -146,10 +151,7 @@ type TrustRecordEvaluator struct {
 	lru      *list.List
 	failures map[string]trustFailure
 	pending  map[string]*trustCall
-	seen200  map[string]*list.Element // operators that have served a 200, LRU-bounded
-	seenLRU  *list.List
-	lastGood map[string]*list.Element // last record read per operator (*EvaluatedTrustRecord), LRU-bounded
-	goodLRU  *list.List
+	history  AuthorityHistory
 
 	responses       map[string]cachedResponse
 	responsePending map[string]*responseCall
@@ -203,10 +205,7 @@ func NewTrustRecordEvaluator(opts TrustRecordEvaluatorOptions) (*TrustRecordEval
 		lru:             list.New(),
 		failures:        map[string]trustFailure{},
 		pending:         map[string]*trustCall{},
-		seen200:         map[string]*list.Element{},
-		seenLRU:         list.New(),
-		lastGood:        map[string]*list.Element{},
-		goodLRU:         list.New(),
+		history:         opts.History,
 		responses:       map[string]cachedResponse{},
 		responsePending: map[string]*responseCall{},
 		hostsInflight:   map[string]int{},
@@ -226,6 +225,9 @@ func NewTrustRecordEvaluator(opts TrustRecordEvaluatorOptions) (*TrustRecordEval
 	}
 	if e.clock == nil {
 		e.clock = time.Now
+	}
+	if e.history == nil {
+		e.history = newMemoryAuthorityHistory()
 	}
 	if e.fetch == nil {
 		client := safefetch.NewClient()
@@ -318,6 +320,9 @@ func (e *TrustRecordEvaluator) refresh(ctx context.Context, domain, recordURL st
 	ctx, cancel := context.WithTimeout(ctx, trustDiscoveryTimeout)
 	defer cancel()
 	rec, err := e.resolve(ctx, domain, recordURL)
+	if err == nil {
+		err = e.storeLastGood(ctx, domain, rec)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	delete(e.pending, domain)
@@ -343,7 +348,6 @@ func (e *TrustRecordEvaluator) refresh(ctx context.Context, domain, recordURL st
 		e.lru.Remove(back)
 		delete(e.cache, back.Value.(string))
 	}
-	e.storeLastGood(domain, rec)
 	call.rec = rec
 }
 
@@ -386,11 +390,12 @@ func (e *TrustRecordEvaluator) resolve(ctx context.Context, domain, recordURL st
 			expires = res.expires
 		}
 		status := res.resp.Status
-		e.mu.Lock()
-		_, seen := e.seen200[domain]
-		e.mu.Unlock()
 		if status == http.StatusNotFound || status == http.StatusGone {
-			if seen {
+			state, herr := e.history.LoadAuthority(ctx, domain)
+			if herr != nil {
+				return nil, trustErr("trust record history unavailable", herr)
+			}
+			if state.Served {
 				// A record read before and now gone is a removal: every
 				// origin it listed is delisted, and brand.json does not
 				// come back.
@@ -403,9 +408,9 @@ func (e *TrustRecordEvaluator) resolve(ctx context.Context, domain, recordURL st
 		if status != http.StatusOK || len(res.resp.Body) > TrustRecordMaxBytes {
 			return nil, trustErr(fmt.Sprintf("trust record unavailable (HTTP %d)", status), nil)
 		}
-		e.mu.Lock()
-		e.markSeen200(domain)
-		e.mu.Unlock()
+		if err := e.markSeen200(ctx, domain); err != nil {
+			return nil, trustErr("trust record history unavailable", err)
+		}
 		rec, err := ValidateTrustRecord(res.resp.Body, TrustRecordOptions{Mode: Reading, Owner: domain})
 		if err != nil {
 			return nil, trustErr("trust record is invalid", err)
@@ -421,40 +426,30 @@ func (e *TrustRecordEvaluator) resolve(ctx context.Context, domain, recordURL st
 	return nil, trustErr("trust record resolution failed", nil)
 }
 
-// seen200Limit bounds the operators remembered as having served a 200.
-// Evicting one re-allows the legacy fallback for it after a later 404, so
-// the bound is generous; deployments that need the guarantee across
-// restarts persist it themselves.
-const seen200Limit = 1 << 16
-
-// markSeen200 records that domain served a 200. Called with mu held.
-func (e *TrustRecordEvaluator) markSeen200(domain string) {
-	if el, ok := e.seen200[domain]; ok {
-		e.seenLRU.MoveToFront(el)
-		return
+// markSeen200 records that domain served a 200, keeping its last record.
+func (e *TrustRecordEvaluator) markSeen200(ctx context.Context, domain string) error {
+	state, err := e.history.LoadAuthority(ctx, domain)
+	if err != nil {
+		return err
 	}
-	e.seen200[domain] = e.seenLRU.PushFront(domain)
-	for e.seenLRU.Len() > seen200Limit {
-		back := e.seenLRU.Back()
-		e.seenLRU.Remove(back)
-		delete(e.seen200, back.Value.(string))
+	if state.Served {
+		return nil
 	}
+	state.Served = true
+	return e.history.StoreAuthority(ctx, domain, state)
 }
 
-// storeLastGood records rec as the last record read for domain. Called
-// with mu held.
-func (e *TrustRecordEvaluator) storeLastGood(domain string, rec *EvaluatedTrustRecord) {
-	if el, ok := e.lastGood[domain]; ok {
-		el.Value = rec
-		e.goodLRU.MoveToFront(el)
-		return
+// storeLastGood records rec as the last record read for domain.
+func (e *TrustRecordEvaluator) storeLastGood(ctx context.Context, domain string, rec *EvaluatedTrustRecord) error {
+	state, err := e.history.LoadAuthority(ctx, domain)
+	if err != nil {
+		return trustErr("trust record history unavailable", err)
 	}
-	e.lastGood[domain] = e.goodLRU.PushFront(rec)
-	for e.goodLRU.Len() > seen200Limit {
-		back := e.goodLRU.Back()
-		e.goodLRU.Remove(back)
-		delete(e.lastGood, back.Value.(*EvaluatedTrustRecord).OperatorDomain)
+	state.LastRecord = rec
+	if err := e.history.StoreAuthority(ctx, domain, state); err != nil {
+		return trustErr("trust record history unavailable", err)
 	}
+	return nil
 }
 
 // ListingStatus is the outcome of CheckListing.
@@ -510,13 +505,9 @@ func (e *TrustRecordEvaluator) CheckListing(ctx context.Context, origin, role st
 	if !ok {
 		return Listing{Status: Unlisted, Err: err}
 	}
-	e.mu.Lock()
-	var last *EvaluatedTrustRecord
-	if el, ok := e.lastGood[domain]; ok {
-		last = el.Value.(*EvaluatedTrustRecord)
-	}
-	e.mu.Unlock()
-	if last == nil {
+	state, herr := e.history.LoadAuthority(ctx, domain)
+	last := state.LastRecord
+	if herr != nil || last == nil {
 		return Listing{Status: Unavailable, Err: err}
 	}
 	if _, merr := last.Agent(origin, role); merr != nil {

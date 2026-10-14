@@ -392,12 +392,93 @@ func TestMemoryRevocationHistory(t *testing.T) {
 	got, _ = h.LoadRevocations(ctx, o)
 	require.Len(t, got.RevokedKids, 3)
 
-	// One operator over its origin quota evicts only its own entries.
-	for i := range historyOriginsPerOperator + 5 {
-		origin := fmt.Sprintf("https://t%d.attacker.example.net", i)
-		require.NoError(t, h.StoreRevocations(ctx, origin, mk(origin, wbaTestNow, kid(100+i))))
+	// One operator, or one hosting platform's free subdomains, cannot flood
+	// the history: past the quota its new origins are refused (they fail
+	// closed), and no other origin's history is evicted.
+	for _, tenant := range []func(int) string{
+		func(i int) string { return fmt.Sprintf("https://t%d.attacker.example.net", i) },
+		func(i int) string { return fmt.Sprintf("https://tenant%d.github.io", i) },
+	} {
+		for i := range historyOriginsPerOperator {
+			origin := tenant(i)
+			require.NoError(t, h.StoreRevocations(ctx, origin, mk(origin, wbaTestNow, kid(100+i))))
+		}
+		over := tenant(historyOriginsPerOperator)
+		require.ErrorIs(t, h.StoreRevocations(ctx, over, mk(over, wbaTestNow, kid(999))), errHistoryFull)
+		got, _ = h.LoadRevocations(ctx, tenant(0))
+		require.NotNil(t, got, "the flooding group's own earlier entries are kept")
 	}
 	got, _ = h.LoadRevocations(ctx, o)
-	require.NotNil(t, got, "another operator's history is not evicted")
-	require.LessOrEqual(t, h.opOrigins["example.net"], historyOriginsPerOperator)
+	require.NotNil(t, got, "another operator's history is never evicted")
+	require.Len(t, got.RevokedKids, 3)
+}
+
+// refusingHistory wraps the memory history and can be made to refuse.
+type refusingHistory struct {
+	inner  *memoryRevocationHistory
+	refuse atomic.Bool
+}
+
+func (h *refusingHistory) LoadRevocations(ctx context.Context, origin string) (*RevocationList, error) {
+	return h.inner.LoadRevocations(ctx, origin)
+}
+
+func (h *refusingHistory) StoreRevocations(ctx context.Context, origin string, l *RevocationList) error {
+	if h.refuse.Load() {
+		return errHistoryFull
+	}
+	return h.inner.StoreRevocations(ctx, origin, l)
+}
+
+// TestOriginRevocationCheckerFailsClosedWhenHistoryRefuses: an origin whose
+// revocations the History cannot keep (over its quota, or a store outage)
+// fails closed rather than being checked against state an eviction or a
+// restart would forget, and recovers once the History accepts it.
+func TestOriginRevocationCheckerFailsClosedWhenHistoryRefuses(t *testing.T) {
+	now := wbaTestNow
+	clock := func() time.Time { return now }
+	rig := newWBARig(t)
+	rig.resolver = NewDirectoryResolver(DirectoryResolverOptions{Fetch: rig.dirs.fetch, Clock: clock})
+	hist := &refusingHistory{inner: newMemoryRevocationHistory(16)}
+	checker, err := NewOriginRevocationChecker(OriginRevocationCheckerOptions{Keys: rig.resolver, Fetch: rig.revs.fetch, Clock: clock, History: hist})
+	require.NoError(t, err)
+	ctx := context.Background()
+	kid := strings.Repeat("o", 43)
+	publish := func() {
+		updated := now.Add(-10 * time.Second)
+		rig.revs.set(t, revocationPayload{Updated: rfc3339(updated), NextUpdate: rfc3339(updated.Add(5 * time.Minute)), RevokedKids: []string{kid}})
+	}
+
+	// Discovery while the History refuses: SERVICE_UNAVAILABLE, not admitted.
+	hist.refuse.Store(true)
+	publish()
+	_, err = checker.RevokedWBAKey(ctx, rig.origin, kid)
+	requireWBAStatus(t, err, http.StatusServiceUnavailable)
+	require.True(t, IsIdentityUnavailable(err))
+
+	// Accepted after the cooldown.
+	hist.refuse.Store(false)
+	now = now.Add(discoveryNegativeTTL + time.Second)
+	publish()
+	revoked, err := checker.RevokedWBAKey(ctx, rig.origin, kid)
+	require.NoError(t, err)
+	require.True(t, revoked)
+
+	// An admitted origin whose next list cannot be stored fails closed too.
+	hist.refuse.Store(true)
+	now = now.Add(5 * time.Minute)
+	publish()
+	_, err = checker.RevokedWBAKey(ctx, rig.origin, kid)
+	requireWBAStatus(t, err, http.StatusServiceUnavailable)
+
+	// It recovers on the next refresh once the store succeeds, even if the
+	// list is unchanged (a 304 retries the store).
+	hist.refuse.Store(false)
+	rig.revs.mu.Lock()
+	rig.revs.status = http.StatusNotModified
+	rig.revs.mu.Unlock()
+	now = now.Add(revocationMinInterval + time.Second)
+	revoked, err = checker.RevokedWBAKey(ctx, rig.origin, kid)
+	require.NoError(t, err)
+	require.True(t, revoked)
 }

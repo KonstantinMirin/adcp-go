@@ -69,3 +69,20 @@ func validHost(host string) bool {
 	}
 	return true
 }
+
+// QuotaKey returns the key under which per-operator quotas count a host:
+// its registrable domain, except that every tenant of a PRIVATE-section
+// suffix (a hosting platform such as github.io or pages.dev, where anyone
+// can get a free registrable domain) counts under the platform suffix.
+// One party with many free subdomains therefore shares one quota. It
+// reports false when the host has no registrable domain.
+func QuotaKey(hostOrURL string) (string, bool) {
+	domain, ok := RegistrableDomain(hostOrURL)
+	if !ok {
+		return "", false
+	}
+	if suffix, icann := publicsuffix.PublicSuffix(domain); !icann && strings.Contains(suffix, ".") {
+		return suffix, true
+	}
+	return domain, true
+}

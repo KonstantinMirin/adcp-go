@@ -3,6 +3,7 @@ package identity
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 
@@ -95,10 +96,13 @@ func (b *OriginBindings) PrincipalForOrigin(_ context.Context, origin string) (s
 // by the revocation polling interval:
 //   - listed with the role: the bound principal;
 //   - delisted (the record no longer lists it, or no record is published):
-//     identity-established again, as at first contact. The binding itself
-//     is kept, so the origin still cannot fall back to the RFC 9421
-//     profile, and TrustRecordEvaluator.Bind refuses to bind it again
-//     while it stays unlisted;
+//     identity-established again, as at first contact, except that it may
+//     still poll and cancel tasks it created while listed (TaskOperations
+//     keep the principal; the application must scope task lookups to the
+//     principal, as it does for any caller). The binding itself is kept,
+//     so the origin still cannot fall back to the RFC 9421 profile, and
+//     TrustRecordEvaluator.Bind refuses to bind it again while it stays
+//     unlisted;
 //   - record unreadable (a fetch failure is never a delisting, and an
 //     outage never restores access): if the last record read did not list
 //     the origin, it stays delisted; otherwise a spend-committing
@@ -116,7 +120,16 @@ type BindingGate struct {
 	// SpendCommitting classifies operations for the outage rule. Defaults
 	// to signing.IsSpendCommittingOperation.
 	SpendCommitting func(operation string) bool
+	// TaskOperations are the task polling and cancellation operations a
+	// delisted origin may still call for work it started while listed (the
+	// one exception to its demotion). Defaults to DefaultTaskOperations.
+	TaskOperations []string
 }
+
+// DefaultTaskOperations are the AdCP and protocol task polling and
+// cancellation operations: get_task_status, tasks/get, tasks/result, and
+// tasks/cancel.
+var DefaultTaskOperations = []string{"get_task_status", "tasks/get", "tasks/result", "tasks/cancel"}
 
 // AuthorizeWBA implements signing.WBAAuthorizer.
 func (g *BindingGate) AuthorizeWBA(ctx context.Context, signer *signing.VerifiedSigner, operation string) (string, error) {
@@ -143,7 +156,18 @@ func (g *BindingGate) AuthorizeWBA(ctx context.Context, signer *signing.Verified
 		return principal, nil
 	case Unlisted:
 		// Delisted, removed, or never published: identity-established
-		// again. A stale delisting stays a delisting through an outage.
+		// again. A stale delisting stays a delisting through an outage. The
+		// one exception is work already in flight: task polling and
+		// cancellation keep the principal, so the application can scope
+		// them to the tasks that principal created while listed. Nothing
+		// new starts under the binding.
+		ops := g.TaskOperations
+		if ops == nil {
+			ops = DefaultTaskOperations
+		}
+		if slices.Contains(ops, operation) {
+			return principal, nil
+		}
 		return "", nil
 	default:
 		spend := signing.IsSpendCommittingOperation(operation)

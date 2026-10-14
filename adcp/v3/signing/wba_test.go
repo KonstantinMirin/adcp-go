@@ -251,6 +251,21 @@ func TestWBARejections(t *testing.T) {
 		{"duplicate parameter", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
 			r.Header.Set("Signature-Input", r.Header.Get("Signature-Input")+`;tag="web-bot-auth"`)
 		}, http.StatusBadRequest, false},
+		{"duplicate created parameter", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
+			r.Header.Set("Signature-Input", r.Header.Get("Signature-Input")+`;created=1`)
+		}, http.StatusBadRequest, false},
+		{"duplicate Signature member", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
+			r.Header.Set("Signature", r.Header.Get("Signature")+", "+r.Header.Get("Signature"))
+		}, http.StatusBadRequest, false},
+		{"duplicate Signature-Agent member", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
+			r.Header.Set("Signature-Agent", r.Header.Get("Signature-Agent")+", "+r.Header.Get("Signature-Agent"))
+		}, http.StatusBadRequest, false},
+		{"duplicate Signature-Agent member with another origin last", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
+			r.Header.Set("Signature-Agent", r.Header.Get("Signature-Agent")+`, sig1="https://other.example.com"`)
+		}, http.StatusBadRequest, false},
+		{"duplicate Signature-Agent parameter", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
+			r.Header.Set("Signature-Agent", r.Header.Get("Signature-Agent")+`;x=1;x=2`)
+		}, http.StatusBadRequest, false},
 		{"Signature-Input on two lines", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
 			r.Header.Add("Signature-Input", `sig2=("@method");tag="web-bot-auth"`)
 		}, http.StatusBadRequest, false},

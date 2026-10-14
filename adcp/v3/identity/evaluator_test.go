@@ -3,6 +3,7 @@ package identity
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -390,10 +391,17 @@ func TestBindingsAndGate(t *testing.T) {
 	// downgrade, and it cannot be bound again while unlisted.
 	r.server.set(trustURL("example.com"), 200, `{"agents":[{"url":"https://other.example.com","roles":["adcp:buying"]}]}`)
 	r.now = r.now.Add(2 * time.Minute)
-	for _, op := range []string{"create_media_buy", "get_principal"} {
+	for _, op := range []string{"create_media_buy", "get_principal", "sync_accounts"} {
 		got, err = gate.AuthorizeWBA(ctx, signer, op)
 		require.NoError(t, err, op)
 		require.Empty(t, got, op)
+	}
+	// Work already in flight: a delisted origin may still poll and cancel
+	// its own tasks, under its principal.
+	for _, op := range []string{"get_task_status", "tasks/get", "tasks/cancel"} {
+		got, err = gate.AuthorizeWBA(ctx, signer, op)
+		require.NoError(t, err, op)
+		require.Equal(t, "p1", got, op)
 	}
 	_, still, _ := b.PrincipalForOrigin(ctx, "https://buyer.example.com")
 	require.True(t, still)
@@ -541,4 +549,113 @@ func TestBindingGateOutageRules(t *testing.T) {
 		require.Empty(t, got, "the last record read still delists the origin")
 		close(release)
 	})
+}
+
+// TestAuthorityHistoryResistsFlooding: one party with many free hosting
+// subdomains (a PSL PRIVATE suffix) cannot evict another operator's
+// authority history, so a brand's removal still counts as a removal (and
+// the brand.json fallback stays disabled) after the flood.
+func TestAuthorityHistoryResistsFlooding(t *testing.T) {
+	ctx := context.Background()
+	r := newEvalRig(t)
+	r.eval.maxRecords = 1 << 12
+	r.server.set(trustURL("brand-7k3q.com"), 200, `{"grants":[]}`)
+	_, err := r.eval.Evaluate(ctx, "brand-7k3q.com", "")
+	require.NoError(t, err)
+	for i := range historyPerOperator + 10 {
+		tenant := fmt.Sprintf("tenant%d.github.io", i)
+		r.server.set(trustURL(tenant), 200, `{"grants":[]}`)
+		_, err := r.eval.Evaluate(ctx, tenant, "")
+		require.NoError(t, err)
+	}
+	mem := r.eval.history.(*memoryAuthorityHistory)
+	mem.mu.Lock()
+	require.Equal(t, historyPerOperator, mem.table.GroupLen("github.io"), "the platform's tenants share one quota")
+	brand, _ := mem.table.Get("brand-7k3q.com")
+	mem.mu.Unlock()
+	require.True(t, brand.Served, "the brand's history was not evicted")
+
+	r.server.set(trustURL("brand-7k3q.com"), http.StatusNotFound, "")
+	r.now = r.now.Add(2 * time.Minute)
+	rec, err := r.eval.Evaluate(ctx, "brand-7k3q.com", "")
+	require.NoError(t, err)
+	require.True(t, rec.Removed, "still a removal, so authorized_operators does not come back")
+
+	// A refused tenant simply has no history: its own later 404 is absence.
+	over := fmt.Sprintf("tenant%d.github.io", historyPerOperator+5)
+	r.server.set(trustURL(over), http.StatusNotFound, "")
+	_, err = r.eval.Evaluate(ctx, over, "")
+	require.True(t, IsTrustRecordAbsent(err))
+}
+
+// sharedHistory is a stand-in for a durable AuthorityHistory shared by
+// replicas.
+type sharedHistory struct {
+	mu       sync.Mutex
+	states   map[string]AuthorityState
+	storeErr error
+	loadErr  error
+}
+
+func (h *sharedHistory) LoadAuthority(_ context.Context, domain string) (AuthorityState, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.states[domain], h.loadErr
+}
+
+func (h *sharedHistory) StoreAuthority(_ context.Context, domain string, s AuthorityState) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.storeErr != nil {
+		return h.storeErr
+	}
+	h.states[domain] = s
+	return nil
+}
+
+// TestDurableAuthorityHistory: with a shared History, a replica that never
+// read the record still treats a 404 as a removal and keeps the last
+// record through an outage; a history that cannot be read or written
+// fails the evaluation closed.
+func TestDurableAuthorityHistory(t *testing.T) {
+	ctx := context.Background()
+	hist := &sharedHistory{states: map[string]AuthorityState{}}
+	server := newTrustServer()
+	now := testNow
+	newEval := func() *TrustRecordEvaluator {
+		e, err := NewTrustRecordEvaluator(TrustRecordEvaluatorOptions{Fetch: server.fetch, Clock: func() time.Time { return now }, History: hist})
+		require.NoError(t, err)
+		return e
+	}
+	server.set(trustURL("example.com"), 200, buyerRecord)
+	_, err := newEval().Evaluate(ctx, "https://buyer.example.com", RoleBuying)
+	require.NoError(t, err)
+	require.True(t, hist.states["example.com"].Served)
+	require.NotNil(t, hist.states["example.com"].LastRecord)
+
+	// Another replica, during an outage: the shared last record holds.
+	server.set(trustURL("example.com"), http.StatusServiceUnavailable, "")
+	l := newEval().CheckListing(ctx, "https://buyer.example.com", RoleBuying)
+	require.Equal(t, Unavailable, l.Status)
+	require.True(t, l.WithinGrace)
+
+	// Another replica after removal: a removal, not absence.
+	server.set(trustURL("example.com"), http.StatusNotFound, "")
+	rec, err := newEval().Evaluate(ctx, "example.com", "")
+	require.NoError(t, err)
+	require.True(t, rec.Removed)
+
+	// A history that cannot be written or read fails closed.
+	server.set(trustURL("other.com"), 200, `{"grants":[]}`)
+	hist.storeErr = errors.New("db down")
+	_, err = newEval().Evaluate(ctx, "other.com", "")
+	require.True(t, IsTrustRecordUnavailable(err), "%v", err)
+	hist.storeErr = nil
+	hist.loadErr = errors.New("db down")
+	server.set(trustURL("gone.com"), http.StatusNotFound, "")
+	_, err = newEval().Evaluate(ctx, "gone.com", "")
+	require.True(t, IsTrustRecordUnavailable(err), "a 404 is not absence when history is unreadable: %v", err)
+	l = newEval().CheckListing(ctx, "https://buyer.example.com", RoleBuying)
+	require.Equal(t, Unavailable, l.Status)
+	require.False(t, l.WithinGrace)
 }

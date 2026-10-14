@@ -39,3 +39,20 @@ func TestRegistrableDomain(t *testing.T) {
 		}
 	}
 }
+
+func TestQuotaKey(t *testing.T) {
+	for in, want := range map[string]string{
+		"https://agent.brand.example.com": "example.com",
+		"https://a.tenant1.github.io":     "github.io",
+		"https://tenant2.github.io":       "github.io",
+		"https://x.brand.co.uk":           "brand.co.uk",
+	} {
+		got, ok := QuotaKey(in)
+		if !ok || got != want {
+			t.Errorf("QuotaKey(%q) = %q, %v; want %q", in, got, ok, want)
+		}
+	}
+	if _, ok := QuotaKey("https://192.0.2.1"); ok {
+		t.Error("IP literal has a quota key")
+	}
+}

@@ -360,8 +360,9 @@ type OriginRevocationCheckerOptions struct {
 	// bound the least recently used origin is evicted, its revocations
 	// kept in History, so admission never locks out new origins.
 	MaxOrigins int
-	// MaxOriginsPerOperator bounds origins of one registrable domain
-	// (default 8); beyond it that operator's least recently used origin is
+	// MaxOriginsPerOperator bounds origins of one operator (default 8):
+	// one registrable domain, with every tenant of a PSL PRIVATE hosting
+	// suffix counted together. Beyond it that operator's least recently used origin is
 	// evicted, so one operator cannot crowd out others. It also bounds
 	// concurrent first discoveries per operator.
 	MaxOriginsPerOperator int
@@ -369,9 +370,10 @@ type OriginRevocationCheckerOptions struct {
 	// many polling intervals. Defaults to 2, as in the Python SDK.
 	GraceMultiplier float64
 	// History persists retained revocations. Defaults to an in-memory
-	// history of 4 x MaxOrigins origins with per-operator quotas. That
-	// default is not monotonic under hostile load (many registrable domains
-	// can flush it), so public deployments should supply a durable one.
+	// history of 4 x MaxOrigins origins with per-operator quotas that
+	// refuse rather than evict (an origin that does not fit fails closed).
+	// It does not survive restarts or span replicas, so public deployments
+	// must supply a durable one.
 	History RevocationHistory
 	// Clock defaults to time.Now.
 	Clock func() time.Time
@@ -383,9 +385,10 @@ type OriginRevocationCheckerOptions struct {
 // implements WBARevocationChecker.
 //
 // Revocation is monotonic: every revoked key and detail seen for an origin
-// is retained across refreshes and across evictions through History (with
-// the default in-memory History, only while the origin stays within its
-// bounds), a list older than the retained one is refused, and keyCompromise and the
+// is retained across refreshes and across evictions through History (the
+// default in-memory History refuses an origin that would exceed its quotas,
+// which then fails closed, rather than forgetting another's), a list older
+// than the retained one is refused, and keyCompromise and the
 // earliest invalidity_date win. Only thumbprint-shaped kids (the only kids
 // a Web Bot Auth keyid can match) are retained, at most 1024 per origin; a
 // list over the bound fails that origin closed. Refreshes are single-flight
@@ -423,6 +426,10 @@ type originRevocations struct {
 	lastAttempt  time.Time
 	interval     time.Duration
 	refreshing   *revocationCall
+	// unpersisted is set while History refuses or fails to store the
+	// retained list: the origin then fails closed, since its revocations
+	// would not survive an eviction or restart.
+	unpersisted error
 }
 
 const (
@@ -546,8 +553,11 @@ func (c *OriginRevocationChecker) retained(origin string) *RevocationList {
 	return l
 }
 
+// operatorBucket is the quota group of an origin: its registrable domain,
+// with every tenant of a hosting platform's PRIVATE suffix counted under
+// the platform (psl.QuotaKey).
 func operatorBucket(origin string) string {
-	if d, ok := psl.RegistrableDomain(origin); ok {
+	if d, ok := psl.QuotaKey(origin); ok {
 		return d
 	}
 	if u, err := url.Parse(origin); err == nil && u.Hostname() != "" {
@@ -721,6 +731,9 @@ func (s *originRevocations) fresh(ctx context.Context, c *OriginRevocationChecke
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now = c.clock()
+	if s.unpersisted != nil {
+		return nil, s.unpersisted
+	}
 	if s.current == nil {
 		if callErr == nil {
 			callErr = errors.New("revocation list unavailable")
@@ -752,11 +765,18 @@ func (s *originRevocations) refresh(ctx context.Context, c *OriginRevocationChec
 	}
 	s.refreshing = nil
 	committed := s.current
+	retry := s.unpersisted != nil
 	s.mu.Unlock()
-	if err == nil && l != nil && committed != nil {
-		if herr := c.history.StoreRevocations(ctx, s.origin, committed); herr != nil {
-			err = herr
+	if err == nil && (l != nil || retry) && committed != nil {
+		herr := c.history.StoreRevocations(ctx, s.origin, committed)
+		s.mu.Lock()
+		if herr != nil {
+			s.unpersisted = fmt.Errorf("revocation history store failed: %w", herr)
+			err = s.unpersisted
+		} else {
+			s.unpersisted = nil
 		}
+		s.mu.Unlock()
 	}
 	call.err = err
 	close(call.done)
@@ -840,30 +860,34 @@ func (s *originRevocations) commit(c *OriginRevocationChecker, l *RevocationList
 	return nil
 }
 
-// memoryRevocationHistory is the default RevocationHistory: a bounded LRU
-// with a per-operator (registrable domain) quota on origins and retained
-// kids, so one operator evicts only its own entries. It is not monotonic
-// under hostile load: an attacker with many registrable domains (cheap
-// through public-suffix tenants) can still push other origins out of the
-// global bound. Public deployments should supply a durable History.
+// memoryRevocationHistory is the default RevocationHistory. It refuses
+// rather than evicts: a quota group (psl.QuotaKey: an operator, with every
+// tenant of a hosting platform's PRIVATE suffix counted together) holds at
+// most historyOriginsPerOperator origins and historyKidsPerOperator kids,
+// and the table at most limit origins and historyKidBudget kids. A store
+// that does not fit fails, so that origin fails closed
+// (SERVICE_UNAVAILABLE) instead of another origin's revocations being
+// forgotten. It lives in memory: public deployments must supply a durable
+// History so revocations hold across restarts and replicas.
 type memoryRevocationHistory struct {
 	mu        sync.Mutex
 	limit     int // origins
 	budget    int // retained kids across all origins
-	opLimit   int // origins per operator
-	opBudget  int // retained kids per operator
+	opLimit   int // origins per quota group
+	opBudget  int // retained kids per quota group
 	kids      int
-	lists     map[string]*list.Element
-	lru       *list.List
+	lists     map[string]*historyEntry
 	opKids    map[string]int
 	opOrigins map[string]int
 }
 
 type historyEntry struct {
-	origin   string
-	operator string
-	list     *RevocationList
+	group string
+	list  *RevocationList
 }
+
+// errHistoryFull refuses a store that would exceed a quota.
+var errHistoryFull = errors.New("signing: revocation history quota exceeded")
 
 const (
 	historyOriginsPerOperator = 32
@@ -874,8 +898,7 @@ func newMemoryRevocationHistory(limit int) *memoryRevocationHistory {
 	return &memoryRevocationHistory{
 		limit: limit, budget: historyKidBudget,
 		opLimit: historyOriginsPerOperator, opBudget: historyKidsPerOperator,
-		lists: map[string]*list.Element{}, lru: list.New(),
-		opKids: map[string]int{}, opOrigins: map[string]int{},
+		lists: map[string]*historyEntry{}, opKids: map[string]int{}, opOrigins: map[string]int{},
 	}
 }
 
@@ -883,8 +906,7 @@ func (h *memoryRevocationHistory) LoadRevocations(_ context.Context, origin stri
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if e, ok := h.lists[origin]; ok {
-		h.lru.MoveToFront(e)
-		return e.Value.(*historyEntry).list, nil
+		return e.list, nil
 	}
 	return nil, nil
 }
@@ -896,13 +918,16 @@ func (h *memoryRevocationHistory) LoadRevocations(_ context.Context, origin stri
 func (h *memoryRevocationHistory) StoreRevocations(_ context.Context, origin string, l *RevocationList) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	e, exists := h.lists[origin]
+	old, exists := h.lists[origin]
 	if !exists && len(l.RevokedKids) == 0 {
 		return nil
 	}
 	merged := cloneRevocationList(l)
+	oldKids := 0
+	group := operatorBucket(origin)
 	if exists {
-		old := e.Value.(*historyEntry)
+		oldKids = len(old.list.RevokedKids)
+		group = old.group
 		if l.Updated.Before(old.list.Updated) {
 			merged = cloneRevocationList(old.list)
 			if err := merged.Retain(l); err != nil {
@@ -911,47 +936,19 @@ func (h *memoryRevocationHistory) StoreRevocations(_ context.Context, origin str
 		} else if err := merged.Retain(old.list); err != nil {
 			return err
 		}
-		h.remove(e)
 	}
-	op := operatorBucket(origin)
-	// An operator over its quota evicts its own oldest entries, never
-	// another operator's.
-	for h.opOrigins[op] >= h.opLimit || h.opKids[op]+len(merged.RevokedKids) > h.opBudget {
-		victim := h.oldestOf(op)
-		if victim == nil {
-			break
-		}
-		h.remove(victim)
+	added := len(merged.RevokedKids) - oldKids
+	if (!exists && (h.opOrigins[group] >= h.opLimit || len(h.lists) >= h.limit)) ||
+		h.opKids[group]+added > h.opBudget || h.kids+added > h.budget {
+		return errHistoryFull
 	}
-	h.lists[origin] = h.lru.PushFront(&historyEntry{origin: origin, operator: op, list: merged})
-	h.kids += len(merged.RevokedKids)
-	h.opKids[op] += len(merged.RevokedKids)
-	h.opOrigins[op]++
-	for h.lru.Len() > 1 && (h.lru.Len() > h.limit || h.kids > h.budget) {
-		h.remove(h.lru.Back())
+	if !exists {
+		h.opOrigins[group]++
 	}
+	h.lists[origin] = &historyEntry{group: group, list: merged}
+	h.kids += added
+	h.opKids[group] += added
 	return nil
-}
-
-func (h *memoryRevocationHistory) oldestOf(op string) *list.Element {
-	for e := h.lru.Back(); e != nil; e = e.Prev() {
-		if e.Value.(*historyEntry).operator == op {
-			return e
-		}
-	}
-	return nil
-}
-
-func (h *memoryRevocationHistory) remove(e *list.Element) {
-	entry := e.Value.(*historyEntry)
-	h.lru.Remove(e)
-	delete(h.lists, entry.origin)
-	h.kids -= len(entry.list.RevokedKids)
-	h.opKids[entry.operator] -= len(entry.list.RevokedKids)
-	if h.opOrigins[entry.operator]--; h.opOrigins[entry.operator] <= 0 {
-		delete(h.opOrigins, entry.operator)
-		delete(h.opKids, entry.operator)
-	}
 }
 
 func cloneRevocationList(l *RevocationList) *RevocationList {
