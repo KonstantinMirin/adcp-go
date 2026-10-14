@@ -99,10 +99,14 @@ func (b *OriginBindings) PrincipalForOrigin(_ context.Context, origin string) (s
 //     is kept, so the origin still cannot fall back to the RFC 9421
 //     profile, and TrustRecordEvaluator.Bind refuses to bind it again
 //     while it stays unlisted;
-//   - record unreachable (a fetch failure is never a delisting): a
-//     spend-committing operation fails with the retryable
-//     SERVICE_UNAVAILABLE; any other operation continues under the
-//     binding.
+//   - record unreadable (a fetch failure is never a delisting, and an
+//     outage never restores access): if the last record read did not list
+//     the origin, it stays delisted; otherwise a spend-committing
+//     operation fails with the retryable SERVICE_UNAVAILABLE, and any other
+//     operation continues under the binding only while the last record
+//     that listed the origin is within 4x the polling interval past its
+//     freshness, then also gets SERVICE_UNAVAILABLE. A 404 or 410 is a
+//     removal (delisted), on every replica.
 type BindingGate struct {
 	Bindings signing.OriginBindingLookup
 	Records  *TrustRecordEvaluator
@@ -133,21 +137,22 @@ func (g *BindingGate) AuthorizeWBA(ctx context.Context, signer *signing.Verified
 	if role == "" {
 		role = RoleBuying
 	}
-	_, err = g.Records.Evaluate(ctx, signer.AgentURL, role)
-	switch {
-	case err == nil:
+	l := g.Records.CheckListing(ctx, signer.AgentURL, role)
+	switch l.Status {
+	case Listed:
 		return principal, nil
-	case IsTrustRecordUnavailable(err):
+	case Unlisted:
+		// Delisted, removed, or never published: identity-established
+		// again. A stale delisting stays a delisting through an outage.
+		return "", nil
+	default:
 		spend := signing.IsSpendCommittingOperation(operation)
 		if g.SpendCommitting != nil {
 			spend = g.SpendCommitting(operation)
 		}
-		if spend {
-			return "", signing.NewAuthorizationError(signing.CodeServiceUnavailable, "operator trust record unavailable on a spend-committing call", err)
+		if spend || !l.WithinGrace {
+			return "", signing.NewAuthorizationError(signing.CodeServiceUnavailable, "operator trust record unavailable", l.Err)
 		}
 		return principal, nil
-	default:
-		// Delisted: identity-established again.
-		return "", nil
 	}
 }

@@ -207,11 +207,12 @@ func TestDirectoryResolverOutageCoolsDown(t *testing.T) {
 	now = now.Add(2 * time.Minute)
 	dirs.fail(origin, errors.New("connection reset"))
 	_, err = d.ResolveWBAKey(ctx, origin, jwk.Kid)
-	requireWBAStatus(t, err, http.StatusForbidden)
+	requireWBAStatus(t, err, http.StatusServiceUnavailable)
+	require.True(t, IsIdentityUnavailable(err))
 	require.NotNil(t, d.Evidence(origin), "the previous signed snapshot is kept as evidence")
-	// Cooldown: no refetch within 60 s.
+	// Cooldown: no refetch within 60 s, and the cooldown keeps the kind.
 	_, err = d.ResolveWBAKey(ctx, origin, jwk.Kid)
-	requireWBAStatus(t, err, http.StatusForbidden)
+	requireWBAStatus(t, err, http.StatusServiceUnavailable)
 	require.Equal(t, 2, dirs.count(origin))
 	now = now.Add(61 * time.Second)
 	dirs.publish(t, origin, now.Add(-time.Minute), time.Hour, key)

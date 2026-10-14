@@ -79,6 +79,9 @@ type WBAError struct {
 	// labels are the request's web-bot-auth labels in order, used to build
 	// Accept-Signature.
 	labels []string
+
+	// outage marks a signer-side outage (ErrIdentityUnavailable).
+	outage bool
 }
 
 func (e *WBAError) Error() string {
@@ -103,6 +106,25 @@ func wbaFail(status int, label, reason string) *WBAError {
 func wbaDeny(reason string) *WBAError {
 	return &WBAError{Status: http.StatusForbidden, Reason: reason, Authorization: true, Code: CodePermissionDenied}
 }
+
+// ErrIdentityUnavailable is matched (errors.Is) by a *WBAError for a
+// signer-side outage: the verifier could not confirm the signer's identity
+// because its key directory could not be fetched (a network error, a 5xx,
+// a timeout) or its revocation list could not be read or is stale past
+// grace. Such a request is answered with SERVICE_UNAVAILABLE (503,
+// retryable, Retry-After, AdCP envelope, no Accept-Signature), and nothing
+// is served under the signature: no anonymous fallback.
+var ErrIdentityUnavailable = errors.New("signing: signer identity cannot be confirmed (outage)")
+
+// IsIdentityUnavailable reports whether err is a signer-side outage.
+func IsIdentityUnavailable(err error) bool { return errors.Is(err, ErrIdentityUnavailable) }
+
+func identityUnavailable(reason string, wrapped error) *WBAError {
+	return &WBAError{Status: http.StatusServiceUnavailable, Code: CodeServiceUnavailable, Reason: reason, Wrapped: wrapped, outage: true}
+}
+
+// Is reports a signer-side outage as ErrIdentityUnavailable.
+func (e *WBAError) Is(target error) bool { return target == ErrIdentityUnavailable && e.outage }
 
 // AdCP error codes used for authorization outcomes after identity is
 // established.
@@ -255,13 +277,6 @@ type WBAVerifyOptions struct {
 	// Revocation checks each verified key against its origin's list.
 	Revocation WBARevocationChecker
 
-	// RevocationOutageAllowed, when set, returns a signer whose revocation
-	// status could not be read with RevocationUnknown set, instead of
-	// failing with SERVICE_UNAVAILABLE. The caller must then fail closed for
-	// spend-committing operations (IsSpendCommittingOperation), as
-	// Middleware does. A revoked key always fails.
-	RevocationOutageAllowed bool
-
 	// Replay records each signature's nonce per identity. The identity, not
 	// the key, scopes the nonce, so key rotation does not reopen a replay.
 	// A store that implements ReplayClaimer (MemoryReplayStore does) records
@@ -296,8 +311,11 @@ var errWBANotConfigured = errors.New("signing: Web Bot Auth verification require
 // the signatures before it. Each VerifiedSigner's AgentURL is the signer's
 // canonical origin and its KeyID is the key's thumbprint.
 //
-// A failure is a *WBAError carrying the status to answer. The function
-// verifies identity only: it reads no trust record and grants no authority.
+// A failure is a *WBAError carrying the status to answer. A signer-side
+// outage (key directory or revocation list unavailable) matches
+// ErrIdentityUnavailable and must be answered with SERVICE_UNAVAILABLE,
+// serving nothing. The function verifies identity only: it reads no trust
+// record and grants no authority.
 //
 // A non-empty signed body must be strict JSON (AdCP bodies are JSON-RPC
 // or JSON): one value, no duplicate keys, including keys that differ only
@@ -470,20 +488,16 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*Verifie
 		if len(body) > 0 && !wbaDigestMatches(r.Header.Get(contentDigestHeader), body) {
 			return nil, labels, wbaFail(http.StatusForbidden, label, "request digest mismatch")
 		}
-		// The signature verified. A revocation status that cannot be read is
-		// an outage, not a signature failure: never 403 with
-		// Accept-Signature. It fails closed (SERVICE_UNAVAILABLE) unless the
-		// caller takes responsibility for failing closed only on spend.
-		revocationUnknown := false
+		// The signature verified. A revocation list that cannot be read, or
+		// is stale past grace, leaves identity unconfirmed: a signer-side
+		// outage. Serve nothing under the signature (SERVICE_UNAVAILABLE),
+		// never 403 with Accept-Signature and never an anonymous fallback.
 		revoked, err := opts.Revocation.RevokedWBAKey(r.Context(), origin, keyID)
 		if err != nil {
-			if we := AsWBAError(err); we != nil && we.Authorization {
+			if we := AsWBAError(err); we != nil && (we.Authorization || we.Status == http.StatusTooManyRequests || we.Code == CodeServiceUnavailable) {
 				return nil, labels, we
 			}
-			if !opts.RevocationOutageAllowed {
-				return nil, labels, NewAuthorizationError(CodeServiceUnavailable, "origin revocation status unavailable", err)
-			}
-			revocationUnknown = true
+			return nil, labels, identityUnavailable("origin revocation status unavailable", err)
 		}
 		if revoked {
 			return nil, labels, wbaDeny("signing key revoked")
@@ -504,7 +518,6 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*Verifie
 				Label:             label,
 				CoveredComponents: names,
 				Profile:           ProfileTagWebBotAuth,
-				RevocationUnknown: revocationUnknown,
 			},
 			nonce: nonce,
 			ttl:   ttl,

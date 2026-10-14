@@ -149,9 +149,6 @@ func TestEvaluateAuthoritativeLocation(t *testing.T) {
 		"pointer with userinfo": func(s *trustServer) {
 			s.set(trustURL("example.com"), 200, `{"authoritative_location":"https://user@hosted.example.net/trust.json"}`)
 		},
-		"hop target is 404 (not absence)": func(s *trustServer) {
-			s.set(trustURL("example.com"), 200, `{"authoritative_location":"`+hosted+`"}`)
-		},
 		"strict JSON": func(s *trustServer) {
 			s.set(trustURL("example.com"), 200, `{"agents":[],"agents":[]}`)
 		},
@@ -188,13 +185,24 @@ func TestEvaluateAbsenceAndNoDowngrade(t *testing.T) {
 	r.now = r.now.Add(61 * time.Second)
 	_, err = r.eval.Evaluate(ctx, "brand-7k3q.com", "")
 	require.NoError(t, err)
-	// After a 200 the record disappears: that is a failure, not absence, so
-	// no fallback to brand.json is possible.
+	// After a 200 the record disappears: a removal, not absence (so no
+	// fallback to brand.json) and not an outage. It lists and grants
+	// nothing.
 	r.server.set(trustURL("brand-7k3q.com"), http.StatusNotFound, "")
 	r.now = r.now.Add(2 * time.Minute)
-	_, err = r.eval.Evaluate(ctx, "brand-7k3q.com", "")
-	require.Error(t, err)
-	require.False(t, IsTrustRecordAbsent(err))
+	rec, err := r.eval.Evaluate(ctx, "brand-7k3q.com", "")
+	require.NoError(t, err)
+	require.True(t, rec.Removed)
+	require.Empty(t, rec.Record.Grants)
+	require.Empty(t, rec.Record.Agents)
+
+	// A hop target that is gone after the pointer was read is a removal too.
+	hosted := "https://records.host.example.net/brand/trust.json"
+	r2 := newEvalRig(t)
+	r2.server.set(trustURL("example.com"), 200, `{"authoritative_location":"`+hosted+`"}`)
+	rec, err = r2.eval.Evaluate(ctx, "example.com", "")
+	require.NoError(t, err)
+	require.True(t, rec.Removed)
 }
 
 func TestEvaluateFreshnessAndNegativeCache(t *testing.T) {
@@ -417,4 +425,120 @@ func TestBindingsAndGate(t *testing.T) {
 	require.Error(t, err, "binding requires a Web Bot Auth identity")
 	_, err = r.eval.Bind(ctx, nil, "p7", b, BindOptions{})
 	require.Error(t, err)
+}
+
+// TestBindingGateOutageRules: an outage never restores access. The last
+// record read stays authoritative; non-spend calls continue under a binding
+// only within grace (4x the polling interval past the listing record's
+// freshness); a 404/410 is a removal on every replica; caps that force an
+// "outage" cannot bypass a delisting.
+func TestBindingGateOutageRules(t *testing.T) {
+	ctx := context.Background()
+	origin := "https://buyer.example.com"
+	signer := &signing.VerifiedSigner{AgentURL: origin, Profile: signing.ProfileTagWebBotAuth}
+	listed := `{"agents":[{"url":"https://buyer.example.com/mcp","roles":["adcp:buying"]}]}`
+	delisted := `{"agents":[{"url":"https://other.example.com","roles":["adcp:buying"]}]}`
+	newGate := func(t *testing.T) (*evalRig, *BindingGate) {
+		r := newEvalRig(t)
+		b := NewOriginBindings()
+		require.NoError(t, b.Bind(ctx, origin, "p1", BindOptions{}))
+		return r, &BindingGate{Bindings: b, Records: r.eval}
+	}
+	expectUnavailable := func(t *testing.T, err error) {
+		t.Helper()
+		we := signing.AsWBAError(err)
+		require.NotNil(t, we, "%v", err)
+		require.Equal(t, signing.CodeServiceUnavailable, we.Code)
+	}
+
+	t.Run("listed, then outage: grace for non-spend, then 503", func(t *testing.T) {
+		r, gate := newGate(t)
+		r.server.set(trustURL("example.com"), 200, listed)
+		got, err := gate.AuthorizeWBA(ctx, signer, "get_media_buys")
+		require.NoError(t, err)
+		require.Equal(t, "p1", got)
+		r.server.fail(trustURL("example.com"), errors.New("connection refused"))
+		r.now = r.now.Add(2 * time.Minute) // record (1 min freshness) expired
+		got, err = gate.AuthorizeWBA(ctx, signer, "get_media_buys")
+		require.NoError(t, err)
+		require.Equal(t, "p1", got, "within 4x the polling interval past freshness")
+		_, err = gate.AuthorizeWBA(ctx, signer, "create_media_buy")
+		expectUnavailable(t, err)
+		r.now = r.now.Add(4 * time.Minute) // past freshness + 4 x 1 min
+		_, err = gate.AuthorizeWBA(ctx, signer, "get_media_buys")
+		expectUnavailable(t, err)
+		r.server.set(trustURL("example.com"), 200, listed)
+		r.now = r.now.Add(61 * time.Second) // past the negative cache
+		got, err = gate.AuthorizeWBA(ctx, signer, "get_media_buys")
+		require.NoError(t, err)
+		require.Equal(t, "p1", got, "a successful fetch restores the binding")
+	})
+
+	t.Run("stale delisting plus outage stays delisted", func(t *testing.T) {
+		r, gate := newGate(t)
+		r.server.set(trustURL("example.com"), 200, delisted)
+		got, err := gate.AuthorizeWBA(ctx, signer, "get_media_buys")
+		require.NoError(t, err)
+		require.Empty(t, got)
+		r.server.fail(trustURL("example.com"), errors.New("connection refused"))
+		r.now = r.now.Add(2 * time.Minute)
+		for _, op := range []string{"get_media_buys", "create_media_buy"} {
+			got, err = gate.AuthorizeWBA(ctx, signer, op)
+			require.NoError(t, err, op)
+			require.Empty(t, got, "an outage never restores access: %s", op)
+		}
+	})
+
+	t.Run("no history and an outage: 503, never access", func(t *testing.T) {
+		r, gate := newGate(t)
+		r.server.fail(trustURL("example.com"), errors.New("connection refused"))
+		_, err := gate.AuthorizeWBA(ctx, signer, "get_media_buys")
+		expectUnavailable(t, err)
+	})
+
+	t.Run("404 for a bound origin's operator is a removal, even without history", func(t *testing.T) {
+		_, gate := newGate(t) // the fake serves 404 for an unknown URL
+		got, err := gate.AuthorizeWBA(ctx, signer, "get_media_buys")
+		require.NoError(t, err)
+		require.Empty(t, got)
+	})
+
+	t.Run("410 after a read is a removal", func(t *testing.T) {
+		r, gate := newGate(t)
+		r.server.set(trustURL("example.com"), 200, listed)
+		_, _ = gate.AuthorizeWBA(ctx, signer, "get_media_buys")
+		r.server.set(trustURL("example.com"), http.StatusGone, "")
+		r.now = r.now.Add(2 * time.Minute)
+		got, err := gate.AuthorizeWBA(ctx, signer, "get_media_buys")
+		require.NoError(t, err)
+		require.Empty(t, got)
+	})
+
+	t.Run("a cap-forced outage cannot bypass a delisting", func(t *testing.T) {
+		server := newTrustServer()
+		now := testNow
+		eval, _ := NewTrustRecordEvaluator(TrustRecordEvaluatorOptions{Fetch: server.fetch, Clock: func() time.Time { return now }, PollingInterval: time.Minute, MaxFetchesPerHost: 1})
+		b := NewOriginBindings()
+		require.NoError(t, b.Bind(ctx, origin, "p1", BindOptions{}))
+		gate := &BindingGate{Bindings: b, Records: eval}
+		server.set(trustURL("example.com"), 200, delisted)
+		got, err := gate.AuthorizeWBA(ctx, signer, "get_media_buys")
+		require.NoError(t, err)
+		require.Empty(t, got)
+		// Hold the only fetch slot for the host so the refresh fails on the
+		// cap, then ask again after the record expires.
+		now = now.Add(2 * time.Minute)
+		release := make(chan struct{})
+		server.mu.Lock()
+		server.block[trustURL("example.com")] = release
+		server.mu.Unlock()
+		go func() { _, _ = eval.Evaluate(context.Background(), "example.com", "") }()
+		require.Eventually(t, func() bool { return server.count(trustURL("example.com")) == 2 }, time.Second, time.Millisecond)
+		short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+		defer cancel()
+		got, err = gate.AuthorizeWBA(short, signer, "get_media_buys")
+		require.NoError(t, err)
+		require.Empty(t, got, "the last record read still delists the origin")
+		close(release)
+	})
 }

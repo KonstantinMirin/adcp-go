@@ -39,6 +39,7 @@ const (
 	GrantReasonTrustRecordAbsent        = "trust_record_absent"
 	GrantReasonTrustRecordUnavailable   = "trust_record_unavailable"
 	GrantReasonAuthorizationHookFailure = "authorization_hook_failed"
+	GrantReasonSignerUnlisted           = "signer_not_listed"
 )
 
 // GrantAuthorization is the outcome of GrantEvaluator.Check.
@@ -50,6 +51,10 @@ type GrantAuthorization struct {
 	// trust record (404/410 before any 200), the only case in which
 	// brand.json authorized_operators may still decide.
 	LegacyFallbackAllowed bool
+	// Unavailable reports that a trust record on the chain could not be
+	// read (an outage, never absence). Err then returns the retryable
+	// SERVICE_UNAVAILABLE instead of grant_absent.
+	Unavailable bool
 	// ExpiresAt bounds how long an authorization may be reused: the
 	// earliest of the records' cache lifetimes and each link's valid_until.
 	// It is set on every authorization, including a SellerAuthorization or
@@ -66,7 +71,17 @@ func (a GrantAuthorization) Err() error {
 	if a.Authorized {
 		return nil
 	}
+	if a.Unavailable {
+		return trustUnavailableError()
+	}
 	return grantAbsentError()
+}
+
+func trustUnavailableError() error {
+	return adcp.NewError("SERVICE_UNAVAILABLE", adcp.ErrorOptions{
+		Message:  "Authorization status is temporarily unavailable; retry later",
+		Recovery: "transient",
+	})
 }
 
 func grantAbsentError() error {
@@ -109,8 +124,10 @@ type GrantHook func(ctx context.Context, req GrantRequest) (bool, error)
 //     disabling SellerAuthorization for them;
 //   - a 200 from the brand's trust.json makes it the only source of grants,
 //     so LegacyAuthorization (brand.json authorized_operators) runs only
-//     when the brand has never published one. A fetch failure is never
-//     absence and invokes neither hook.
+//     when the brand has never published one. A record removed after it
+//     was read (404/410) is a removal: its links are gone (grant_absent)
+//     and authorized_operators does not come back. A fetch failure is
+//     never absence: it is SERVICE_UNAVAILABLE and invokes neither hook.
 //
 // Under Web Bot Auth, the signer's operator must also currently list the
 // signer's origin with adcp:buying.
@@ -163,8 +180,9 @@ func (g *GrantEvaluator) Check(ctx context.Context, req GrantRequest) (GrantAuth
 	var signerRec *EvaluatedTrustRecord
 	if req.SigningProfile == signing.ProfileTagWebBotAuth {
 		// Web Bot Auth authority always needs a current operator role entry.
-		if signerRec, err = g.Records.Evaluate(ctx, origin, RoleBuying); err != nil {
-			return denied(GrantReasonSignerRecordUnavailable, false)
+		var deny *GrantAuthorization
+		if signerRec, deny = g.signerListing(ctx, origin); deny != nil {
+			return *deny, nil
 		}
 		if signerOp == brandOp && brandOp == accountOp {
 			return GrantAuthorization{Authorized: true, ExpiresAt: signerRec.ExpiresAt}, nil
@@ -187,14 +205,15 @@ func (g *GrantEvaluator) Check(ctx context.Context, req GrantRequest) (GrantAuth
 			}
 			return denied(GrantReasonTrustRecordAbsent, true)
 		}
-		return denied(GrantReasonTrustRecordUnavailable, false)
+		return unavailable(GrantReasonTrustRecordUnavailable)
 	}
 	if signerRec == nil {
 		// An RFC 9421 signer keeps its established onboarding path while the
 		// brand has no trust record. Once the brand serves 200, grants have
 		// one source and need the signer's operator role entry.
-		if signerRec, err = g.Records.Evaluate(ctx, origin, RoleBuying); err != nil {
-			return denied(GrantReasonSignerRecordUnavailable, false)
+		var deny *GrantAuthorization
+		if signerRec, deny = g.signerListing(ctx, origin); deny != nil {
+			return *deny, nil
 		}
 		if signerOp == brandOp && brandOp == accountOp {
 			return GrantAuthorization{Authorized: true, ExpiresAt: signerRec.ExpiresAt}, nil
@@ -227,8 +246,13 @@ func (g *GrantEvaluator) Check(ctx context.Context, req GrantRequest) (GrantAuth
 		links = [][]TrustGrant{match(brandRec.Record.Grants, signerOp, g.now())}
 	case len(first) > 0:
 		intermediary, err := g.Records.Evaluate(ctx, accountOp, "")
-		if err != nil {
-			return denied(GrantReasonTrustRecordUnavailable, false)
+		switch {
+		case err == nil:
+		case IsTrustRecordUnavailable(err):
+			return unavailable(GrantReasonTrustRecordUnavailable)
+		default:
+			// The intermediary publishes no record: no second link.
+			intermediary = &EvaluatedTrustRecord{OperatorDomain: accountOp, Record: &TrustRecord{}, ExpiresAt: g.now().Add(g.Records.PollingInterval())}
 		}
 		used = append(used, intermediary)
 		// Fetching the intermediary may outlive an earlier grant: evaluate
@@ -241,7 +265,7 @@ func (g *GrantEvaluator) Check(ctx context.Context, req GrantRequest) (GrantAuth
 	now := g.now()
 	for _, r := range used {
 		if !now.Before(r.ExpiresAt) {
-			return denied(GrantReasonTrustRecordUnavailable, false)
+			return unavailable(GrantReasonTrustRecordUnavailable)
 		}
 	}
 	covered := len(links) > 0
@@ -306,6 +330,28 @@ func (g *GrantEvaluator) Check(ctx context.Context, req GrantRequest) (GrantAuth
 // outcome, not an error of Check: it denies, with the cause in Reason.
 func denied(reason string, legacyFallbackAllowed bool) (GrantAuthorization, error) {
 	return GrantAuthorization{Reason: reason, LegacyFallbackAllowed: legacyFallbackAllowed}, nil
+}
+
+// unavailable is an outage outcome: SERVICE_UNAVAILABLE, never grant_absent.
+func unavailable(reason string) (GrantAuthorization, error) {
+	return GrantAuthorization{Reason: reason, Unavailable: true}, nil
+}
+
+// signerListing evaluates the signer's operator record: Listed returns the
+// record; Unlisted (including removed or never published) is grant_absent;
+// Unavailable is an outage.
+func (g *GrantEvaluator) signerListing(ctx context.Context, origin string) (*EvaluatedTrustRecord, *GrantAuthorization) {
+	l := g.Records.CheckListing(ctx, origin, RoleBuying)
+	switch l.Status {
+	case Listed:
+		return l.Record, nil
+	case Unlisted:
+		a, _ := denied(GrantReasonSignerUnlisted, false)
+		return nil, &a
+	default:
+		a, _ := unavailable(GrantReasonSignerRecordUnavailable)
+		return nil, &a
+	}
 }
 
 type grantError string

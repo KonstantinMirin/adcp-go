@@ -3,6 +3,7 @@ package signing
 import (
 	"container/list"
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 	"time"
@@ -42,7 +43,10 @@ type DirectoryResolverOptions struct {
 // five minutes and never past its signatures' expiry; a key absent from a
 // fresh directory is absent (no refetch on a miss); a failed discovery is
 // not evidence of removal and is retried after a 60-second cooldown, while
-// keys from an expired directory never authenticate. Concurrent lookups for
+// keys from an expired directory never authenticate. A directory that
+// cannot be fetched (network error, 5xx, 429, timeout) is a signer-side
+// outage (ErrIdentityUnavailable, SERVICE_UNAVAILABLE); one that is fetched
+// but absent (404/410), invalid, or missing the key is a signature failure. Concurrent lookups for
 // one origin share a single fetch, and one slow origin does not block
 // another.
 type DirectoryResolver struct {
@@ -52,9 +56,9 @@ type DirectoryResolver struct {
 	clock          func() time.Time
 
 	mu       sync.Mutex
-	cache    map[string]*directoryEntry // verified directories only
-	lru      *list.List                 // front = most recently used origin
-	failures map[string]time.Time       // discovery cooldowns, kept apart so failures never evict successes
+	cache    map[string]*directoryEntry  // verified directories only
+	lru      *list.List                  // front = most recently used origin
+	failures map[string]directoryFailure // discovery cooldowns, kept apart so failures never evict successes
 	pending  map[string]*directoryCall
 }
 
@@ -64,6 +68,15 @@ type directoryEntry struct {
 	keys    map[string]JWK
 	expires time.Time
 	elem    *list.Element
+}
+
+// directoryFailure is a discovery cooldown. outage distinguishes a
+// directory that could not be fetched (network error, 5xx, 429, timeout:
+// SERVICE_UNAVAILABLE) from one that was fetched and is absent or invalid
+// (a signature failure).
+type directoryFailure struct {
+	until  time.Time
+	outage bool
 }
 
 type directoryCall struct {
@@ -87,7 +100,7 @@ func NewDirectoryResolver(opts DirectoryResolverOptions) *DirectoryResolver {
 		clock:          opts.Clock,
 		cache:          map[string]*directoryEntry{},
 		lru:            list.New(),
-		failures:       map[string]time.Time{},
+		failures:       map[string]directoryFailure{},
 		pending:        map[string]*directoryCall{},
 	}
 	if d.maxOrigins <= 0 {
@@ -130,8 +143,11 @@ func (d *DirectoryResolver) ResolveWBAKey(ctx context.Context, origin, keyID str
 		}
 		return &jwk, nil
 	}
-	if until, ok := d.failures[origin]; ok && now.Before(until) {
+	if f, ok := d.failures[origin]; ok && now.Before(f.until) {
 		d.mu.Unlock()
+		if f.outage {
+			return nil, identityUnavailable("key directory unavailable (cooling down)", nil)
+		}
 		return nil, wbaFail(http.StatusForbidden, "", "key directory discovery is cooling down")
 	}
 	call := d.pending[origin]
@@ -178,9 +194,12 @@ func (d *DirectoryResolver) refresh(ctx context.Context, origin string, call *di
 	ctx, cancel := context.WithTimeout(ctx, discoveryTimeout)
 	defer cancel()
 	resp, err := d.fetch(ctx, origin+DirectoryPath)
+	outage := err != nil || resp == nil || resp.Status >= 500 || resp.Status == http.StatusTooManyRequests
 	var keys map[string]JWK
-	if err == nil {
+	if !outage {
 		keys, err = VerifyDirectoryResponse(origin, resp, d.clock())
+	} else if err == nil {
+		err = errors.New("key directory fetch failed")
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -190,10 +209,10 @@ func (d *DirectoryResolver) refresh(ctx context.Context, origin string, call *di
 		// A failure never proves removal and never evicts a verified
 		// directory; the previous signed snapshot stays as evidence, and
 		// expired keys never authenticate.
-		d.failures[origin] = now.Add(discoveryNegativeTTL)
+		d.failures[origin] = directoryFailure{until: now.Add(discoveryNegativeTTL), outage: outage}
 		if len(d.failures) > d.maxOrigins {
-			for o, until := range d.failures {
-				if !now.Before(until) {
+			for o, f := range d.failures {
+				if !now.Before(f.until) {
 					delete(d.failures, o)
 				}
 			}
@@ -206,7 +225,15 @@ func (d *DirectoryResolver) refresh(ctx context.Context, origin string, call *di
 				}
 			}
 		}
-		call.err = &WBAError{Status: http.StatusForbidden, Reason: "key directory discovery failed", Wrapped: err}
+		if outage {
+			// The signer's directory could not be fetched: identity cannot
+			// be confirmed, which is not the signer's fault (503).
+			call.err = identityUnavailable("key directory could not be fetched", err)
+			return
+		}
+		// Fetched, but absent (404/410), invalid, or without valid
+		// signatures: a signature failure (403 with Accept-Signature).
+		call.err = &WBAError{Status: http.StatusForbidden, Reason: "key directory absent or invalid", Wrapped: err}
 		return
 	}
 	delete(d.failures, origin)

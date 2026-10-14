@@ -273,11 +273,26 @@ func TestWBARejections(t *testing.T) {
 			jwk, _ := PublicDirectoryKey(rig.key)
 			rig.revs.set(t, revocationPayload{Updated: rfc3339(wbaTestNow.Add(-time.Minute)), NextUpdate: rfc3339(wbaTestNow.Add(10 * time.Minute)), RevokedKids: []string{jwk.Kid}})
 		}, http.StatusForbidden, true},
-		{"revocation list unavailable fails closed (an outage, not a signature failure)", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
+		{"revocation list unavailable: signer-side outage, not a signature failure", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
 			rig.revs.fetchErr = errors.New("connection refused")
-		}, http.StatusServiceUnavailable, true},
-		{"directory discovery fails", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
+		}, http.StatusServiceUnavailable, false},
+		{"directory cannot be fetched: signer-side outage", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
 			rig.dirs.fail(rig.origin, errors.New("timeout"))
+		}, http.StatusServiceUnavailable, false},
+		{"directory 5xx: signer-side outage", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
+			rig.dirs.mu.Lock()
+			rig.dirs.dirs[rig.origin] = &DirectoryResponse{Status: http.StatusBadGateway, Header: http.Header{}}
+			rig.dirs.mu.Unlock()
+		}, http.StatusServiceUnavailable, false},
+		{"directory absent (404): signature failure", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
+			rig.dirs.mu.Lock()
+			delete(rig.dirs.dirs, rig.origin)
+			rig.dirs.mu.Unlock()
+		}, http.StatusForbidden, false},
+		{"directory absent (410): signature failure", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
+			rig.dirs.mu.Lock()
+			rig.dirs.dirs[rig.origin] = &DirectoryResponse{Status: http.StatusGone, Header: http.Header{}}
+			rig.dirs.mu.Unlock()
 		}, http.StatusForbidden, false},
 	}
 	for _, tc := range cases {
@@ -290,6 +305,7 @@ func TestWBARejections(t *testing.T) {
 			_, err := VerifyWebBotAuthRequest(r, rig.opts())
 			we := requireWBAError(t, err, tc.status)
 			require.Equal(t, tc.authz, we.Authorization)
+			require.Equal(t, tc.status == http.StatusServiceUnavailable, IsIdentityUnavailable(err), "outages are distinguishable")
 			if tc.status == http.StatusForbidden && !tc.authz {
 				require.NotEmpty(t, we.ResponseHeader().Get("Accept-Signature"))
 			} else {

@@ -94,6 +94,10 @@ type EvaluatedTrustRecord struct {
 	SourceURL      string
 	Record         *TrustRecord
 	ExpiresAt      time.Time
+	// Removed reports a record that was read before and is now gone (404
+	// or 410): a removal, not an outage. Record is then empty, so it lists
+	// no agent and makes no grant, and no legacy fallback applies.
+	Removed bool
 }
 
 // Agent returns the record's single agents[] entry for origin with role.
@@ -144,6 +148,8 @@ type TrustRecordEvaluator struct {
 	pending  map[string]*trustCall
 	seen200  map[string]*list.Element // operators that have served a 200, LRU-bounded
 	seenLRU  *list.List
+	lastGood map[string]*list.Element // last record read per operator (*EvaluatedTrustRecord), LRU-bounded
+	goodLRU  *list.List
 
 	responses       map[string]cachedResponse
 	responsePending map[string]*responseCall
@@ -199,6 +205,8 @@ func NewTrustRecordEvaluator(opts TrustRecordEvaluatorOptions) (*TrustRecordEval
 		pending:         map[string]*trustCall{},
 		seen200:         map[string]*list.Element{},
 		seenLRU:         list.New(),
+		lastGood:        map[string]*list.Element{},
+		goodLRU:         list.New(),
 		responses:       map[string]cachedResponse{},
 		responsePending: map[string]*responseCall{},
 		hostsInflight:   map[string]int{},
@@ -335,6 +343,7 @@ func (e *TrustRecordEvaluator) refresh(ctx context.Context, domain, recordURL st
 		e.lru.Remove(back)
 		delete(e.cache, back.Value.(string))
 	}
+	e.storeLastGood(domain, rec)
 	call.rec = rec
 }
 
@@ -380,8 +389,16 @@ func (e *TrustRecordEvaluator) resolve(ctx context.Context, domain, recordURL st
 		e.mu.Lock()
 		_, seen := e.seen200[domain]
 		e.mu.Unlock()
-		if (status == http.StatusNotFound || status == http.StatusGone) && hop == 0 && !seen {
-			return nil, &TrustRecordError{Absent: true, Reason: "no trust record is published"}
+		if status == http.StatusNotFound || status == http.StatusGone {
+			if seen {
+				// A record read before and now gone is a removal: every
+				// origin it listed is delisted, and brand.json does not
+				// come back.
+				return &EvaluatedTrustRecord{OperatorDomain: domain, SourceURL: source, Record: &TrustRecord{}, ExpiresAt: expires, Removed: true}, nil
+			}
+			if hop == 0 {
+				return nil, &TrustRecordError{Absent: true, Reason: "no trust record is published"}
+			}
 		}
 		if status != http.StatusOK || len(res.resp.Body) > TrustRecordMaxBytes {
 			return nil, trustErr(fmt.Sprintf("trust record unavailable (HTTP %d)", status), nil)
@@ -422,6 +439,91 @@ func (e *TrustRecordEvaluator) markSeen200(domain string) {
 		e.seenLRU.Remove(back)
 		delete(e.seen200, back.Value.(string))
 	}
+}
+
+// storeLastGood records rec as the last record read for domain. Called
+// with mu held.
+func (e *TrustRecordEvaluator) storeLastGood(domain string, rec *EvaluatedTrustRecord) {
+	if el, ok := e.lastGood[domain]; ok {
+		el.Value = rec
+		e.goodLRU.MoveToFront(el)
+		return
+	}
+	e.lastGood[domain] = e.goodLRU.PushFront(rec)
+	for e.goodLRU.Len() > seen200Limit {
+		back := e.goodLRU.Back()
+		e.goodLRU.Remove(back)
+		delete(e.lastGood, back.Value.(*EvaluatedTrustRecord).OperatorDomain)
+	}
+}
+
+// ListingStatus is the outcome of CheckListing.
+type ListingStatus int
+
+const (
+	// Listed: the operator's record lists the origin with the role.
+	Listed ListingStatus = iota
+	// Unlisted: the last record read does not list it (including a removed
+	// record, no published record, or no registrable domain).
+	Unlisted
+	// Unavailable: the record cannot be read now, and the last record read
+	// listed the origin (or there is none).
+	Unavailable
+)
+
+// Listing is the outcome of CheckListing.
+type Listing struct {
+	Status ListingStatus
+	// Record is the evaluated record when Listed.
+	Record *EvaluatedTrustRecord
+	// WithinGrace, for Unavailable, reports that the last record that
+	// listed the origin is within 4x the polling interval past its
+	// freshness, so non-spend calls may continue under a binding.
+	WithinGrace bool
+	// Err is the evaluation error, for logs.
+	Err error
+}
+
+// CheckListing evaluates whether the origin's operator lists it with role,
+// applying the outage rules: a fetch failure is not absence, and an outage
+// never restores access.
+//   - The last record read stays authoritative: if it did not list the
+//     origin, the origin stays Unlisted even when a refresh fails, whatever
+//     the cause (including a rate or concurrency cap).
+//   - A 404 or 410 is Unlisted: after a record has been read it is a
+//     removal, and without that history (another replica, a restart) a
+//     bound origin's operator was once authoritative anyway, so the result
+//     is the same on every replica.
+//   - Otherwise an unreadable record is Unavailable, WithinGrace while the
+//     last record that listed the origin is no more than 4x the polling
+//     interval past its freshness.
+func (e *TrustRecordEvaluator) CheckListing(ctx context.Context, origin, role string) Listing {
+	rec, err := e.Evaluate(ctx, origin, role)
+	if err == nil {
+		return Listing{Status: Listed, Record: rec}
+	}
+	if !IsTrustRecordUnavailable(err) {
+		// Not listed, absent or removed, or no registrable domain.
+		return Listing{Status: Unlisted, Err: err}
+	}
+	domain, ok := psl.RegistrableDomain(origin)
+	if !ok {
+		return Listing{Status: Unlisted, Err: err}
+	}
+	e.mu.Lock()
+	var last *EvaluatedTrustRecord
+	if el, ok := e.lastGood[domain]; ok {
+		last = el.Value.(*EvaluatedTrustRecord)
+	}
+	e.mu.Unlock()
+	if last == nil {
+		return Listing{Status: Unavailable, Err: err}
+	}
+	if _, merr := last.Agent(origin, role); merr != nil {
+		return Listing{Status: Unlisted, Err: err}
+	}
+	grace := 4 * e.interval
+	return Listing{Status: Unavailable, WithinGrace: e.clock().Before(last.ExpiresAt.Add(grace)), Err: err}
 }
 
 // fetchResponse shares transport bytes per URL while each owner validates

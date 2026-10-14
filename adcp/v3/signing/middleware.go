@@ -217,11 +217,6 @@ type WebBotAuthOptions struct {
 	// Clock supplies the verifier's wall clock. Defaults to time.Now.
 	Clock func() time.Time
 
-	// SpendCommitting classifies operations for fail-closed outage handling
-	// (a revocation list or trust record that cannot be read). Defaults to
-	// IsSpendCommittingOperation.
-	SpendCommitting func(op string) bool
-
 	// Authorities lists the host[:port] values this endpoint serves; see
 	// WBAVerifyOptions.Authorities. Recommended.
 	Authorities []string
@@ -435,14 +430,13 @@ func Middleware(opts MiddlewareOptions) func(http.Handler) http.Handler {
 func serveWebBotAuth(w http.ResponseWriter, r *http.Request, next http.Handler, wba *WebBotAuthOptions,
 	unboundFor map[string]struct{}, replay ReplayStore, scheme, opName string, opts MiddlewareOptions, logger *slog.Logger) {
 	signers, err := VerifyWebBotAuthRequest(r, WBAVerifyOptions{
-		Keys:                    wba.Keys,
-		Revocation:              wba.Revocation,
-		RevocationOutageAllowed: true, // fail closed for spend below
-		Replay:                  replay,
-		Scheme:                  scheme,
-		MaxBodyBytes:            opts.MaxBodyBytes,
-		Clock:                   wba.Clock,
-		Authorities:             wba.Authorities,
+		Keys:         wba.Keys,
+		Revocation:   wba.Revocation,
+		Replay:       replay,
+		Scheme:       scheme,
+		MaxBodyBytes: opts.MaxBodyBytes,
+		Clock:        wba.Clock,
+		Authorities:  wba.Authorities,
 	})
 	if err != nil {
 		rejectWBA(w, r, err, opName, wba, logger)
@@ -456,16 +450,6 @@ func serveWebBotAuth(w http.ResponseWriter, r *http.Request, next http.Handler, 
 	op := opName
 	if op == "" {
 		op = jsonRPCOperation(r, opts.MaxBodyBytes)
-	}
-	spend := IsSpendCommittingOperation(op)
-	if wba.SpendCommitting != nil {
-		spend = wba.SpendCommitting(op)
-	}
-	for _, s := range signers {
-		if s.RevocationUnknown && spend {
-			rejectWBA(w, r, NewAuthorizationError(CodeServiceUnavailable, "origin revocation status unavailable on a spend-committing call", nil), op, wba, logger)
-			return
-		}
 	}
 	principal := ""
 	if wba.Authorizer != nil {
@@ -539,16 +523,16 @@ func rejectWBA(w http.ResponseWriter, r *http.Request, err error, op string, wba
 
 // writeWBAReject writes the profile's failure response, split by layer. A
 // signature failure is its WBA status (400, 403 with Accept-Signature, 429)
-// with a generic body. An authorization outcome (identity established) is
-// the standard AdCP error envelope with its code and no Accept-Signature:
-// PERMISSION_DENIED as 403, SERVICE_UNAVAILABLE as 503 with Retry-After.
-// Neither body carries signature-specific detail.
+// with a generic body. An authorization outcome (identity established), or
+// a signer-side outage, is the standard AdCP error envelope with its code
+// and no Accept-Signature: PERMISSION_DENIED as 403, SERVICE_UNAVAILABLE as
+// 503 with Retry-After. Neither body carries signature-specific detail.
 func writeWBAReject(w http.ResponseWriter, r *http.Request, e *WBAError, onReject func(http.ResponseWriter, *http.Request, *WBAError)) {
 	if onReject != nil {
 		onReject(w, r, e)
 		return
 	}
-	if e.Authorization {
+	if e.Authorization || e.Code == CodeServiceUnavailable {
 		code, recovery, message := e.Code, "correctable", "Agent is not authorized for this request"
 		if code == "" {
 			code = CodePermissionDenied

@@ -198,7 +198,7 @@ func TestOriginRevocationCheckerLifecycle(t *testing.T) {
 	require.True(t, revoked)
 	now = now.Add(11 * time.Minute) // past next_update + 2 x 5 min
 	_, err = checker.RevokedWBAKey(ctx, rig.origin, jwk.Kid)
-	requireWBAStatus(t, err, http.StatusForbidden)
+	requireWBAStatus(t, err, http.StatusServiceUnavailable)
 	require.Equal(t, `"v1"`, rig.revs.lastINM, "refreshes are conditional")
 }
 
@@ -219,7 +219,7 @@ func TestOriginRevocationCheckerNotModifiedDoesNotExtend(t *testing.T) {
 		now = now.Add(time.Minute + time.Second)
 		_, err = checker.RevokedWBAKey(context.Background(), rig.origin, "k")
 	}
-	requireWBAStatus(t, err, http.StatusForbidden)
+	requireWBAStatus(t, err, http.StatusServiceUnavailable)
 }
 
 func TestOriginRevocationCheckerAdmission(t *testing.T) {
@@ -256,7 +256,7 @@ func TestOriginRevocationCheckerAdmission(t *testing.T) {
 	// admission slot.
 	for range 3 {
 		_, err := checker.RevokedWBAKey(ctx, "https://missing.example.net", "k")
-		requireWBAStatus(t, err, http.StatusForbidden)
+		requireWBAStatus(t, err, http.StatusServiceUnavailable)
 	}
 	require.Zero(t, admitted())
 
@@ -295,7 +295,7 @@ func TestOriginRevocationCheckerAdmission(t *testing.T) {
 	require.True(t, revoked, "an older list cannot un-revoke the key")
 	now = now.Add(61 * time.Minute) // past next_update + 2 x interval
 	_, err = checker.RevokedWBAKey(ctx, "https://a.example.com", revokedKid)
-	requireWBAStatus(t, err, http.StatusForbidden)
+	requireWBAStatus(t, err, http.StatusServiceUnavailable)
 
 	// A list over the retained-entry bound fails that origin closed.
 	many := make([]string, maxRetainedRevocations+1)
@@ -304,7 +304,7 @@ func TestOriginRevocationCheckerAdmission(t *testing.T) {
 	}
 	publish("https://g.example.info", many...)
 	_, err = checker.RevokedWBAKey(ctx, "https://g.example.info", "k")
-	requireWBAStatus(t, err, http.StatusForbidden)
+	requireWBAStatus(t, err, http.StatusServiceUnavailable)
 
 	// A list signed by a key outside the origin's directory is refused.
 	dirs2 := newFakeDirectories()
@@ -313,7 +313,7 @@ func TestOriginRevocationCheckerAdmission(t *testing.T) {
 	s.set(t, revocationPayload{Updated: rfc3339(now.Add(-time.Minute)), NextUpdate: rfc3339(now.Add(30 * time.Minute))})
 	c2, _ := NewOriginRevocationChecker(OriginRevocationCheckerOptions{Keys: NewDirectoryResolver(DirectoryResolverOptions{Fetch: dirs2.fetch, Clock: clock}), Fetch: s.fetch, Clock: clock})
 	_, err = c2.RevokedWBAKey(ctx, "https://x.example.com", "k")
-	requireWBAStatus(t, err, http.StatusForbidden)
+	requireWBAStatus(t, err, http.StatusServiceUnavailable)
 
 	_, err = NewOriginRevocationChecker(OriginRevocationCheckerOptions{})
 	require.Error(t, err)

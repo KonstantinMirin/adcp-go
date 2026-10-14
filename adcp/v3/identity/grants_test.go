@@ -191,7 +191,7 @@ func TestGrantEvaluation(t *testing.T) {
 			name:    "Web Bot Auth: the signer's operator must list the origin with adcp:buying",
 			records: map[string]string{"agency-7k3q.com": `{"agents":[{"url":"https://buy.agency-7k3q.com/mcp","roles":["adcp:sales"]}]}`},
 			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "agency-7k3q.com", AccountOperator: "agency-7k3q.com"},
-			reason:  GrantReasonSignerRecordUnavailable,
+			reason:  GrantReasonSignerUnlisted,
 		},
 		{
 			name:    "a brand trust record that cannot be fetched is not absence",
@@ -339,7 +339,7 @@ func TestGrantRFC9421Signer(t *testing.T) {
 	r = grantRig(t, map[string]string{"brand-7k3q.com": `{"grants":[{"grantee":"agency-7k3q.com","scopes":["adcp:media_buying"]}]}`})
 	res, _ = (&GrantEvaluator{Records: r.eval, LegacyAuthorization: legacy}).Check(ctx, req)
 	require.False(t, res.Authorized)
-	require.Equal(t, GrantReasonSignerRecordUnavailable, res.Reason)
+	require.Equal(t, GrantReasonSignerUnlisted, res.Reason, "the agency publishes no record, so it lists no agent")
 
 	// A Web Bot Auth signer never reaches the legacy path without its own
 	// operator record.
@@ -605,4 +605,67 @@ func TestGrantGate(t *testing.T) {
 
 	_, err := (&GrantEvaluator{}).Check(ctx, GrantRequest{})
 	require.Error(t, err, "a GrantEvaluator without Records")
+}
+
+// TestGrantOutageVersusRemoval: a grantor record that cannot be fetched is
+// SERVICE_UNAVAILABLE, never grant_absent; a record removed after it was
+// read is a removal: its link is gone (grant_absent) and the brand.json
+// fallback does not come back.
+func TestGrantOutageVersusRemoval(t *testing.T) {
+	ctx := context.Background()
+	req := GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"}
+	legacyCalled := false
+	legacy := func(context.Context, GrantRequest) (bool, error) { legacyCalled = true; return true, nil }
+
+	r := grantRig(t, with(baseRecords, map[string]string{"brand-7k3q.com": `{"grants":[{"grantee":"agency-7k3q.com","scopes":["adcp:media_buying"]}]}`}))
+	g := &GrantEvaluator{Records: r.eval, LegacyAuthorization: legacy}
+	res, _ := g.Check(ctx, req)
+	require.True(t, res.Authorized)
+
+	// Brand record outage.
+	r.server.fail(trustURL("brand-7k3q.com"), errors.New("connection refused"))
+	r.now = r.now.Add(2 * time.Minute)
+	res, _ = g.Check(ctx, req)
+	require.False(t, res.Authorized)
+	require.True(t, res.Unavailable)
+	code, _ := permissionDetails(t, res.Err())
+	require.Equal(t, "SERVICE_UNAVAILABLE", code)
+
+	// Brand record removed after it was read.
+	r.server.set(trustURL("brand-7k3q.com"), http.StatusGone, "")
+	r.now = r.now.Add(2 * time.Minute)
+	res, _ = g.Check(ctx, req)
+	require.False(t, res.Authorized)
+	require.False(t, res.Unavailable)
+	require.Equal(t, GrantReasonAbsent, res.Reason)
+	require.False(t, legacyCalled, "authorized_operators does not come back after a removal")
+	_, details := permissionDetails(t, res.Err())
+	require.Equal(t, "grant_absent", details["reason"])
+
+	// Intermediary outage on a two-link chain.
+	r2 := grantRig(t, with(baseRecords, map[string]string{
+		"brand-7k3q.com":  `{"grants":[{"grantee":"agency-7k3q.com","scopes":["adcp:media_buying"]}]}`,
+		"agency-7k3q.com": `{"agents":[{"url":"https://buy.agency-7k3q.com/mcp","roles":["adcp:buying"]}],"grants":[{"grantee":"platform-7k3q.com","scopes":["adcp:media_buying"]}]}`,
+	}))
+	g2 := &GrantEvaluator{Records: r2.eval}
+	chain := GrantRequest{AgentOrigin: platformAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"}
+	res, _ = g2.Check(ctx, chain)
+	require.True(t, res.Authorized)
+	r2.server.fail(trustURL("agency-7k3q.com"), errors.New("timeout"))
+	r2.now = r2.now.Add(2 * time.Minute)
+	res, _ = g2.Check(ctx, chain)
+	require.True(t, res.Unavailable)
+	// The intermediary removes its record: the second link is gone.
+	r2.server.set(trustURL("agency-7k3q.com"), http.StatusNotFound, "")
+	r2.now = r2.now.Add(2 * time.Minute)
+	res, _ = g2.Check(ctx, chain)
+	require.False(t, res.Authorized)
+	require.False(t, res.Unavailable)
+	require.Equal(t, GrantReasonAbsent, res.Reason)
+
+	// The signer's own operator record is unreachable: an outage.
+	r3 := grantRig(t, with(baseRecords, map[string]string{"brand-7k3q.com": `{"grants":[]}`}))
+	r3.server.fail(trustURL("agency-7k3q.com"), errors.New("timeout"))
+	res, _ = (&GrantEvaluator{Records: r3.eval}).Check(ctx, req)
+	require.True(t, res.Unavailable)
 }

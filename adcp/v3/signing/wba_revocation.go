@@ -496,10 +496,11 @@ func (c *OriginRevocationChecker) RevokedWBAKey(ctx context.Context, origin, key
 	}
 	l, err := state.fresh(ctx, c)
 	if err != nil {
-		if we := AsWBAError(err); we != nil {
+		if we := AsWBAError(err); we != nil && (we.outage || we.Status == http.StatusTooManyRequests) {
 			return false, we
 		}
-		return false, &WBAError{Status: http.StatusForbidden, Reason: "origin revocation status unavailable", Wrapped: err}
+		// Unreadable or stale past grace: identity cannot be confirmed.
+		return false, identityUnavailable("origin revocation list unavailable or stale past grace", err)
 	}
 	return l.IsRevoked(keyID), nil
 }
@@ -570,7 +571,7 @@ func (c *OriginRevocationChecker) admit(ctx context.Context, origin string) (*or
 		now := c.clock()
 		if until, ok := c.failures[origin]; ok && now.Before(until) {
 			c.mu.Unlock()
-			return nil, wbaFail(http.StatusForbidden, "", "origin revocation discovery is cooling down")
+			return nil, identityUnavailable("origin revocation discovery is cooling down", nil)
 		}
 		call := c.pending[origin]
 		if call == nil {
@@ -629,7 +630,7 @@ func (c *OriginRevocationChecker) discover(ctx context.Context, origin string, c
 		if len(c.failures) > c.maxOrigins {
 			c.pruneFailures()
 		}
-		call.err = &WBAError{Status: http.StatusForbidden, Reason: "origin revocation status unavailable", Wrapped: err}
+		call.err = identityUnavailable("origin revocation list unavailable", err)
 		return
 	}
 	delete(c.failures, origin)

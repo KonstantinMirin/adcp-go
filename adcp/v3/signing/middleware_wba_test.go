@@ -153,11 +153,13 @@ func requireAdCPEnvelope(t *testing.T, rec *httptest.ResponseRecorder, code stri
 	}
 }
 
-// TestMiddlewareRevocationOutage: a revocation list that cannot be read is
-// an outage, not a signature failure. Spend-committing calls fail with
-// SERVICE_UNAVAILABLE; other calls proceed. A revoked key is
-// PERMISSION_DENIED. None of these gets Accept-Signature.
-func TestMiddlewareRevocationOutage(t *testing.T) {
+// TestMiddlewareSignerSideOutage: when identity cannot be confirmed (the
+// revocation list cannot be read, or the key directory cannot be fetched),
+// every signed request gets SERVICE_UNAVAILABLE and nothing is served
+// under the signature: no anonymous fallback, no Accept-Signature. A
+// revoked key is PERMISSION_DENIED; an absent directory is a signature
+// failure.
+func TestMiddlewareSignerSideOutage(t *testing.T) {
 	serve := func(t *testing.T, rig *wbaRig, body string) (*httptest.ResponseRecorder, *captured) {
 		var c captured
 		auth := &fakeAuthorizer{principals: map[string]string{rig.origin: "p"}}
@@ -167,13 +169,28 @@ func TestMiddlewareRevocationOutage(t *testing.T) {
 		h.ServeHTTP(rec, rig.signedRequest(t, body))
 		return rec, &c
 	}
+	for _, op := range []string{"create_media_buy", "get_media_buys", "get_adcp_capabilities"} {
+		rig := newWBARig(t)
+		rig.revs.fetchErr = errors.New("connection refused")
+		rec, c := serve(t, rig, mcpCall(op))
+		requireAdCPEnvelope(t, rec, CodeServiceUnavailable)
+		require.False(t, c.called, "nothing is served under an unconfirmed signature: %s", op)
+	}
+
 	rig := newWBARig(t)
-	rig.revs.fetchErr = errors.New("connection refused")
-	rec, _ := serve(t, rig, mcpCall("create_media_buy"))
+	rig.dirs.fail(rig.origin, errors.New("i/o timeout"))
+	rec, c := serve(t, rig, mcpCall("get_adcp_capabilities"))
 	requireAdCPEnvelope(t, rec, CodeServiceUnavailable)
-	rec, c := serve(t, rig, mcpCall("get_media_buys"))
-	require.Equal(t, http.StatusOK, rec.Code)
-	require.True(t, c.signer.RevocationUnknown)
+	require.False(t, c.called)
+
+	rig = newWBARig(t)
+	rig.dirs.mu.Lock()
+	delete(rig.dirs.dirs, rig.origin) // the fake serves 404
+	rig.dirs.mu.Unlock()
+	rec, c = serve(t, rig, mcpCall("get_adcp_capabilities"))
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	require.NotEmpty(t, rec.Header().Get("Accept-Signature"), "an absent directory is a signature failure")
+	require.False(t, c.called)
 
 	rig = newWBARig(t)
 	jwk, _ := PublicDirectoryKey(rig.key)
