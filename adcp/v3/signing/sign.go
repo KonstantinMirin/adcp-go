@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"fmt"
 	"io"
@@ -101,6 +102,13 @@ func NewSigner(opts SignerOptions) (*Signer, error) {
 			return nil, fmt.Errorf("signing: unsupported ECDSA curve %q (only P-256)", ec.Curve.Params().Name)
 		}
 		alg = AlgES256
+	case *rsa.PrivateKey:
+		// RSA (rsa-pss-sha512) is a Web Bot Auth key type only; the AdCP
+		// RFC 9421 profile does not admit it.
+		if opts.AgentOrigin == "" {
+			return nil, fmt.Errorf("signing: RSA keys sign only under Web Bot Auth (set AgentOrigin)")
+		}
+		alg = AlgRSAPSSSHA512
 	default:
 		return nil, fmt.Errorf("signing: unsupported private key type %T", opts.PrivateKey)
 	}

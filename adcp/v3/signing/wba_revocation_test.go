@@ -161,10 +161,10 @@ func TestOriginRevocationCheckerLifecycle(t *testing.T) {
 	rig.revs.set(t, revocationPayload{Updated: rfc3339(updated), NextUpdate: rfc3339(updated.Add(5 * time.Minute)), RevokedKids: []string{oldKid, "operator-chosen-kid"},
 		Details: map[string]map[string]string{oldKid: {"reason": "keyCompromise", "invalidity_date": "2026-01-01T00:00:00Z"}}})
 
-	revoked, err := checker.RevokedWBAKey(ctx, rig.origin, jwk.Kid)
+	revoked, err := revokedWBAKey(checker, ctx, rig.origin, jwk.Kid)
 	require.NoError(t, err)
 	require.False(t, revoked)
-	revoked, err = checker.RevokedWBAKey(ctx, rig.origin, oldKid)
+	revoked, err = revokedWBAKey(checker, ctx, rig.origin, oldKid)
 	require.NoError(t, err)
 	require.True(t, revoked)
 	require.Equal(t, 1, rig.revs.fetches, "served from cache before next_update")
@@ -179,10 +179,10 @@ func TestOriginRevocationCheckerLifecycle(t *testing.T) {
 	updated = now.Add(-10 * time.Second)
 	rig.revs.set(t, revocationPayload{Updated: rfc3339(updated), NextUpdate: rfc3339(updated.Add(5 * time.Minute)), RevokedKids: []string{jwk.Kid},
 		Details: map[string]map[string]string{jwk.Kid: {"reason": "superseded"}}})
-	revoked, err = checker.RevokedWBAKey(ctx, rig.origin, oldKid)
+	revoked, err = revokedWBAKey(checker, ctx, rig.origin, oldKid)
 	require.NoError(t, err)
 	require.True(t, revoked, "an origin cannot un-revoke a key")
-	revoked, _ = checker.RevokedWBAKey(ctx, rig.origin, jwk.Kid)
+	revoked, _ = revokedWBAKey(checker, ctx, rig.origin, jwk.Kid)
 	require.True(t, revoked)
 	d, _ = checker.Details(rig.origin, oldKid)
 	require.Equal(t, RevocationReasonKeyCompromise, d.Reason)
@@ -193,12 +193,15 @@ func TestOriginRevocationCheckerLifecycle(t *testing.T) {
 	// grace the cached list still serves, past grace checks fail closed.
 	now = now.Add(5 * time.Minute)
 	rig.revs.set(t, revocationPayload{Updated: rfc3339(updated.Add(-time.Hour)), NextUpdate: rfc3339(now.Add(time.Hour))})
-	revoked, err = checker.RevokedWBAKey(ctx, rig.origin, jwk.Kid)
+	revoked, err = revokedWBAKey(checker, ctx, rig.origin, jwk.Kid)
 	require.NoError(t, err)
 	require.True(t, revoked)
 	now = now.Add(11 * time.Minute) // past next_update + 2 x 5 min
-	_, err = checker.RevokedWBAKey(ctx, rig.origin, jwk.Kid)
-	requireWBAStatus(t, err, http.StatusServiceUnavailable)
+	_, err = revokedWBAKey(checker, ctx, rig.origin, strings.Repeat("n", 43))
+	requireRevocationState(t, err, RevocationStale)
+	revoked, err = revokedWBAKey(checker, ctx, rig.origin, jwk.Kid)
+	require.NoError(t, err)
+	require.True(t, revoked, "past grace, what was revoked stays revoked")
 	require.Equal(t, `"v1"`, rig.revs.lastINM, "refreshes are conditional")
 }
 
@@ -210,16 +213,16 @@ func TestOriginRevocationCheckerNotModifiedDoesNotExtend(t *testing.T) {
 	checker, _ := NewOriginRevocationChecker(OriginRevocationCheckerOptions{Keys: rig.resolver, Fetch: rig.revs.fetch, Clock: clock})
 	updated := now.Add(-time.Minute)
 	rig.revs.set(t, revocationPayload{Updated: rfc3339(updated), NextUpdate: rfc3339(updated.Add(2 * time.Minute))})
-	_, err := checker.RevokedWBAKey(context.Background(), rig.origin, "k")
+	_, err := revokedWBAKey(checker, context.Background(), rig.origin, "k")
 	require.NoError(t, err)
 	rig.revs.mu.Lock()
 	rig.revs.status = http.StatusNotModified
 	rig.revs.mu.Unlock()
 	for range 6 { // 304 every minute; never extends signed freshness
 		now = now.Add(time.Minute + time.Second)
-		_, err = checker.RevokedWBAKey(context.Background(), rig.origin, "k")
+		_, err = revokedWBAKey(checker, context.Background(), rig.origin, "k")
 	}
-	requireWBAStatus(t, err, http.StatusServiceUnavailable)
+	requireRevocationState(t, err, RevocationStale)
 }
 
 func TestOriginRevocationCheckerAdmission(t *testing.T) {
@@ -255,8 +258,8 @@ func TestOriginRevocationCheckerAdmission(t *testing.T) {
 	// A failed first discovery (no list published) costs a cooldown, not an
 	// admission slot.
 	for range 3 {
-		_, err := checker.RevokedWBAKey(ctx, "https://missing.example.net", "k")
-		requireWBAStatus(t, err, http.StatusServiceUnavailable)
+		_, err := revokedWBAKey(checker, ctx, "https://missing.example.net", "k")
+		requireRevocationState(t, err, RevocationNoList)
 	}
 	require.Zero(t, admitted())
 
@@ -264,16 +267,16 @@ func TestOriginRevocationCheckerAdmission(t *testing.T) {
 	for _, o := range []string{"https://b.example.com", "https://c.example.com", "https://d.example.org", "https://e.example.org", "https://f.example.edu"} {
 		publish(o)
 	}
-	revoked, err := checker.RevokedWBAKey(ctx, "https://a.example.com", revokedKid)
+	revoked, err := revokedWBAKey(checker, ctx, "https://a.example.com", revokedKid)
 	require.NoError(t, err)
 	require.True(t, revoked)
 	for _, o := range []string{"https://b.example.com", "https://c.example.com"} {
-		_, err := checker.RevokedWBAKey(ctx, o, "k")
+		_, err := revokedWBAKey(checker, ctx, o, "k")
 		require.NoError(t, err, "an operator over its quota evicts its own oldest origin, never locks out")
 	}
 	require.Equal(t, 2, admitted())
 	for _, o := range []string{"https://d.example.org", "https://e.example.org", "https://f.example.edu"} {
-		_, err := checker.RevokedWBAKey(ctx, o, "k")
+		_, err := revokedWBAKey(checker, ctx, o, "k")
 		require.NoError(t, err, "a full checker evicts its least recently used origin")
 	}
 	require.Equal(t, 3, admitted())
@@ -283,19 +286,22 @@ func TestOriginRevocationCheckerAdmission(t *testing.T) {
 	mu.Lock()
 	servers["https://a.example.com"].set(t, revocationPayload{Updated: rfc3339(now.Add(-time.Hour)), NextUpdate: rfc3339(now.Add(time.Hour))})
 	mu.Unlock()
-	revoked, err = checker.RevokedWBAKey(ctx, "https://a.example.com", revokedKid)
+	revoked, err = revokedWBAKey(checker, ctx, "https://a.example.com", revokedKid)
 	require.NoError(t, err)
 	require.True(t, revoked, "history survives eviction")
 	require.Equal(t, []string{revokedKid}, checker.RevokedKids("https://a.example.com"))
 	// Past next_update the checker refetches; the older list is refused, the
 	// key stays revoked within the grace window, then checks fail closed.
 	now = now.Add(31 * time.Minute)
-	revoked, err = checker.RevokedWBAKey(ctx, "https://a.example.com", revokedKid)
+	revoked, err = revokedWBAKey(checker, ctx, "https://a.example.com", revokedKid)
 	require.NoError(t, err)
 	require.True(t, revoked, "an older list cannot un-revoke the key")
 	now = now.Add(61 * time.Minute) // past next_update + 2 x interval
-	_, err = checker.RevokedWBAKey(ctx, "https://a.example.com", revokedKid)
-	requireWBAStatus(t, err, http.StatusServiceUnavailable)
+	_, err = revokedWBAKey(checker, ctx, "https://a.example.com", "k")
+	requireRevocationState(t, err, RevocationStale)
+	revoked, err = revokedWBAKey(checker, ctx, "https://a.example.com", revokedKid)
+	require.NoError(t, err)
+	require.True(t, revoked, "a stale list still revokes what it revoked")
 
 	// A list over the retained-entry bound fails that origin closed.
 	many := make([]string, maxRetainedRevocations+1)
@@ -303,8 +309,8 @@ func TestOriginRevocationCheckerAdmission(t *testing.T) {
 		many[i] = fmt.Sprintf("%043d", i)
 	}
 	publish("https://g.example.info", many...)
-	_, err = checker.RevokedWBAKey(ctx, "https://g.example.info", "k")
-	requireWBAStatus(t, err, http.StatusServiceUnavailable)
+	_, err = revokedWBAKey(checker, ctx, "https://g.example.info", "k")
+	requireRevocationState(t, err, RevocationStale)
 
 	// A list signed by a key outside the origin's directory is refused.
 	dirs2 := newFakeDirectories()
@@ -312,8 +318,8 @@ func TestOriginRevocationCheckerAdmission(t *testing.T) {
 	s := newRevocationServer(t, "https://x.example.com", newEd25519(t))
 	s.set(t, revocationPayload{Updated: rfc3339(now.Add(-time.Minute)), NextUpdate: rfc3339(now.Add(30 * time.Minute))})
 	c2, _ := NewOriginRevocationChecker(OriginRevocationCheckerOptions{Keys: NewDirectoryResolver(DirectoryResolverOptions{Fetch: dirs2.fetch, Clock: clock}), Fetch: s.fetch, Clock: clock})
-	_, err = c2.RevokedWBAKey(ctx, "https://x.example.com", "k")
-	requireWBAStatus(t, err, http.StatusServiceUnavailable)
+	_, err = revokedWBAKey(c2, ctx, "https://x.example.com", "k")
+	requireRevocationState(t, err, RevocationStale)
 
 	_, err = NewOriginRevocationChecker(OriginRevocationCheckerOptions{})
 	require.Error(t, err)
@@ -341,14 +347,14 @@ func TestOriginRevocationRefreshIsDetachedFromTheCaller(t *testing.T) {
 	checker, _ := NewOriginRevocationChecker(OriginRevocationCheckerOptions{Keys: rig.resolver, Fetch: fetch, Clock: clock})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error)
-	go func() { _, err := checker.RevokedWBAKey(ctx, rig.origin, "k"); done <- err }()
+	go func() { _, err := revokedWBAKey(checker, ctx, rig.origin, "k"); done <- err }()
 	require.Eventually(t, func() bool { return fetches.Load() == 1 }, time.Second, time.Millisecond)
 	// While the fetch is blocked, other callers are not stuck behind a lock:
 	// a second check honors its own deadline and inspection returns at once.
 	short, cancelShort := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancelShort()
 	start := time.Now()
-	_, err := checker.RevokedWBAKey(short, rig.origin, "k")
+	_, err := revokedWBAKey(checker, short, rig.origin, "k")
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.Less(t, time.Since(start), time.Second)
 	require.Empty(t, checker.RevokedKids(rig.origin))
@@ -357,7 +363,7 @@ func TestOriginRevocationRefreshIsDetachedFromTheCaller(t *testing.T) {
 	close(release)
 	// The shared discovery completed despite the cancellation.
 	require.Eventually(t, func() bool {
-		_, err := checker.RevokedWBAKey(context.Background(), rig.origin, "k")
+		_, err := revokedWBAKey(checker, context.Background(), rig.origin, "k")
 		return err == nil
 	}, time.Second, time.Millisecond)
 	require.Equal(t, int32(1), fetches.Load())
@@ -444,6 +450,7 @@ func TestOriginRevocationCheckerFailsClosedWhenHistoryRefuses(t *testing.T) {
 	require.NoError(t, err)
 	ctx := context.Background()
 	kid := strings.Repeat("o", 43)
+	unrevoked := strings.Repeat("u", 43)
 	publish := func() {
 		updated := now.Add(-10 * time.Second)
 		rig.revs.set(t, revocationPayload{Updated: rfc3339(updated), NextUpdate: rfc3339(updated.Add(5 * time.Minute)), RevokedKids: []string{kid}})
@@ -452,15 +459,14 @@ func TestOriginRevocationCheckerFailsClosedWhenHistoryRefuses(t *testing.T) {
 	// Discovery while the History refuses: SERVICE_UNAVAILABLE, not admitted.
 	hist.refuse.Store(true)
 	publish()
-	_, err = checker.RevokedWBAKey(ctx, rig.origin, kid)
-	requireWBAStatus(t, err, http.StatusServiceUnavailable)
-	require.True(t, IsIdentityUnavailable(err))
+	_, err = revokedWBAKey(checker, ctx, rig.origin, unrevoked)
+	requireRevocationState(t, err, RevocationStale)
 
 	// Accepted after the cooldown.
 	hist.refuse.Store(false)
 	now = now.Add(discoveryNegativeTTL + time.Second)
 	publish()
-	revoked, err := checker.RevokedWBAKey(ctx, rig.origin, kid)
+	revoked, err := revokedWBAKey(checker, ctx, rig.origin, kid)
 	require.NoError(t, err)
 	require.True(t, revoked)
 
@@ -468,8 +474,8 @@ func TestOriginRevocationCheckerFailsClosedWhenHistoryRefuses(t *testing.T) {
 	hist.refuse.Store(true)
 	now = now.Add(5 * time.Minute)
 	publish()
-	_, err = checker.RevokedWBAKey(ctx, rig.origin, kid)
-	requireWBAStatus(t, err, http.StatusServiceUnavailable)
+	_, err = revokedWBAKey(checker, ctx, rig.origin, unrevoked)
+	requireRevocationState(t, err, RevocationStale)
 
 	// It recovers on the next refresh once the store succeeds, even if the
 	// list is unchanged (a 304 retries the store).
@@ -478,7 +484,36 @@ func TestOriginRevocationCheckerFailsClosedWhenHistoryRefuses(t *testing.T) {
 	rig.revs.status = http.StatusNotModified
 	rig.revs.mu.Unlock()
 	now = now.Add(revocationMinInterval + time.Second)
-	revoked, err = checker.RevokedWBAKey(ctx, rig.origin, kid)
+	revoked, err = revokedWBAKey(checker, ctx, rig.origin, kid)
 	require.NoError(t, err)
 	require.True(t, revoked)
+}
+
+// revocationStateError carries a CheckWBAKey state other than revoked or
+// current.
+type revocationStateError struct {
+	state RevocationState
+	err   error
+}
+
+func (e *revocationStateError) Error() string { return e.state.String() }
+func (e *revocationStateError) Unwrap() error { return e.err }
+
+// revokedWBAKey adapts CheckWBAKey to (revoked, error) for the tests.
+func revokedWBAKey(c *OriginRevocationChecker, ctx context.Context, origin, kid string) (bool, error) {
+	state, err := c.CheckWBAKey(ctx, origin, kid)
+	switch state {
+	case RevocationRevoked:
+		return true, nil
+	case RevocationCurrent:
+		return false, nil
+	}
+	return false, &revocationStateError{state: state, err: err}
+}
+
+func requireRevocationState(t *testing.T, err error, want RevocationState) {
+	t.Helper()
+	var se *revocationStateError
+	require.ErrorAs(t, err, &se)
+	require.Equal(t, want, se.state, "%v", se.err)
 }

@@ -184,10 +184,25 @@ type WebBotAuthOptions struct {
 	// the production resolver.
 	Keys WBAKeyResolver
 
-	// Revocation checks each key against its origin's list. Required;
-	// NewOriginRevocationChecker is the production checker. A revocation
-	// status that cannot be established fails closed.
+	// Revocation checks each verified key against its origin's list, in
+	// the authorization layer after verification (CheckWBARevocation);
+	// NewOriginRevocationChecker is the production checker. A revoked key
+	// is refused with 403 and no Accept-Signature. Every other state is
+	// recorded in VerifiedSigner.Revocation for the Authorizer:
+	// identity.BindingGate treats an origin with no list, or no checker, as
+	// identity-established, and fails spend-committing calls closed with
+	// SERVICE_UNAVAILABLE while the list is stale. Nil skips the check, so
+	// no origin can be bound.
 	Revocation WBARevocationChecker
+
+	// OnDiscoveryFailure is the local policy for a request whose signer's
+	// key directory cannot be resolved (and no unexpired cached copy holds
+	// the key). Such a request is unverified (WBA §6.10). The default,
+	// DiscoveryFailureReject, answers 403 with Accept-Signature;
+	// DiscoveryFailureAnonymous serves it exactly as an anonymous request,
+	// except that an operation in RequiredFor or ProtocolMethodsRequiredFor
+	// is still refused.
+	OnDiscoveryFailure DiscoveryFailurePolicy
 
 	// Authorizer decides authority for a verified origin and returns its
 	// bound principal ID, or "" for an identity-established signer. It runs
@@ -221,6 +236,17 @@ type WebBotAuthOptions struct {
 	// WBAVerifyOptions.Authorities. Recommended.
 	Authorities []string
 }
+
+// DiscoveryFailurePolicy is WebBotAuthOptions.OnDiscoveryFailure.
+type DiscoveryFailurePolicy int
+
+const (
+	// DiscoveryFailureReject answers an unverified request 403 with
+	// Accept-Signature. The default.
+	DiscoveryFailureReject DiscoveryFailurePolicy = iota
+	// DiscoveryFailureAnonymous serves an unverified request as anonymous.
+	DiscoveryFailureAnonymous
+)
 
 // WBAAuthorizer is the binding hook for verified Web Bot Auth origins. It
 // returns the principal bound to signer.AgentURL, re-evaluating the binding
@@ -431,26 +457,45 @@ func serveWebBotAuth(w http.ResponseWriter, r *http.Request, next http.Handler, 
 	unboundFor map[string]struct{}, replay ReplayStore, scheme, opName string, opts MiddlewareOptions, logger *slog.Logger) {
 	signers, err := VerifyWebBotAuthRequest(r, WBAVerifyOptions{
 		Keys:         wba.Keys,
-		Revocation:   wba.Revocation,
 		Replay:       replay,
 		Scheme:       scheme,
 		MaxBodyBytes: opts.MaxBodyBytes,
 		Clock:        wba.Clock,
 		Authorities:  wba.Authorities,
 	})
+	op := opName
 	if err != nil {
-		rejectWBA(w, r, err, opName, wba, logger)
+		if IsDiscoveryFailure(err) && wba.OnDiscoveryFailure == DiscoveryFailureAnonymous {
+			if op == "" {
+				op = jsonRPCOperation(r, opts.MaxBodyBytes)
+			}
+			if !requiresSignature(r, op, opts) {
+				// Unverified (WBA §6.10): local policy serves it as an
+				// anonymous request, with no verified signer.
+				logger.Info("web bot auth key discovery failed; serving as anonymous", "op", op, "detail", AsWBAError(err).Reason)
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+		rejectWBA(w, r, err, op, wba, logger)
 		return
 	}
-	// Identity is established. From here every outcome is authorization:
-	// the AdCP error envelope with existing codes, never 403 with
-	// Accept-Signature. The originating signer is the AdCP caller; relays
-	// are verified independently and acquire none of its authority.
-	caller := signers[0]
-	op := opName
 	if op == "" {
 		op = jsonRPCOperation(r, opts.MaxBodyBytes)
 	}
+	// Identity is verified. The authorization layer follows: revocation,
+	// then the binding. A revoked key is answered like a signature failure
+	// (403, generic body) but without Accept-Signature; every other outcome
+	// is the AdCP error envelope with existing codes, never 403 with
+	// Accept-Signature. The originating signer is the AdCP caller; relays
+	// are verified independently and acquire none of its authority.
+	if wba.Revocation != nil {
+		if err := CheckWBARevocation(r.Context(), wba.Revocation, signers); err != nil {
+			rejectWBA(w, r, err, op, wba, logger)
+			return
+		}
+	}
+	caller := signers[0]
 	principal := ""
 	if wba.Authorizer != nil {
 		principal, err = wba.Authorizer.AuthorizeWBA(r.Context(), caller, op)
@@ -516,15 +561,18 @@ func rejectWBA(w http.ResponseWriter, r *http.Request, err error, op string, wba
 		"op", op,
 		"label", e.Label,
 		"authorization", e.Authorization,
+		"discovery_failure", e.DiscoveryFailure,
+		"revoked", e.Revoked,
 		"profile", ProfileTagWebBotAuth,
 	)
 	writeWBAReject(w, r, e, wba.OnReject)
 }
 
 // writeWBAReject writes the profile's failure response, split by layer. A
-// signature failure is its WBA status (400, 403 with Accept-Signature, 429)
-// with a generic body. An authorization outcome (identity established), or
-// a signer-side outage, is the standard AdCP error envelope with its code
+// signature-path failure is its WBA status and headers (400, 403 with
+// Accept-Signature, 403 without it for a revoked key, 429) with the generic
+// authentication error as its body (DR-0023). An authorization outcome
+// (identity established) is the standard AdCP error envelope with its code
 // and no Accept-Signature: PERMISSION_DENIED as 403, SERVICE_UNAVAILABLE as
 // 503 with Retry-After. Neither body carries signature-specific detail.
 func writeWBAReject(w http.ResponseWriter, r *http.Request, e *WBAError, onReject func(http.ResponseWriter, *http.Request, *WBAError)) {
@@ -532,7 +580,7 @@ func writeWBAReject(w http.ResponseWriter, r *http.Request, e *WBAError, onRejec
 		onReject(w, r, e)
 		return
 	}
-	if e.Authorization || e.Code == CodeServiceUnavailable {
+	if e.Authorization {
 		code, recovery, message := e.Code, "correctable", "Agent is not authorized for this request"
 		if code == "" {
 			code = CodePermissionDenied
@@ -553,8 +601,15 @@ func writeWBAReject(w http.ResponseWriter, r *http.Request, e *WBAError, onRejec
 			w.Header().Add(k, v)
 		}
 	}
-	http.Error(w, http.StatusText(e.Status), e.Status)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(e.Status)
+	_, _ = w.Write(genericAuthenticationError)
 }
+
+// genericAuthenticationError is the one body for every signature-path
+// failure, whatever the cause, so the response is no oracle.
+var genericAuthenticationError = []byte(`{"errors":[{"code":"AUTH_INVALID","message":"Request authentication failed","recovery":"correctable"}]}`)
 
 // jsonRPCOperation names the operation of a JSON-RPC request body: the
 // tool name of an MCP tools/call, or otherwise the JSON-RPC method (for

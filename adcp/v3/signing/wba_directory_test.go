@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -67,14 +68,25 @@ func TestVerifyDirectoryResponseRejectsTampering(t *testing.T) {
 			b, _ := json.Marshal(doc)
 			resign(r, b)
 		}, origin, wbaTestNow},
-		{"one key unsigned", func(r *DirectoryResponse) {
-			r.Header.Set("Signature-Input", strings.SplitN(r.Header.Get("Signature-Input"), ", key2=", 2)[0])
+		{"one of two signatures removed from Signature only", func(r *DirectoryResponse) {
 			r.Header.Set("Signature", strings.SplitN(r.Header.Get("Signature"), ", key2=", 2)[0])
+		}, origin, wbaTestNow},
+		{"signed but digest missing", func(r *DirectoryResponse) { r.Header.Del("Content-Digest") }, origin, wbaTestNow},
+		{"Signature-Input without Signature", func(r *DirectoryResponse) { r.Header.Del("Signature") }, origin, wbaTestNow},
+		{"only unusable keys", func(r *DirectoryResponse) {
+			resign(r, []byte(`{"keys":[{"kty":"EC","crv":"P-384","x":"AAAA","y":"AAAA"}]}`))
+			r.Header.Del("Signature")
+			r.Header.Del("Signature-Input")
+		}, origin, wbaTestNow},
+		{"symmetric key material", func(r *DirectoryResponse) {
+			resign(r, []byte(`{"keys":[{"kty":"oct","k":"c2VjcmV0"}]}`))
+			r.Header.Del("Signature")
+			r.Header.Del("Signature-Input")
 		}, origin, wbaTestNow},
 		{"signature labels differ", func(r *DirectoryResponse) {
 			r.Header.Set("Signature", strings.Replace(r.Header.Get("Signature"), "key2=", "key9=", 1))
 		}, origin, wbaTestNow},
-		{"wrong media type", func(r *DirectoryResponse) { r.Header.Set("Content-Type", "application/json") }, origin, wbaTestNow},
+		{"wrong media type", func(r *DirectoryResponse) { r.Header.Set("Content-Type", "text/html") }, origin, wbaTestNow},
 		{"not 200", func(r *DirectoryResponse) { r.Status = http.StatusNotModified }, origin, wbaTestNow},
 		{"oversized", func(r *DirectoryResponse) { r.Body = make([]byte, directoryMaxBytes+1) }, origin, wbaTestNow},
 		{"served for another origin", func(*DirectoryResponse) {}, "https://evil.example.com", wbaTestNow},
@@ -111,6 +123,37 @@ func TestVerifyDirectoryResponseRejectsTampering(t *testing.T) {
 	}
 	_, err := VerifyDirectoryResponse(origin, fresh(), wbaTestNow)
 	require.NoError(t, err)
+
+	// Accepted (WBA Appendix B.1 makes directory signatures RECOMMENDED,
+	// and a verifier MAY use keys from the directory itself).
+	accepted := map[string]func(*DirectoryResponse){
+		"unsigned directory": func(r *DirectoryResponse) {
+			r.Header.Del("Signature")
+			r.Header.Del("Signature-Input")
+			r.Header.Del("Content-Digest")
+		},
+		"one key without a signature": func(r *DirectoryResponse) {
+			r.Header.Set("Signature-Input", strings.SplitN(r.Header.Get("Signature-Input"), ", key2=", 2)[0])
+			r.Header.Set("Signature", strings.SplitN(r.Header.Get("Signature"), ", key2=", 2)[0])
+		},
+		"plain JWK Set media type": func(r *DirectoryResponse) { r.Header.Set("Content-Type", "application/jwk-set+json") },
+		"unsigned, with an unusable key skipped": func(r *DirectoryResponse) {
+			jwk, _ := PublicDirectoryKey(keyA)
+			resign(r, []byte(`{"keys":[{"kty":"EC","crv":"P-384","x":"AAAA","y":"AAAA"},{"kty":"OKP","crv":"Ed25519","x":"`+jwk.X+`","kid":"operator-chosen"}]}`))
+			r.Header.Del("Signature")
+			r.Header.Del("Signature-Input")
+		},
+	}
+	for name, mutate := range accepted {
+		t.Run(name, func(t *testing.T) {
+			resp := fresh()
+			mutate(resp)
+			keys, err := VerifyDirectoryResponse(origin, resp, wbaTestNow)
+			require.NoError(t, err)
+			jwk, _ := PublicDirectoryKey(keyA)
+			require.Contains(t, keys, jwk.Kid, "keys are indexed by thumbprint")
+		})
+	}
 }
 
 func TestDirectoryPublisherResigns(t *testing.T) {
@@ -189,36 +232,98 @@ func TestDirectoryResolverCaching(t *testing.T) {
 	require.Equal(t, 3, dirs.count(origin))
 }
 
-func TestDirectoryResolverOutageCoolsDown(t *testing.T) {
+// TestDirectoryResolverDiscoveryFailure: a directory that fails to resolve
+// is not evidence and never evicts the cached entry, which keeps verifying
+// until it expires (WBA §6.10); a directory that resolves without the key is
+// evidence and replaces it.
+func TestDirectoryResolverDiscoveryFailure(t *testing.T) {
 	now := wbaTestNow
 	clock := func() time.Time { return now }
 	dirs := newFakeDirectories()
 	origin := "https://buyer.example.com"
 	key := newEd25519(t)
 	jwk, _ := PublicDirectoryKey(key)
-	dirs.publish(t, origin, now.Add(-time.Minute), 2*time.Minute, key)
+	dirs.publish(t, origin, now.Add(-time.Minute), time.Hour, key)
 	d := NewDirectoryResolver(DirectoryResolverOptions{Fetch: dirs.fetch, Clock: clock})
 	ctx := context.Background()
 	_, err := d.ResolveWBAKey(ctx, origin, jwk.Kid)
 	require.NoError(t, err)
 
-	// The directory expires and the origin goes down: a failure is not
-	// evidence of removal, but expired keys never authenticate.
-	now = now.Add(2 * time.Minute)
+	// Past the refresh point the origin goes down: the cached keys keep
+	// verifying.
+	now = now.Add(6 * time.Minute)
 	dirs.fail(origin, errors.New("connection reset"))
-	_, err = d.ResolveWBAKey(ctx, origin, jwk.Kid)
-	requireWBAStatus(t, err, http.StatusServiceUnavailable)
-	require.True(t, IsIdentityUnavailable(err))
-	require.NotNil(t, d.Evidence(origin), "the previous signed snapshot is kept as evidence")
-	// Cooldown: no refetch within 60 s, and the cooldown keeps the kind.
-	_, err = d.ResolveWBAKey(ctx, origin, jwk.Kid)
-	requireWBAStatus(t, err, http.StatusServiceUnavailable)
-	require.Equal(t, 2, dirs.count(origin))
-	now = now.Add(61 * time.Second)
-	dirs.publish(t, origin, now.Add(-time.Minute), time.Hour, key)
-	_, err = d.ResolveWBAKey(ctx, origin, jwk.Kid)
+	got, err := d.ResolveWBAKey(ctx, origin, jwk.Kid)
 	require.NoError(t, err)
+	require.NotNil(t, got, "a failed refresh does not evict the cached directory")
+	require.Equal(t, 2, dirs.count(origin))
+	// The failure cools down for 60 s: no refetch, still the cached keys.
+	got, err = d.ResolveWBAKey(ctx, origin, jwk.Kid)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Equal(t, 2, dirs.count(origin))
+	// A 404 is a discovery failure too, not evidence of removal.
+	now = now.Add(61 * time.Second)
+	dirs.mu.Lock()
+	delete(dirs.errs, origin)
+	delete(dirs.dirs, origin)
+	dirs.mu.Unlock()
+	got, err = d.ResolveWBAKey(ctx, origin, jwk.Kid)
+	require.NoError(t, err)
+	require.NotNil(t, got)
 	require.Equal(t, 3, dirs.count(origin))
+
+	// Once the cached directory's signatures expire, its keys stop
+	// verifying: an unverified request.
+	now = wbaTestNow.Add(time.Hour)
+	_, err = d.ResolveWBAKey(ctx, origin, jwk.Kid)
+	we := requireWBAError(t, err, http.StatusForbidden)
+	require.True(t, IsDiscoveryFailure(err))
+	require.NotEmpty(t, we.ResponseHeader().Get("Accept-Signature"))
+	require.NotNil(t, d.Evidence(origin), "the last directory is kept as evidence")
+
+	// A directory that resolves without the key replaces the cached one.
+	now = now.Add(61 * time.Second)
+	other := newEd25519(t)
+	dirs.publish(t, origin, now.Add(-time.Minute), time.Hour, other)
+	got, err = d.ResolveWBAKey(ctx, origin, jwk.Kid)
+	require.NoError(t, err)
+	require.Nil(t, got, "a removed key stops verifying")
+}
+
+// TestDirectoryResolverUnsignedDirectory: a plain JWK Set is accepted by
+// default (signing is RECOMMENDED), refused when signatures are required,
+// and bounded by MaxStale through an outage.
+func TestDirectoryResolverUnsignedDirectory(t *testing.T) {
+	now := wbaTestNow
+	clock := func() time.Time { return now }
+	origin := "https://buyer.example.com"
+	key := newEd25519(t)
+	jwk, _ := PublicDirectoryKey(key)
+	plain := &DirectoryResponse{Status: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}},
+		Body: []byte(`{"keys":[{"kty":"OKP","crv":"Ed25519","x":"` + jwk.X + `"},{"kty":"RSA","use":"enc","n":"AQAB","e":"AQAB"}]}`)}
+	var fail atomic.Bool
+	fetch := func(context.Context, string) (*DirectoryResponse, error) {
+		if fail.Load() {
+			return nil, errors.New("timeout")
+		}
+		return plain, nil
+	}
+	_, err := NewDirectoryResolver(DirectoryResolverOptions{Fetch: fetch, Clock: clock, RequireSignedDirectory: true}).ResolveWBAKey(context.Background(), origin, jwk.Kid)
+	require.True(t, IsDiscoveryFailure(err), "refused when signatures are required")
+
+	d := NewDirectoryResolver(DirectoryResolverOptions{Fetch: fetch, Clock: clock, MaxStale: 10 * time.Minute})
+	got, err := d.ResolveWBAKey(context.Background(), origin, jwk.Kid)
+	require.NoError(t, err)
+	require.NotNil(t, got, "found by thumbprint without a kid")
+	fail.Store(true)
+	now = now.Add(9 * time.Minute)
+	got, err = d.ResolveWBAKey(context.Background(), origin, jwk.Kid)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	now = now.Add(2 * time.Minute)
+	_, err = d.ResolveWBAKey(context.Background(), origin, jwk.Kid)
+	require.True(t, IsDiscoveryFailure(err), "MaxStale bounds an outage")
 }
 
 func TestDirectoryResolverCoalescesPerOrigin(t *testing.T) {
@@ -294,7 +399,8 @@ func TestDirectoryResolverBounds(t *testing.T) {
 		return dirs.count("https://a.example.com") >= 2 && dirs.count("https://b.example.com") >= 2
 	}, time.Second, time.Millisecond)
 	_, err := d2.ResolveWBAKey(context.Background(), "https://c.example.com", "k")
-	requireWBAStatus(t, err, http.StatusTooManyRequests)
+	requireWBAStatus(t, err, http.StatusForbidden)
+	require.True(t, IsDiscoveryFailure(err), "a fetch the verifier's own limits refuse is a discovery failure (WBA §6.10)")
 	close(release)
 	wg.Wait()
 
@@ -329,7 +435,8 @@ func TestDirectoryResolverOperatorIsolation(t *testing.T) {
 		return dirs.count("https://a1.attacker.example.com") == 1 && dirs.count("https://a2.attacker.example.com") == 1
 	}, time.Second, time.Millisecond)
 	_, err = d.ResolveWBAKey(context.Background(), "https://a3.attacker.example.com", "k")
-	requireWBAStatus(t, err, http.StatusTooManyRequests)
+	requireWBAStatus(t, err, http.StatusForbidden)
+	require.True(t, IsDiscoveryFailure(err))
 	close(release)
 	wg.Wait()
 

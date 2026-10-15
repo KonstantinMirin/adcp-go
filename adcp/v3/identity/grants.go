@@ -29,10 +29,16 @@ type GrantRequest struct {
 	// signing.ProfileTagWebBotAuth (the default) or
 	// signing.ProfileTagRequestSigning.
 	SigningProfile string
+	// Spend marks a claim for a spend-committing operation. While a record
+	// on the chain cannot be read, a spend claim gets SERVICE_UNAVAILABLE;
+	// any other claim continues on the last record read within the
+	// evaluator's OutageContinuation bound.
+	Spend bool
 }
 
-// Grant evaluation outcomes. Every denial surfaces externally as
-// PERMISSION_DENIED with reason grant_absent; Reason is for logs.
+// Grant evaluation outcomes. A denial surfaces externally as
+// PERMISSION_DENIED with reason grant_absent, except that an unlisted
+// signer gets PERMISSION_DENIED with no details; Reason is for logs.
 const (
 	GrantReasonAbsent                   = "grant_absent"
 	GrantReasonSignerRecordUnavailable  = "signer_trust_record_unavailable"
@@ -63,9 +69,10 @@ type GrantAuthorization struct {
 	ExpiresAt time.Time
 }
 
-// Err returns nil when authorized, and otherwise PERMISSION_DENIED with
-// details {scope: "agent", reason: "grant_absent"} and recovery
-// correctable. Call it only after the signer's identity is established:
+// Err returns nil when authorized, SERVICE_UNAVAILABLE for an outage,
+// PERMISSION_DENIED with no details when the signer's operator does not
+// list it, and otherwise PERMISSION_DENIED with details {scope: "agent",
+// reason: "grant_absent"} and recovery correctable. Call it only after the signer's identity is established:
 // before that, PERMISSION_DENIED must omit details (see RequireClaim).
 func (a GrantAuthorization) Err() error {
 	if a.Authorized {
@@ -73,6 +80,11 @@ func (a GrantAuthorization) Err() error {
 	}
 	if a.Unavailable {
 		return trustUnavailableError()
+	}
+	if a.Reason == GrantReasonSignerUnlisted {
+		// The signer's own operator does not list it: its identity carries
+		// no standing here, so grant_absent would misstate the cause.
+		return unestablishedDenial()
 	}
 	return grantAbsentError()
 }
@@ -124,10 +136,13 @@ type GrantHook func(ctx context.Context, req GrantRequest) (bool, error)
 //     disabling SellerAuthorization for them;
 //   - a 200 from the brand's trust.json makes it the only source of grants,
 //     so LegacyAuthorization (brand.json authorized_operators) runs only
-//     when the brand has never published one. A record removed after it
-//     was read (404/410) is a removal: its links are gone (grant_absent)
-//     and authorized_operators does not come back. A fetch failure is
-//     never absence: it is SERVICE_UNAVAILABLE and invokes neither hook.
+//     when the brand has never published one. A fetch failure, including a
+//     404 or 410 after a record was published, is never absence and invokes
+//     neither hook: the last record read stands. A spend claim
+//     (GrantRequest.Spend) then gets SERVICE_UNAVAILABLE; any other claim
+//     is evaluated on the last records read while they are within the
+//     evaluator's OutageContinuation bound, and gets SERVICE_UNAVAILABLE
+//     after it.
 //
 // Under Web Bot Auth, the signer's operator must also currently list the
 // signer's origin with adcp:buying.
@@ -181,14 +196,14 @@ func (g *GrantEvaluator) Check(ctx context.Context, req GrantRequest) (GrantAuth
 	if req.SigningProfile == signing.ProfileTagWebBotAuth {
 		// Web Bot Auth authority always needs a current operator role entry.
 		var deny *GrantAuthorization
-		if signerRec, deny = g.signerListing(ctx, origin); deny != nil {
+		if signerRec, deny = g.signerListing(ctx, origin, req.Spend); deny != nil {
 			return *deny, nil
 		}
 		if signerOp == brandOp && brandOp == accountOp {
 			return GrantAuthorization{Authorized: true, ExpiresAt: signerRec.ExpiresAt}, nil
 		}
 	}
-	brandRec, err := g.Records.Evaluate(ctx, req.BrandDomain, "")
+	brandRec, err := g.Records.evaluateForGrant(ctx, req.BrandDomain, req.Spend)
 	if err != nil {
 		if IsTrustRecordAbsent(err) {
 			if g.LegacyAuthorization != nil {
@@ -212,7 +227,7 @@ func (g *GrantEvaluator) Check(ctx context.Context, req GrantRequest) (GrantAuth
 		// brand has no trust record. Once the brand serves 200, grants have
 		// one source and need the signer's operator role entry.
 		var deny *GrantAuthorization
-		if signerRec, deny = g.signerListing(ctx, origin); deny != nil {
+		if signerRec, deny = g.signerListing(ctx, origin, req.Spend); deny != nil {
 			return *deny, nil
 		}
 		if signerOp == brandOp && brandOp == accountOp {
@@ -245,7 +260,7 @@ func (g *GrantEvaluator) Check(ctx context.Context, req GrantRequest) (GrantAuth
 		// operator directly, for example the platform hosting its agent.
 		links = [][]TrustGrant{match(brandRec.Record.Grants, signerOp, g.now())}
 	case len(first) > 0:
-		intermediary, err := g.Records.Evaluate(ctx, accountOp, "")
+		intermediary, err := g.Records.evaluateForGrant(ctx, accountOp, req.Spend)
 		switch {
 		case err == nil:
 		case IsTrustRecordUnavailable(err):
@@ -338,14 +353,16 @@ func unavailable(reason string) (GrantAuthorization, error) {
 }
 
 // signerListing evaluates the signer's operator record: Listed returns the
-// record; Unlisted (including removed or never published) is grant_absent;
-// Unavailable is an outage.
-func (g *GrantEvaluator) signerListing(ctx context.Context, origin string) (*EvaluatedTrustRecord, *GrantAuthorization) {
+// record; Unlisted (delisted or never published) is a denial without
+// details; Unavailable is an outage, except that a non-spend claim
+// continues on the last record that listed the signer within the
+// OutageContinuation bound.
+func (g *GrantEvaluator) signerListing(ctx context.Context, origin string, spend bool) (*EvaluatedTrustRecord, *GrantAuthorization) {
 	l := g.Records.CheckListing(ctx, origin, RoleBuying)
-	switch l.Status {
-	case Listed:
+	switch {
+	case l.Status == Listed, l.Status == Unavailable && l.WithinGrace && !spend:
 		return l.Record, nil
-	case Unlisted:
+	case l.Status == Unlisted:
 		a, _ := denied(GrantReasonSignerUnlisted, false)
 		return nil, &a
 	default:
@@ -433,6 +450,10 @@ type GrantClaim struct {
 	Countries       []string
 	// Scope defaults to adcp:media_buying.
 	Scope string
+	// Spend marks a claim for a spend-committing operation (see
+	// GrantRequest.Spend). RequireAccountForOperation sets it from the
+	// operation.
+	Spend bool
 }
 
 // GrantGate applies grant evaluation before account side effects: at
@@ -469,6 +490,11 @@ func (g *GrantGate) RequireClaim(ctx context.Context, claim GrantClaim, signer *
 		if signer.PrincipalID == "" {
 			return unboundDenial()
 		}
+		if claim.Spend && signer.Revocation != signing.RevocationCurrent {
+			// The identity is not established for spend while its
+			// revocation list is stale or absent.
+			return trustUnavailableError()
+		}
 	}
 	res, err := g.Evaluator.Check(ctx, GrantRequest{
 		AgentOrigin:     signer.AgentURL,
@@ -478,6 +504,7 @@ func (g *GrantGate) RequireClaim(ctx context.Context, claim GrantClaim, signer *
 		BrandID:         claim.BrandID,
 		Countries:       claim.Countries,
 		SigningProfile:  profile,
+		Spend:           claim.Spend,
 	})
 	if err != nil {
 		return grantAbsentError()
@@ -543,6 +570,7 @@ func (g *GrantGate) RequireAccountForOperation(ctx context.Context, accountID, o
 			return grantAbsentError()
 		}
 	}
+	claim.Spend = claim.Spend || signing.IsSpendCommittingOperation(operation)
 	return g.RequireClaim(ctx, claim, signer)
 }
 

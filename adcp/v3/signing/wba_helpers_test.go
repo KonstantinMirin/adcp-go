@@ -206,7 +206,7 @@ func newWBARig(t *testing.T) *wbaRig {
 }
 
 func (rig *wbaRig) opts() WBAVerifyOptions {
-	return WBAVerifyOptions{Keys: rig.resolver, Revocation: rig.checker, Replay: rig.replay, Clock: wbaClock}
+	return WBAVerifyOptions{Keys: rig.resolver, Replay: rig.replay, Clock: wbaClock}
 }
 
 func (rig *wbaRig) signedRequest(t *testing.T, body string) *http.Request {

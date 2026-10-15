@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -42,7 +43,7 @@ type WBASignOptions struct {
 
 // SignWebBotAuthRequest signs r under the opt-in Web Bot Auth profile. It
 // sets Signature-Agent to the agent's origin under the label and covers it,
-// sets tag="web-bot-auth", a 256-bit nonce, the key's RFC 7638 thumbprint
+// sets tag="web-bot-auth", a 64-byte random nonce (unpadded base64url), the key's RFC 7638 thumbprint
 // as keyid, and an algorithm derived from the key. A request with a body
 // must carry Content-Type; the signer sets Content-Digest and covers both.
 // Signatures use RFC 8941 sf-binary (standard Base64).
@@ -143,14 +144,14 @@ func signWBA(r *http.Request, privateKey any, opts WBASignOptions, inputs, signa
 		if reader == nil {
 			reader = rand.Reader
 		}
-		var buf [32]byte
+		var buf [wbaNonceBytes]byte
 		if _, err := io.ReadFull(reader, buf[:]); err != nil {
 			return fmt.Errorf("signing: generate nonce: %w", err)
 		}
 		nonce = b64UrlEncodeRaw(buf[:])
 	}
-	if len(nonce) < wbaMinNonceLen || len(nonce) > wbaMaxNonceLen {
-		return errors.New("signing: nonce must carry at least 128 bits and be at most 256 characters")
+	if !validWBANonce(nonce) {
+		return errors.New("signing: a Web Bot Auth nonce is 64 bytes, as unpadded base64url or padded base64")
 	}
 
 	// The signer's own headers.
@@ -206,11 +207,7 @@ func signWBA(r *http.Request, privateKey any, opts WBASignOptions, inputs, signa
 		staged.Set(signatureInputHeader, inputs.serialize())
 		staged.Set(signatureHeader, signatures.serialize())
 	}
-	signURL := *r.URL
-	if r.Host != "" {
-		signURL.Host = r.Host
-	}
-	base, err := wbaSignatureBase(r.Method, signURL.String(), staged, member, false)
+	base, err := wbaSignatureBase(r.Method, sentTargetURI(r), staged, member, false)
 	if err != nil {
 		return fmt.Errorf("signing: build Web Bot Auth signature base: %w", err)
 	}
@@ -229,8 +226,9 @@ func signWBA(r *http.Request, privateKey any, opts WBASignOptions, inputs, signa
 	return nil
 }
 
-// signWithKey signs base with an Ed25519 or P-256 private key, producing a
-// raw Ed25519 signature or an IEEE P1363 (r||s) ECDSA signature.
+// signWithKey signs base with an Ed25519, P-256, or RSA private key,
+// producing a raw Ed25519 signature, an IEEE P1363 (r||s) ECDSA signature,
+// or an RSASSA-PSS (SHA-512, 64-byte salt) signature.
 func signWithKey(privateKey any, base []byte) ([]byte, error) {
 	switch k := privateKey.(type) {
 	case ed25519.PrivateKey:
@@ -245,6 +243,8 @@ func signWithKey(privateKey any, base []byte) ([]byte, error) {
 			return nil, err
 		}
 		return encodeP1363(rInt, sInt, 32), nil
+	case *rsa.PrivateKey:
+		return signRSAPSS(k, base)
 	default:
 		return nil, fmt.Errorf("signing: unsupported private key type %T", privateKey)
 	}

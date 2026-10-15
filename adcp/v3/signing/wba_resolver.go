@@ -25,13 +25,27 @@ type DirectoryResolverOptions struct {
 	// discoveries. Defaults to 256.
 	MaxOrigins int
 	// MaxPendingPerOperator bounds concurrent discoveries for origins of
-	// one registrable domain, so one operator (for example with wildcard
-	// DNS and a stalling server) cannot hold every discovery slot. Defaults
-	// to 8.
+	// one operator (a registrable domain, with every tenant of a PSL
+	// PRIVATE hosting suffix counted together), so one operator (for
+	// example with wildcard DNS and a stalling server) cannot hold every
+	// discovery slot. Defaults to 8.
 	MaxPendingPerOperator int
+	// RequireSignedDirectory refuses a directory response that carries no
+	// signatures. By default an unsigned directory (a plain JWK Set) is
+	// accepted, since signing it is RECOMMENDED, not required (WBA
+	// Appendix B.1); signatures that are present must verify.
+	RequireSignedDirectory bool
+	// MaxStale bounds how long a cached directory keeps verifying requests
+	// while its refreshes fail (WBA §6.10: a failed fetch does not evict a
+	// cached entry), counted from the last successful fetch and never past
+	// the directory signatures' expiry. Defaults to 24 hours.
+	MaxStale time.Duration
 	// Clock defaults to time.Now.
 	Clock func() time.Time
 }
+
+// DefaultDirectoryMaxStale is the default DirectoryResolverOptions.MaxStale.
+const DefaultDirectoryMaxStale = 24 * time.Hour
 
 // DirectoryResolver is the WBAKeyResolver for many signers. It discovers
 // each signer's keys from the key directory at the origin the covered
@@ -39,44 +53,40 @@ type DirectoryResolverOptions struct {
 // seller needs no hand-written keyid-to-agent map. It never reads
 // capabilities, brand.json, or trust.json.
 //
-// Caching follows the profile: a verified directory is cached for at most
-// five minutes and never past its signatures' expiry; a key absent from a
-// fresh directory is absent (no refetch on a miss); a failed discovery is
-// not evidence of removal and is retried after a 60-second cooldown, while
-// keys from an expired directory never authenticate. A directory that
-// cannot be fetched (network error, 5xx, 429, timeout) is a signer-side
-// outage (ErrIdentityUnavailable, SERVICE_UNAVAILABLE); one that is fetched
-// but absent (404/410), invalid, or missing the key is a signature failure. Concurrent lookups for
-// one origin share a single fetch, and one slow origin does not block
-// another.
+// Caching follows WBA §6.10 and the profile. A directory is refreshed after
+// at most five minutes (sooner if its signatures expire). A key absent from
+// a directory that resolves is absent: the new directory replaces the
+// cached one, and there is no refetch on a miss. A directory that fails to
+// resolve (a network or TLS error, a timeout, any status other than 200, an
+// invalid directory, or a fetch the resolver's own limits refuse) is not
+// evidence: it never evicts the cached entry, which keeps verifying until
+// MaxStale has passed since the last successful fetch, and the failure is
+// retried after a 60-second cooldown. With no usable cached entry, the
+// lookup fails with a discovery failure (ErrDiscoveryFailure): the request
+// is unverified. Concurrent lookups for one origin share a single fetch,
+// and one slow origin does not block another.
 type DirectoryResolver struct {
 	fetch          DirectoryFetcher
 	maxOrigins     int
 	maxPerOperator int
+	requireSigned  bool
+	maxStale       time.Duration
 	clock          func() time.Time
 
 	mu       sync.Mutex
-	cache    map[string]*directoryEntry  // verified directories only
-	lru      *list.List                  // front = most recently used origin
-	failures map[string]directoryFailure // discovery cooldowns, kept apart so failures never evict successes
+	cache    map[string]*directoryEntry // directories that resolved
+	lru      *list.List                 // front = most recently used origin
+	failures map[string]time.Time       // discovery cooldowns, kept apart so failures never evict successes
 	pending  map[string]*directoryCall
 }
 
 type directoryEntry struct {
-	origin  string
-	resp    *DirectoryResponse
-	keys    map[string]JWK
-	expires time.Time
-	elem    *list.Element
-}
-
-// directoryFailure is a discovery cooldown. outage distinguishes a
-// directory that could not be fetched (network error, 5xx, 429, timeout:
-// SERVICE_UNAVAILABLE) from one that was fetched and is absent or invalid
-// (a signature failure).
-type directoryFailure struct {
-	until  time.Time
-	outage bool
+	origin    string
+	resp      *DirectoryResponse
+	keys      map[string]JWK
+	refreshAt time.Time // refetch after this
+	expires   time.Time // keys stop verifying after this, even if refreshes fail
+	elem      *list.Element
 }
 
 type directoryCall struct {
@@ -97,10 +107,12 @@ func NewDirectoryResolver(opts DirectoryResolverOptions) *DirectoryResolver {
 		fetch:          opts.Fetch,
 		maxOrigins:     opts.MaxOrigins,
 		maxPerOperator: opts.MaxPendingPerOperator,
+		requireSigned:  opts.RequireSignedDirectory,
+		maxStale:       opts.MaxStale,
 		clock:          opts.Clock,
 		cache:          map[string]*directoryEntry{},
 		lru:            list.New(),
-		failures:       map[string]directoryFailure{},
+		failures:       map[string]time.Time{},
 		pending:        map[string]*directoryCall{},
 	}
 	if d.maxOrigins <= 0 {
@@ -109,13 +121,16 @@ func NewDirectoryResolver(opts DirectoryResolverOptions) *DirectoryResolver {
 	if d.maxPerOperator <= 0 {
 		d.maxPerOperator = 8
 	}
+	if d.maxStale <= 0 {
+		d.maxStale = DefaultDirectoryMaxStale
+	}
 	if d.clock == nil {
 		d.clock = time.Now
 	}
 	if d.fetch == nil {
 		client := safefetch.NewClient()
 		d.fetch = func(ctx context.Context, url string) (*DirectoryResponse, error) {
-			r, err := safefetch.Get(ctx, client, url, safefetch.Options{Accept: DirectoryMediaType, MaxBytes: directoryMaxBytes})
+			r, err := safefetch.Get(ctx, client, url, safefetch.Options{Accept: DirectoryMediaType + ", application/jwk-set+json;q=0.9, application/json;q=0.8", MaxBytes: directoryMaxBytes})
 			if err != nil {
 				return nil, err
 			}
@@ -123,6 +138,14 @@ func NewDirectoryResolver(opts DirectoryResolverOptions) *DirectoryResolver {
 		}
 	}
 	return d
+}
+
+func (e *directoryEntry) lookup(keyID string) *JWK {
+	jwk, ok := e.keys[keyID]
+	if !ok {
+		return nil
+	}
+	return &jwk
 }
 
 // ResolveWBAKey implements WBAKeyResolver.
@@ -134,38 +157,50 @@ func (d *DirectoryResolver) ResolveWBAKey(ctx context.Context, origin, keyID str
 	d.mu.Lock()
 	now := d.clock()
 	e := d.cache[origin]
-	if e != nil && now.Before(e.expires) {
+	if e != nil && now.Before(e.refreshAt) {
 		d.lru.MoveToFront(e.elem)
-		jwk, ok := e.keys[keyID]
 		d.mu.Unlock()
-		if !ok {
-			return nil, nil
-		}
-		return &jwk, nil
+		return e.lookup(keyID), nil
 	}
-	if f, ok := d.failures[origin]; ok && now.Before(f.until) {
-		d.mu.Unlock()
-		if f.outage {
-			return nil, identityUnavailable("key directory unavailable (cooling down)", nil)
+	// stale is the cached entry a failed refresh falls back to.
+	stale := func() *directoryEntry {
+		if e != nil && d.clock().Before(e.expires) {
+			return e
 		}
-		return nil, wbaFail(http.StatusForbidden, "", "key directory discovery is cooling down")
+		return nil
+	}
+	if until, ok := d.failures[origin]; ok && now.Before(until) {
+		d.mu.Unlock()
+		if s := stale(); s != nil {
+			return s.lookup(keyID), nil
+		}
+		return nil, discoveryFailure("key directory discovery is cooling down", nil)
 	}
 	call := d.pending[origin]
 	if call == nil {
+		refused := ""
 		if len(d.pending) >= d.maxOrigins {
-			d.mu.Unlock()
-			return nil, wbaFail(http.StatusTooManyRequests, "", "key directory discovery capacity exceeded")
-		}
-		op := operatorBucket(origin)
-		n := 0
-		for o := range d.pending {
-			if operatorBucket(o) == op {
-				n++
+			refused = "key directory discovery capacity exceeded"
+		} else {
+			op := operatorBucket(origin)
+			n := 0
+			for o := range d.pending {
+				if operatorBucket(o) == op {
+					n++
+				}
+			}
+			if n >= d.maxPerOperator {
+				refused = "key directory discovery capacity exceeded for operator"
 			}
 		}
-		if n >= d.maxPerOperator {
+		if refused != "" {
+			// A fetch the verifier's own limits refuse is a discovery
+			// failure too (WBA §6.10).
 			d.mu.Unlock()
-			return nil, wbaFail(http.StatusTooManyRequests, "", "key directory discovery capacity exceeded for operator")
+			if s := stale(); s != nil {
+				return s.lookup(keyID), nil
+			}
+			return nil, discoveryFailure(refused, nil)
 		}
 		call = &directoryCall{done: make(chan struct{})}
 		d.pending[origin] = call
@@ -180,13 +215,16 @@ func (d *DirectoryResolver) ResolveWBAKey(ctx context.Context, origin, keyID str
 		return nil, ctx.Err()
 	}
 	if call.err != nil {
+		d.mu.Lock()
+		e = d.cache[origin]
+		s := stale()
+		d.mu.Unlock()
+		if s != nil {
+			return s.lookup(keyID), nil
+		}
 		return nil, call.err
 	}
-	jwk, ok := call.entry.keys[keyID]
-	if !ok {
-		return nil, nil
-	}
-	return &jwk, nil
+	return call.entry.lookup(keyID), nil
 }
 
 func (d *DirectoryResolver) refresh(ctx context.Context, origin string, call *directoryCall) {
@@ -194,25 +232,26 @@ func (d *DirectoryResolver) refresh(ctx context.Context, origin string, call *di
 	ctx, cancel := context.WithTimeout(ctx, discoveryTimeout)
 	defer cancel()
 	resp, err := d.fetch(ctx, origin+DirectoryPath)
-	outage := err != nil || resp == nil || resp.Status >= 500 || resp.Status == http.StatusTooManyRequests
 	var keys map[string]JWK
-	if !outage {
-		keys, err = VerifyDirectoryResponse(origin, resp, d.clock())
-	} else if err == nil {
-		err = errors.New("key directory fetch failed")
+	switch {
+	case err != nil:
+	case resp == nil || resp.Status != http.StatusOK:
+		// Any status other than 200 is a discovery failure (WBA §5.5).
+		err = errors.New("key directory fetch did not return 200")
+	default:
+		keys, err = verifyDirectoryResponse(origin, resp, d.clock(), d.requireSigned)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	delete(d.pending, origin)
 	now := d.clock()
 	if err != nil {
-		// A failure never proves removal and never evicts a verified
-		// directory; the previous signed snapshot stays as evidence, and
-		// expired keys never authenticate.
-		d.failures[origin] = directoryFailure{until: now.Add(discoveryNegativeTTL), outage: outage}
+		// A failure says nothing about the signer: it never evicts the
+		// cached directory, whose keys keep verifying until they expire.
+		d.failures[origin] = now.Add(discoveryNegativeTTL)
 		if len(d.failures) > d.maxOrigins {
-			for o, f := range d.failures {
-				if !now.Before(f.until) {
+			for o, until := range d.failures {
+				if !now.Before(until) {
 					delete(d.failures, o)
 				}
 			}
@@ -225,28 +264,29 @@ func (d *DirectoryResolver) refresh(ctx context.Context, origin string, call *di
 				}
 			}
 		}
-		if outage {
-			// The signer's directory could not be fetched: identity cannot
-			// be confirmed, which is not the signer's fault (503).
-			call.err = identityUnavailable("key directory could not be fetched", err)
-			return
-		}
-		// Fetched, but absent (404/410), invalid, or without valid
-		// signatures: a signature failure (403 with Accept-Signature).
-		call.err = &WBAError{Status: http.StatusForbidden, Reason: "key directory absent or invalid", Wrapped: err}
+		call.err = discoveryFailure("key directory could not be resolved", err)
 		return
 	}
 	delete(d.failures, origin)
-	expires := now.Add(directoryCacheTTL)
-	if exp, ok := directoryExpiry(resp); ok && exp.Before(expires) {
-		expires = exp
+	refreshAt := now.Add(directoryCacheTTL)
+	expires := now.Add(d.maxStale)
+	if exp, ok := directoryExpiry(resp); ok {
+		refreshAt = minTime(refreshAt, exp)
+		expires = minTime(expires, exp)
 	}
-	e := &directoryEntry{origin: origin, resp: resp, keys: keys, expires: expires}
+	e := &directoryEntry{origin: origin, resp: resp, keys: keys, refreshAt: refreshAt, expires: expires}
 	if old := d.cache[origin]; old != nil {
 		e.elem = old.elem
 	}
 	d.store(e)
 	call.entry = e
+}
+
+func minTime(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
 }
 
 // store inserts or refreshes e and evicts the least recently used origins
@@ -265,8 +305,9 @@ func (d *DirectoryResolver) store(e *directoryEntry) {
 	}
 }
 
-// Evidence returns the last verified directory response for origin, the
-// record of what the verifier fetched, or nil.
+// Evidence returns the last directory response that resolved for origin,
+// the record of what the verifier fetched (signed, when the directory is),
+// or nil.
 func (d *DirectoryResolver) Evidence(origin string) *DirectoryResponse {
 	origin, err := webBotAuthOrigin(origin)
 	if err != nil {

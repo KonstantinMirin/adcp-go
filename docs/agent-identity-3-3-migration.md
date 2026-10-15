@@ -30,7 +30,7 @@ Everything here is **opt-in and experimental**.
 2. Sign with the Web Bot Auth profile:
 
    ```go
-   priv, _, _ := signing.LoadPrivateKey(pemBytes) // Ed25519 or P-256
+   priv, _, _ := signing.LoadPrivateKey(pemBytes) // Ed25519 or P-256; an *rsa.PrivateKey (2048+ bits) also works here
    client, _ := signing.NewSignedHTTPClient(signing.SignedHTTPClientOptions{
        PrivateKey:         priv,
        AgentOrigin:        "https://buyer.example.com",
@@ -39,9 +39,9 @@ Everything here is **opt-in and experimental**.
    })
    ```
 
-   `AgentOrigin` sets and covers `Signature-Agent`. The signature carries `tag="web-bot-auth"`, a 256-bit nonce, the key's thumbprint as `keyid`, and an algorithm derived from the key. The digest is always covered on a body. With a `CapabilityProvider`, the client sends only when the seller lists `web-bot-auth`. Otherwise it returns `ErrWebBotAuthNotAdvertised` and never downgrades on its own. `identity.AdvertisedRequestSigningProfiles` reads the list from a capabilities response.
+   `AgentOrigin` sets and covers `Signature-Agent`. The signature carries `tag="web-bot-auth"`, a 64-byte random nonce (unpadded base64url, which Cloudflare's web-bot-auth library also accepts), the key's thumbprint as `keyid`, and an algorithm derived from the key. `@target-uri` is the URI the request is sent to, unchanged. The digest is always covered on a body. With a `CapabilityProvider`, the client sends only when the seller lists `web-bot-auth`. Otherwise it returns `ErrWebBotAuthNotAdvertised` and never downgrades on its own. `identity.AdvertisedRequestSigningProfiles` reads the list from a capabilities response.
 
-3. Serve the signed key directory on that origin:
+3. Serve the key directory on that origin. Signing it is RECOMMENDED (WBA Appendix B.1); verifiers using this SDK also accept a plain JWK Set:
 
    ```go
    pub, _ := signing.NewDirectoryPublisher(signing.DirectoryPublisherOptions{
@@ -52,7 +52,7 @@ Everything here is **opt-in and experimental**.
 
    For static hosting, run `adcp-wba-directory --origin ... --key ... --out-body ... --out-headers ...` again before `--lifetime` elapses. Publish a key before signing with it, because verifiers cache a directory for up to five minutes.
 
-4. Serve a signed revocation list at `/.well-known/governance-revocations.json` on the same origin (`adcp-gov-revocation+jws`, signed by a directory key). **Sellers using this SDK answer `SERVICE_UNAVAILABLE` to every request you sign while they cannot read it** (a signer-side outage).
+4. Serve a signed revocation list at `/.well-known/governance-revocations.json` on the same origin (`adcp-gov-revocation+jws`, signed by a directory key). **Without one, sellers using this SDK treat your origin as identity-established and won't bind it for spend.** While they can't read it, or it is stale past grace, your spend-committing calls get `SERVICE_UNAVAILABLE`; other calls proceed.
 5. List the origin in `https://{your registrable domain}/.well-known/trust.json` with `adcp:buying`. `identity.MarshalTrustRecord(rec, "your-domain.com")` validates it before you publish.
 
 Keep your RFC 9421 setup (`KeyID`, brand.json `jwks_uri`) for sellers that have not moved. The default `Signer` never emits or covers `Signature-Agent`.
@@ -82,14 +82,28 @@ mw := signing.Middleware(signing.MiddlewareOptions{
 - **Profile selection.** A request with `Signature-Agent` or a `web-bot-auth` tag is verified under Web Bot Auth only, including under `ObserveOnly`. An uncovered `Signature-Agent` member is never attributed.
 - **Body.** A non-empty signed body must be strict JSON: no duplicate keys, including keys that differ only in case. Anything else is `400`.
 - **Authorities.** Set `Authorities` so that a signature captured at another seller cannot be replayed to this endpoint under that seller's `Host`.
+- **Layers.** Verification (`signing.VerifyWebBotAuthRequest`) needs only the key directory and replay state, so it can run in front of the server. Revocation, bindings, and grants are the authorization layer after it. The middleware runs both.
+- **Interop.**
+  - Nonces must be 64 bytes, as unpadded base64url or padded base64 (Cloudflare's rule).
+  - `@target-uri` is the target URI as received, percent-encoding included (RFC 9421 §2.2.2), so `/a%7Eb/mcp/` is signed and verified as sent. `@authority` is normalized (§2.2.3). The canonical origin is used only for the `Signature-Agent` identity.
+  - RSA keys verify with `rsa-pss-sha512` (2048 to 8192 bits), as in the draft's Appendix E vectors.
+- **Key directories.** A plain, unsigned JWK Set is accepted by default; signatures that are present must verify. `DirectoryResolverOptions.RequireSignedDirectory` refuses unsigned directories.
+  - **Discovery failures** (WBA §6.10) cover a directory that doesn't resolve: network or TLS error, timeout, any status other than `200` (including 404, 410, 429, 5xx), an invalid directory, or a fetch refused by the resolver's own limits.
+  - A discovery failure never evicts a cached directory. Its keys keep verifying for up to `MaxStale` (24 h by default, never past the directory signatures' expiry).
+  - With no usable cached copy, the request is unverified, and what happens is local policy (`WebBotAuthOptions.OnDiscoveryFailure`). The default is `403` with `Accept-Signature`. `DiscoveryFailureAnonymous` serves the request as anonymous, except operations in `RequiredFor`.
+  - A directory that resolves without the key is evidence that the key was removed.
 - **Errors are split by layer.**
-  - **Signature failures** use the WBA statuses with a generic body: `400` when headers don't parse, `403` with `Accept-Signature`, and `429`.
-  - **Authorization outcomes.** Once the signature verifies, every outcome uses the standard AdCP error envelope (`{"errors":[{"code","message","recovery"}]}`) with existing codes:
-    - a revoked key, a failed binding, or a signature-required operation from an unbound origin gets `PERMISSION_DENIED` (403);
-    - a trust-record or revocation-list outage on a spend-committing call gets `SERVICE_UNAVAILABLE` (503, `Retry-After`, retryable);
+  - **The signature path** answers only with WBA statuses and headers, never `503`: `400` when headers don't parse, `403` with `Accept-Signature`, `403` without it for a revoked key, and `429`. Any body is the generic authentication error (`{"errors":[{"code":"AUTH_INVALID",...}]}`, the same for every cause).
+  - **Authorization outcomes** after verification use the standard AdCP error envelope (`{"errors":[{"code","message","recovery"}]}`) with existing codes:
+    - a failed binding, an unlisted origin, or a signature-required operation from an unbound origin gets `PERMISSION_DENIED` (403) with no details;
+    - a spend-committing call while the trust record or the origin's revocation list can't be read gets `SERVICE_UNAVAILABLE` (503, `Retry-After`, retryable);
     - a missing grant gets `PERMISSION_DENIED` with `grant_absent`, from the grant gate.
-  - A correctly signed request never gets `403` with `Accept-Signature`.
+  - A correctly signed request with a valid key never gets `403` with `Accept-Signature`.
   - `request_signature_*` codes remain for the RFC 9421 profile.
+- **Revocation** runs in the authorization layer (`signing.CheckWBARevocation`, from `WebBotAuthOptions.Revocation`) and is recorded in `VerifiedSigner.Revocation`:
+  - **revoked:** refused, `403` with no `Accept-Signature`;
+  - **no list:** identity-established, and `Bind` refuses it (`identity.ErrRevocationListRequired`), so it can't be bound for spend;
+  - **stale** (unreadable, or past grace): spend-committing calls get `SERVICE_UNAVAILABLE` from `BindingGate` and `GrantGate`, and other calls proceed.
 - **Identity-established.** A verified origin with no binding gets what an anonymous caller gets.
   - Operations in `UnboundFor` (default `get_adcp_capabilities` and `get_principal`) run with the verified identity attached. List there whatever needs the identity.
   - Any other operation is served exactly as an anonymous request, with no verified signer, so your application answers it as it answers anonymous callers. An operation in `RequiredFor` or `ProtocolMethodsRequiredFor` is refused with `PERMISSION_DENIED`.
@@ -98,31 +112,30 @@ mw := signing.Middleware(signing.MiddlewareOptions{
   - `get_principal` should return `unconfigured`, with `relationship` (an `identity.PrincipalRelationship`) when an application is in progress.
   - Add `sync_principal` only when its handler implements an explicit `open` policy.
 - **Binding.** This is an explicit seller decision: `records.Bind(ctx, signer, principalID, bindings, identity.BindOptions{})`. The operator's trust record must list exactly one agent at the origin with `adcp:buying`.
+  - The origin must serve a current revocation list: `Bind` refuses one with no list, a stale list, or no revocation check (`identity.ErrRevocationListRequired`), and `BindingGate` treats such an origin as identity-established.
   - An origin maps to one principal. Binding onto a principal that already uses RFC 9421 needs `ExistingRFC9421Principal: true, MigrationApproved: true`. Set those from your own records: the zero value treats the principal as new, as in the Python SDK.
   - `BindingGate` re-evaluates the trust record on every request, through the evaluator's cache, which is bounded by the polling interval.
-    - **Delisted**, or the operator publishes no record: the origin falls back to identity-established (anonymous-equivalent, plus `UnboundFor`), not to deny-everything. The binding stays, so the origin still cannot downgrade to RFC 9421, and `Bind` refuses to bind it again while it is unlisted.
-      - Work already in flight continues: the origin may still poll and cancel tasks it created while listed, and starts nothing new. `BindingGate.TaskOperations` (default `get_task_status`, `tasks/get`, `tasks/result`, `tasks/cancel`) keep the principal for this. The Go SDK does not manage tasks, so your task handlers must scope lookups and cancellation to that principal, as they do for every caller. Then a delisted origin reaches only its own tasks.
-    - **Unreachable or unreadable record**: this is not a delisting, and an outage never restores access.
-      - The last record read stays authoritative. If it didn't list the origin, the origin stays delisted, whatever made the refresh fail, rate and concurrency caps included.
-      - If it did, spend-committing calls (`signing.IsSpendCommittingOperation`, configurable) fail with `SERVICE_UNAVAILABLE`. Other calls continue under the binding only while that record is within 4× the polling interval past its freshness, and then also get `SERVICE_UNAVAILABLE` until a fetch succeeds.
+    - **Delisted**, or the operator never published a record: the origin falls back to identity-established (anonymous-equivalent, plus `UnboundFor`), not to deny-everything, with no exception (task polling included). The binding stays, so the origin still cannot downgrade to RFC 9421, and `Bind` refuses to bind it again while it is unlisted.
+    - **Unreachable or unreadable record**, including a `404`/`410` after the operator published one: a discovery failure, not a delisting and not a removal. An outage never restores access.
+      - The last record read stays authoritative. If it didn't list the origin, the origin stays delisted, whatever made the refresh fail, rate and concurrency caps included. Operators retire an agent by publishing an empty `agents[]`.
+      - If it did, spend-committing calls (`signing.IsSpendCommittingOperation`, configurable) fail with `SERVICE_UNAVAILABLE`. Other calls may continue under the binding while that record is within `TrustRecordEvaluatorOptions.OutageContinuation` past its freshness. That bound is seller policy (default 4× the polling interval; negative disables). After it, they also get `SERVICE_UNAVAILABLE` until a fetch succeeds.
       - With no record in the authority history, outages are `SERVICE_UNAVAILABLE`.
-    - **Removal**: a `404`/`410` after a record was read is a removal, and every origin it listed is delisted. For a bound origin's operator, a `404`/`410` counts as removal even without that history, so every replica agrees. `TrustRecordEvaluator.CheckListing` implements these rules.
-    - **Authority history** (which operators have served a trust.json, and the last record read from each) is security state. Losing it re-enables the brand.json fallback after a removal, or turns a delisting into an outage. The default `identity.AuthorityHistory` is in memory and does not survive restarts or span replicas. **Public deployments must supply a durable one** (`TrustRecordEvaluatorOptions.History`). If it can't be read or written, the evaluation fails closed as unavailable. The in-memory default refuses rather than evicts: at most 64 operators per quota group and 65,536 overall. A quota group is a registrable domain, and all tenants of a PSL PRIVATE hosting suffix such as `github.io` count as one group. An operator over quota gets no history. No other operator's history is lost, so free subdomains can't flush a brand's removal.
+      - A `404`/`410` from an operator that has never published a record means no record: the origin is not listed. `TrustRecordEvaluator.CheckListing` implements these rules.
+    - **Authority history** (which operators have served a trust.json, and the last record read from each) is security state. Losing it turns a later `404` into absence, re-enabling the brand.json fallback, or turns a delisting into an outage. The default `identity.AuthorityHistory` is in memory and does not survive restarts or span replicas. **Public deployments must supply a durable one** (`TrustRecordEvaluatorOptions.History`). If it can't be read or written, the evaluation fails closed as unavailable. The in-memory default refuses rather than evicts: at most 64 operators per quota group and 65,536 overall. A quota group is a registrable domain, and all tenants of a PSL PRIVATE hosting suffix such as `github.io` count as one group. An operator over quota gets no history. No other operator's history is lost, so free subdomains can't flush another operator's history.
 - **The trust record is never read on the signature path.** The `signing` package cannot import `identity`, because `identity` imports `signing`.
 - **MCP tool handlers.** Read the signer with `signing.VerifiedSignerFromToolRequest(req)`. A stateful go-sdk session binds handlers to the context of its `initialize` request, so `VerifiedSignerFromContext` can return another request's signer there. The middleware places every verified signer, under either profile, in the per-request `auth.TokenInfo`. It sets only `TokenInfo.Extra`, never `UserID`, and the MCP SDK copies it into `req.Extra`. `GrantGate.RequireAccountForToolRequest` uses it.
 - **Grants.** Set `adcp.Config.SyncAccountsAuthorizer = gate.SyncAccountsAuthorizer()`, with `gate := &identity.GrantGate{Evaluator: &identity.GrantEvaluator{Records: records}, ExistingAccountClaim: ...}`.
   - The hook reads the per-request signer (Web Bot Auth or RFC 9421) and checks every entry before the handler runs.
   - An identity-established Web Bot Auth signer (no `PrincipalID`) never provisions accounts.
-  - A missing grant is `PERMISSION_DENIED` with `{scope: "agent", reason: "grant_absent"}`, or with no details when no identity is established.
+  - A missing grant is `PERMISSION_DENIED` with `{scope: "agent", reason: "grant_absent"}`. When no identity is established, or the signer's own operator doesn't list it, it is `PERMISSION_DENIED` with no details.
   - A chain takes one of three shapes:
     - the brand grants the signer's operator, which is `account.operator`;
     - a self-operated brand (it is `account.operator`) grants the signer's operator directly, for example the platform hosting its agent;
     - the brand grants `account.operator`, which grants the signer's operator.
   - Before spend-committing calls, call `gate.RequireAccountForToolRequest(ctx, req, accountID)`. An operation outside media buying needs an explicit scope (`OperationClaim`).
-  - A grantor or intermediary record that can't be fetched gives `SERVICE_UNAVAILABLE` (retryable), never `grant_absent`. A record removed after it was read (`404`/`410`) is a removal: its link is gone, which gives `grant_absent`, and `authorized_operators` doesn't come back.
+  - A grantor or intermediary record that can't be read is never `grant_absent`. That includes a `404`/`410` after the record was read. The last-read grants stand: a non-spend claim is evaluated on them within `OutageContinuation`. A spend claim (`GrantRequest.Spend`, set by `RequireAccountForOperation`) gets `SERVICE_UNAVAILABLE`, as does any claim after the bound. `authorized_operators` doesn't come back: there is no downgrade.
   - `GrantEvaluator.LegacyAuthorization` (brand.json `authorized_operators`) runs only while the brand has never served a trust.json. `SellerAuthorization` is your discretion for uncovered claims and is disabled by `exclusive_grants`.
-- **Signer-side outages.** If identity can't be confirmed because the key directory can't be fetched (network error, 5xx, 429, timeout) or the revocation list can't be read or is stale past grace, every signed request gets `SERVICE_UNAVAILABLE`: 503, `Retry-After`, the AdCP envelope, no `Accept-Signature`. Nothing is served under that signature, with no anonymous fallback. `signing.IsIdentityUnavailable(err)` identifies these from `VerifyWebBotAuthRequest`. A directory that is fetched but lacks the key, or is absent (404/410), stays a signature failure (403 with `Accept-Signature`).
-- **Revocation.** `OriginRevocationChecker` retains every thumbprint-shaped revoked kid, at most 1024 per origin. It keeps `keyCompromise` and the earliest `invalidity_date`, and refuses older lists. Revocations survive eviction of an origin through `RevocationHistory`. The default history is in memory and refuses rather than evicts: at most 32 origins and 8,192 kids per quota group (the same grouping as the authority history), plus global bounds. An origin that doesn't fit fails closed with `SERVICE_UNAVAILABLE`, and no other origin's revocations are forgotten. **Public deployments must supply a durable `RevocationHistory`**, so revocations hold across restarts and replicas. `RevocationDetails.Exposes(receivedAt)` tells you which accepted buys came from suspect requests; never unwind them automatically.
+- **Revocation.** `OriginRevocationChecker` retains every thumbprint-shaped revoked kid, at most 1024 per origin. It keeps `keyCompromise` and the earliest `invalidity_date`, and refuses older lists. Revocations survive eviction of an origin through `RevocationHistory`. The default history is in memory and refuses rather than evicts: at most 32 origins and 8,192 kids per quota group (the same grouping as the authority history), plus global bounds. An origin that doesn't fit is `RevocationStale` (no spend), and no other origin's revocations are forgotten. A stale list still revokes everything it revoked. **Public deployments must supply a durable `RevocationHistory`**, so revocations hold across restarts and replicas. `RevocationDetails.Exposes(receivedAt)` tells you which accepted buys came from suspect requests; never unwind them automatically.
 - **Advertising.** Advertise the profile with `identity.RequestSigningCapabilities{Profiles: []string{signing.ProfileTagRequestSigning, signing.ProfileTagWebBotAuth}}`, and advertise onboarding with `identity.AccountCapabilities.AgentOnboarding` (list `account.agent_onboarding` in `experimental_features`).
 
 ## Deprecation
@@ -139,4 +152,5 @@ AdCP 3.3 deprecates the RFC 9421 profile. It stays fully functional through 3.x 
 - **Legacy module.** These features ship in `adcp/v3` only. The legacy `adcp` module is frozen at v2 (see MIGRATING.md) and received only the covered-header tolerance.
 - **Webhooks.** Web Bot Auth webhooks are ordinary signed requests and verify with the same middleware. The `adcp/v3/webhook` publisher does not sign them yet, and the `signing_profile` registration field is not modeled.
 - **Durable state.** The defaults keep bindings, revocation history, authority history, and replay state in memory. Persistent stores are the application's, behind `BindingStore`, `RevocationHistory`, `AuthorityHistory`, and `ReplayStore`. Public deployments need all four.
+- **Cross-implementation fixtures.** The TypeScript SDK is generating Web Bot Auth interop fixtures with Cloudflare's libraries (adcp-client `test/fixtures/wba-interop/`). They are not published yet; vendor them with provenance and add a test when they land. Until then the draft's Appendix E.1.1 RSA-PSS vector is the only foreign-generated input verified here.
 - **Released inputs.** The final 3.3 schema bundle and the P7 trust-record and grant-chain vectors are upstream release dependencies. Re-pin and rerun conformance when they land.

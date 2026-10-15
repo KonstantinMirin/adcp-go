@@ -412,7 +412,9 @@ func (s stubKeys) ResolveWBAKey(_ context.Context, origin, kid string) (*signing
 
 type noRevocations struct{}
 
-func (noRevocations) RevokedWBAKey(context.Context, string, string) (bool, error) { return false, nil }
+func (noRevocations) CheckWBAKey(context.Context, string, string) (signing.RevocationState, error) {
+	return signing.RevocationCurrent, nil
+}
 
 type stubAuthorizer map[string]string
 
@@ -546,9 +548,9 @@ func TestGrantGate(t *testing.T) {
 			return GrantClaim{}, errors.New("unknown account")
 		},
 	}
-	signer := &signing.VerifiedSigner{AgentURL: agencyAgent, Profile: signing.ProfileTagWebBotAuth, PrincipalID: "p_agency"}
-	stranger := &signing.VerifiedSigner{AgentURL: platformAgent, Profile: signing.ProfileTagWebBotAuth, PrincipalID: "p_platform"}
-	unbound := &signing.VerifiedSigner{AgentURL: agencyAgent, Profile: signing.ProfileTagWebBotAuth}
+	signer := &signing.VerifiedSigner{AgentURL: agencyAgent, Profile: signing.ProfileTagWebBotAuth, PrincipalID: "p_agency", Revocation: signing.RevocationCurrent}
+	stranger := &signing.VerifiedSigner{AgentURL: platformAgent, Profile: signing.ProfileTagWebBotAuth, PrincipalID: "p_platform", Revocation: signing.RevocationCurrent}
+	unbound := &signing.VerifiedSigner{AgentURL: agencyAgent, Profile: signing.ProfileTagWebBotAuth, Revocation: signing.RevocationCurrent}
 	decl := adcp.AccountInput{Brand: &adcp.BrandReference{Domain: "brand-7k3q.com"}, Operator: "agency-7k3q.com"}
 
 	require.NoError(t, gate.RequireDeclaration(ctx, decl, signer))
@@ -586,6 +588,13 @@ func TestGrantGate(t *testing.T) {
 	require.Equal(t, "grant_absent", details["reason"], "the grant does not cover creative generation")
 
 	gate.OperationClaim = nil
+	// A stale or absent revocation list: the identity is not established
+	// for spend, whatever the grants say; non-spend operations proceed.
+	stale := *signer
+	stale.Revocation = signing.RevocationStale
+	code, _ = permissionDetails(t, gate.RequireAccountForOperation(ctx, "acc_brand", "create_media_buy", &stale))
+	require.Equal(t, "SERVICE_UNAVAILABLE", code)
+	require.NoError(t, gate.RequireAccountForOperation(ctx, "acc_brand", "get_media_buys", &stale))
 	callReq := toolRequestWithSigner(signer)
 	callReq.Params = &mcp.CallToolParamsRaw{Name: "create_media_buy"}
 	require.NoError(t, gate.RequireAccountForToolRequest(ctx, callReq, "acc_brand"))
@@ -607,65 +616,84 @@ func TestGrantGate(t *testing.T) {
 	require.Error(t, err, "a GrantEvaluator without Records")
 }
 
-// TestGrantOutageVersusRemoval: a grantor record that cannot be fetched is
-// SERVICE_UNAVAILABLE, never grant_absent; a record removed after it was
-// read is a removal: its link is gone (grant_absent) and the brand.json
-// fallback does not come back.
-func TestGrantOutageVersusRemoval(t *testing.T) {
+// TestGrantOutageRules: a grantor record that cannot be read, including a
+// 404 or 410 after it was read, is a discovery failure, never grant_absent
+// and never a reason to fall back to brand.json. The last records read stand
+// for non-spend claims within the OutageContinuation bound; a spend claim
+// gets SERVICE_UNAVAILABLE.
+func TestGrantOutageRules(t *testing.T) {
 	ctx := context.Background()
 	req := GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"}
-	legacyCalled := false
-	legacy := func(context.Context, GrantRequest) (bool, error) { legacyCalled = true; return true, nil }
+	spend := req
+	spend.Spend = true
+	brandGrants := `{"grants":[{"grantee":"agency-7k3q.com","scopes":["adcp:media_buying"]}]}`
+	requireUnavailable := func(t *testing.T, res GrantAuthorization) {
+		t.Helper()
+		require.False(t, res.Authorized)
+		require.True(t, res.Unavailable)
+		code, _ := permissionDetails(t, res.Err())
+		require.Equal(t, "SERVICE_UNAVAILABLE", code)
+	}
 
-	r := grantRig(t, with(baseRecords, map[string]string{"brand-7k3q.com": `{"grants":[{"grantee":"agency-7k3q.com","scopes":["adcp:media_buying"]}]}`}))
-	g := &GrantEvaluator{Records: r.eval, LegacyAuthorization: legacy}
-	res, _ := g.Check(ctx, req)
-	require.True(t, res.Authorized)
+	for name, breakBrand := range map[string]func(*evalRig){
+		"outage": func(r *evalRig) { r.server.fail(trustURL("brand-7k3q.com"), errors.New("connection refused")) },
+		"410":    func(r *evalRig) { r.server.set(trustURL("brand-7k3q.com"), http.StatusGone, "") },
+		"404":    func(r *evalRig) { r.server.set(trustURL("brand-7k3q.com"), http.StatusNotFound, "") },
+	} {
+		t.Run("brand record "+name, func(t *testing.T) {
+			legacyCalled := false
+			legacy := func(context.Context, GrantRequest) (bool, error) { legacyCalled = true; return true, nil }
+			r := grantRig(t, with(baseRecords, map[string]string{"brand-7k3q.com": brandGrants}))
+			g := &GrantEvaluator{Records: r.eval, LegacyAuthorization: legacy}
+			res, _ := g.Check(ctx, req)
+			require.True(t, res.Authorized)
 
-	// Brand record outage.
-	r.server.fail(trustURL("brand-7k3q.com"), errors.New("connection refused"))
-	r.now = r.now.Add(2 * time.Minute)
-	res, _ = g.Check(ctx, req)
-	require.False(t, res.Authorized)
-	require.True(t, res.Unavailable)
-	code, _ := permissionDetails(t, res.Err())
-	require.Equal(t, "SERVICE_UNAVAILABLE", code)
+			breakBrand(r)
+			r.now = r.now.Add(2 * time.Minute) // past the 1 min freshness, within 4 x 1 min
+			res, _ = g.Check(ctx, req)
+			require.True(t, res.Authorized, "the last-read grants stand for a non-spend claim")
+			require.True(t, res.ExpiresAt.After(r.now))
+			res, _ = g.Check(ctx, spend)
+			requireUnavailable(t, res)
+			r.now = r.now.Add(4 * time.Minute) // past the bound
+			res, _ = g.Check(ctx, req)
+			requireUnavailable(t, res)
+			require.False(t, legacyCalled, "authorized_operators never comes back once the brand published a record")
+		})
+	}
 
-	// Brand record removed after it was read.
-	r.server.set(trustURL("brand-7k3q.com"), http.StatusGone, "")
-	r.now = r.now.Add(2 * time.Minute)
-	res, _ = g.Check(ctx, req)
-	require.False(t, res.Authorized)
-	require.False(t, res.Unavailable)
-	require.Equal(t, GrantReasonAbsent, res.Reason)
-	require.False(t, legacyCalled, "authorized_operators does not come back after a removal")
-	_, details := permissionDetails(t, res.Err())
-	require.Equal(t, "grant_absent", details["reason"])
+	t.Run("intermediary record", func(t *testing.T) {
+		r := grantRig(t, with(baseRecords, map[string]string{
+			"brand-7k3q.com":  brandGrants,
+			"agency-7k3q.com": `{"agents":[{"url":"https://buy.agency-7k3q.com/mcp","roles":["adcp:buying"]}],"grants":[{"grantee":"platform-7k3q.com","scopes":["adcp:media_buying"]}]}`,
+		}))
+		g := &GrantEvaluator{Records: r.eval}
+		chain := GrantRequest{AgentOrigin: platformAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"}
+		res, _ := g.Check(ctx, chain)
+		require.True(t, res.Authorized)
+		r.server.set(trustURL("agency-7k3q.com"), http.StatusNotFound, "")
+		r.now = r.now.Add(2 * time.Minute)
+		res, _ = g.Check(ctx, chain)
+		require.True(t, res.Authorized, "a 404 is not a removal: the second link stands within the bound")
+		chain.Spend = true
+		res, _ = g.Check(ctx, chain)
+		requireUnavailable(t, res)
+	})
 
-	// Intermediary outage on a two-link chain.
-	r2 := grantRig(t, with(baseRecords, map[string]string{
-		"brand-7k3q.com":  `{"grants":[{"grantee":"agency-7k3q.com","scopes":["adcp:media_buying"]}]}`,
-		"agency-7k3q.com": `{"agents":[{"url":"https://buy.agency-7k3q.com/mcp","roles":["adcp:buying"]}],"grants":[{"grantee":"platform-7k3q.com","scopes":["adcp:media_buying"]}]}`,
-	}))
-	g2 := &GrantEvaluator{Records: r2.eval}
-	chain := GrantRequest{AgentOrigin: platformAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"}
-	res, _ = g2.Check(ctx, chain)
-	require.True(t, res.Authorized)
-	r2.server.fail(trustURL("agency-7k3q.com"), errors.New("timeout"))
-	r2.now = r2.now.Add(2 * time.Minute)
-	res, _ = g2.Check(ctx, chain)
-	require.True(t, res.Unavailable)
-	// The intermediary removes its record: the second link is gone.
-	r2.server.set(trustURL("agency-7k3q.com"), http.StatusNotFound, "")
-	r2.now = r2.now.Add(2 * time.Minute)
-	res, _ = g2.Check(ctx, chain)
-	require.False(t, res.Authorized)
-	require.False(t, res.Unavailable)
-	require.Equal(t, GrantReasonAbsent, res.Reason)
+	t.Run("signer's operator unreachable with no history", func(t *testing.T) {
+		r := grantRig(t, with(baseRecords, map[string]string{"brand-7k3q.com": `{"grants":[]}`}))
+		r.server.fail(trustURL("agency-7k3q.com"), errors.New("timeout"))
+		res, _ := (&GrantEvaluator{Records: r.eval}).Check(ctx, req)
+		requireUnavailable(t, res)
+	})
 
-	// The signer's own operator record is unreachable: an outage.
-	r3 := grantRig(t, with(baseRecords, map[string]string{"brand-7k3q.com": `{"grants":[]}`}))
-	r3.server.fail(trustURL("agency-7k3q.com"), errors.New("timeout"))
-	res, _ = (&GrantEvaluator{Records: r3.eval}).Check(ctx, req)
-	require.True(t, res.Unavailable)
+	t.Run("signer unlisted: PERMISSION_DENIED without details", func(t *testing.T) {
+		r := grantRig(t, map[string]string{"agency-7k3q.com": `{"agents":[]}`, "brand-7k3q.com": brandGrants})
+		res, _ := (&GrantEvaluator{Records: r.eval}).Check(ctx, req)
+		require.False(t, res.Authorized)
+		require.Equal(t, GrantReasonSignerUnlisted, res.Reason)
+		code, details := permissionDetails(t, res.Err())
+		require.Equal(t, "PERMISSION_DENIED", code)
+		require.Empty(t, details)
+	})
 }

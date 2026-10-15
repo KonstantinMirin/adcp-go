@@ -286,6 +286,8 @@ func verifyRevocationJWS(body []byte, resolve func(kid string) (*JWK, error)) ([
 		want = AlgEd25519
 	case string(jwkAlgES256):
 		want = AlgES256
+	case jwkAlgPS512:
+		want = AlgRSAPSSSHA512
 	default:
 		return nil, errors.New("signing: JWS alg not allowed")
 	}
@@ -316,8 +318,7 @@ func verifyRevocationJWS(body []byte, resolve func(kid string) (*JWK, error)) ([
 	if err != nil {
 		return nil, errors.New("signing: JWS signature is not base64url")
 	}
-	pub, err := jwk.PublicKey()
-	if err != nil || !verifySignature(want, pub, []byte(protected+"."+payload), sig) {
+	if !verifyWithJWK(want, *jwk, []byte(protected+"."+payload), sig) {
 		return nil, errors.New("signing: revocation list signature did not verify")
 	}
 	out, err := base64.RawURLEncoding.DecodeString(payload)
@@ -406,9 +407,20 @@ type OriginRevocationChecker struct {
 	mu       sync.Mutex
 	origins  map[string]*originRevocations
 	lru      *list.List // front = most recently used
-	failures map[string]time.Time
+	failures map[string]revocationFailure
 	pending  map[string]*revocationCall
 }
+
+// revocationFailure is a discovery cooldown. noList records that the origin
+// serves no revocation list (404 or 410 with no retained history), as
+// opposed to a list that could not be read.
+type revocationFailure struct {
+	until  time.Time
+	noList bool
+}
+
+// errNoRevocationList is a revocation list fetch answered 404 or 410.
+var errNoRevocationList = errors.New("signing: origin serves no revocation list")
 
 type revocationCall struct {
 	done chan struct{}
@@ -453,7 +465,7 @@ func NewOriginRevocationChecker(opts OriginRevocationCheckerOptions) (*OriginRev
 		clock:          opts.Clock,
 		origins:        map[string]*originRevocations{},
 		lru:            list.New(),
-		failures:       map[string]time.Time{},
+		failures:       map[string]revocationFailure{},
 		pending:        map[string]*revocationCall{},
 	}
 	if c.maxOrigins <= 0 {
@@ -495,21 +507,42 @@ func NewOriginRevocationChecker(opts OriginRevocationCheckerOptions) (*OriginRev
 	return c, nil
 }
 
-// RevokedWBAKey implements WBARevocationChecker.
-func (c *OriginRevocationChecker) RevokedWBAKey(ctx context.Context, origin, keyID string) (bool, error) {
+// CheckWBAKey implements WBARevocationChecker. It runs in the
+// authorization layer, after verification:
+//   - RevocationRevoked when the retained list revokes keyID;
+//   - RevocationCurrent when a list within next_update plus the grace
+//     does not;
+//   - RevocationNoList when the origin serves no list (404 or 410) and no
+//     list has been retained for it;
+//   - RevocationStale otherwise: the list cannot be read or verified, it is
+//     past next_update plus the grace, the History cannot keep it, or a
+//     discovery limit refused the fetch. A previously retained list keeps
+//     revoking its keys whatever the state.
+func (c *OriginRevocationChecker) CheckWBAKey(ctx context.Context, origin, keyID string) (RevocationState, error) {
+	if l := c.retained(origin); l != nil && l.IsRevoked(keyID) {
+		return RevocationRevoked, nil
+	}
 	state, err := c.admit(ctx, origin)
 	if err != nil {
-		return false, err
+		if errors.Is(err, errNoRevocationList) {
+			return RevocationNoList, err
+		}
+		return RevocationStale, err
 	}
 	l, err := state.fresh(ctx, c)
 	if err != nil {
-		if we := AsWBAError(err); we != nil && (we.outage || we.Status == http.StatusTooManyRequests) {
-			return false, we
+		state.mu.Lock()
+		retained := state.current
+		state.mu.Unlock()
+		if retained != nil && retained.IsRevoked(keyID) {
+			return RevocationRevoked, nil
 		}
-		// Unreadable or stale past grace: identity cannot be confirmed.
-		return false, identityUnavailable("origin revocation list unavailable or stale past grace", err)
+		return RevocationStale, err
 	}
-	return l.IsRevoked(keyID), nil
+	if l.IsRevoked(keyID) {
+		return RevocationRevoked, nil
+	}
+	return RevocationCurrent, nil
 }
 
 // Details returns the retained revocation detail for (origin, keyID), for
@@ -569,7 +602,7 @@ func operatorBucket(origin string) string {
 func (c *OriginRevocationChecker) admit(ctx context.Context, origin string) (*originRevocations, error) {
 	origin, err := webBotAuthOrigin(origin)
 	if err != nil {
-		return nil, &WBAError{Status: http.StatusForbidden, Reason: "invalid signer origin", Wrapped: err}
+		return nil, fmt.Errorf("signing: invalid signer origin: %w", err)
 	}
 	for {
 		c.mu.Lock()
@@ -579,15 +612,18 @@ func (c *OriginRevocationChecker) admit(ctx context.Context, origin string) (*or
 			return state, nil
 		}
 		now := c.clock()
-		if until, ok := c.failures[origin]; ok && now.Before(until) {
+		if f, ok := c.failures[origin]; ok && now.Before(f.until) {
 			c.mu.Unlock()
-			return nil, identityUnavailable("origin revocation discovery is cooling down", nil)
+			if f.noList {
+				return nil, errNoRevocationList
+			}
+			return nil, errors.New("signing: origin revocation discovery is cooling down")
 		}
 		call := c.pending[origin]
 		if call == nil {
 			if len(c.pending) >= c.maxOrigins {
 				c.mu.Unlock()
-				return nil, wbaFail(http.StatusTooManyRequests, "", "origin revocation discovery capacity exceeded")
+				return nil, errors.New("signing: origin revocation discovery capacity exceeded")
 			}
 			op := operatorBucket(origin)
 			n := 0
@@ -598,7 +634,7 @@ func (c *OriginRevocationChecker) admit(ctx context.Context, origin string) (*or
 			}
 			if n >= c.maxPerOperator {
 				c.mu.Unlock()
-				return nil, wbaFail(http.StatusTooManyRequests, "", "operator revocation discovery capacity exceeded")
+				return nil, errors.New("signing: operator revocation discovery capacity exceeded")
 			}
 			call = &revocationCall{done: make(chan struct{})}
 			c.pending[origin] = call
@@ -636,11 +672,18 @@ func (c *OriginRevocationChecker) discover(ctx context.Context, origin string, c
 	defer c.mu.Unlock()
 	delete(c.pending, origin)
 	if err != nil {
-		c.failures[origin] = c.clock().Add(discoveryNegativeTTL)
+		// No list and nothing retained: the origin publishes none. With a
+		// retained list, a 404 is a failure to read it, never a reset.
+		noList := errors.Is(err, errNoRevocationList) && state.current == nil
+		c.failures[origin] = revocationFailure{until: c.clock().Add(discoveryNegativeTTL), noList: noList}
 		if len(c.failures) > c.maxOrigins {
 			c.pruneFailures()
 		}
-		call.err = identityUnavailable("origin revocation list unavailable", err)
+		if noList {
+			call.err = errNoRevocationList
+		} else {
+			call.err = fmt.Errorf("signing: origin revocation list unavailable: %w", err)
+		}
 		return
 	}
 	delete(c.failures, origin)
@@ -679,17 +722,17 @@ func (c *OriginRevocationChecker) evict(e *list.Element) {
 // the negative cache bounded. Called with mu held.
 func (c *OriginRevocationChecker) pruneFailures() {
 	now := c.clock()
-	for o, until := range c.failures {
-		if !now.Before(until) {
+	for o, f := range c.failures {
+		if !now.Before(f.until) {
 			delete(c.failures, o)
 		}
 	}
 	for len(c.failures) > c.maxOrigins {
 		var oldest string
 		var at time.Time
-		for o, until := range c.failures {
-			if oldest == "" || until.Before(at) {
-				oldest, at = o, until
+		for o, f := range c.failures {
+			if oldest == "" || f.until.Before(at) {
+				oldest, at = o, f.until
 			}
 		}
 		delete(c.failures, oldest)
@@ -791,6 +834,9 @@ func (s *originRevocations) fetchList(ctx context.Context, c *OriginRevocationCh
 	if res.Status == http.StatusNotModified && inm+ims != "" {
 		return nil, nil, nil
 	}
+	if res.Status == http.StatusNotFound || res.Status == http.StatusGone {
+		return nil, nil, errNoRevocationList
+	}
 	if res.Status != http.StatusOK {
 		return nil, nil, fmt.Errorf("revocation list returned HTTP %d", res.Status)
 	}
@@ -865,9 +911,8 @@ func (s *originRevocations) commit(c *OriginRevocationChecker, l *RevocationList
 // tenant of a hosting platform's PRIVATE suffix counted together) holds at
 // most historyOriginsPerOperator origins and historyKidsPerOperator kids,
 // and the table at most limit origins and historyKidBudget kids. A store
-// that does not fit fails, so that origin fails closed
-// (SERVICE_UNAVAILABLE) instead of another origin's revocations being
-// forgotten. It lives in memory: public deployments must supply a durable
+// that does not fit fails, so that origin's state is RevocationStale (it
+// cannot spend) instead of another origin's revocations being forgotten. It lives in memory: public deployments must supply a durable
 // History so revocations hold across restarts and replicas.
 type memoryRevocationHistory struct {
 	mu        sync.Mutex

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -22,11 +23,14 @@ import (
 // which may still change. Everything here is opt-in: no existing signer or
 // verifier path uses it unless configured to.
 //
-// Verification establishes an identity, never authority. A verified origin
-// the seller has not bound is identity-established: Middleware allows it
-// only WebBotAuthOptions.UnboundFor, which a seller sets to its anonymous
+// Verification establishes an identity, never authority. It needs only the
+// signer's key directory and replay state (VerifyWebBotAuthRequest), so it
+// can run in front of the server. Revocation, bindings, and grants are the
+// authorization layer that runs after it. A verified origin the seller has
+// not bound is identity-established: Middleware allows it only
+// WebBotAuthOptions.UnboundFor, which a seller sets to its anonymous
 // permissions plus get_principal. Nothing on the signature path reads a
-// trust record.
+// trust record or a revocation list.
 
 const (
 	// ProfileTagWebBotAuth is the Signature-Input tag, and the
@@ -51,37 +55,59 @@ const (
 	acceptSignatureHeader = "Accept-Signature"
 
 	wbaMaxWindowSeconds int64 = 300
-	wbaMinNonceLen      int   = 22 // 128 bits as unpadded base64url
-	wbaMaxNonceLen      int   = 256
+	wbaNonceBytes       int   = 64 // web bot auth architecture draft §4.2.2
 	wbaThumbprintLen    int   = 43 // SHA-256 as unpadded base64url
 )
 
-// WBAError is a Web Bot Auth verification failure, expressed as the HTTP
-// status the profile defines: 400 when the signature fields do not parse,
-// 403 when a signature or a profile check fails, 429 for capacity.
+// validWBANonce reports whether nonce encodes exactly 64 bytes, canonically,
+// as unpadded base64url or padded standard base64: the nonces the Web Bot
+// Auth architecture draft (§4.2.2) describes and Cloudflare's web-bot-auth
+// library accepts.
+func validWBANonce(nonce string) bool {
+	for _, enc := range []*base64.Encoding{base64.RawURLEncoding, base64.StdEncoding} {
+		b, err := enc.DecodeString(nonce)
+		if err == nil && len(b) == wbaNonceBytes && enc.EncodeToString(b) == nonce {
+			return true
+		}
+	}
+	return false
+}
+
+// WBAError is a Web Bot Auth failure. On the signature path it is the HTTP
+// status the profile defines (DR-0023, WBA §5.3 and §5.4): 400 when the
+// signature fields do not parse, 403 when a signature, a profile check, or
+// key discovery fails (with Accept-Signature, except for a revoked key), and
+// 429 for capacity. Any body is the generic authentication error.
 //
-// Authorization is set once identity is established (the signature
-// verified). Every such outcome is answered with the standard AdCP error
-// envelope, never 403 with Accept-Signature, which would tell a correctly
-// signing agent to sign again. Code is the AdCP error code
-// (PERMISSION_DENIED when empty, or SERVICE_UNAVAILABLE for a retryable
-// outage on a spend-committing call).
+// DiscoveryFailure marks a signature that could not be verified because the
+// signer's key directory could not be resolved (WBA §6.10: a network or TLS
+// error, a timeout, any status other than 200, or a response that is not a
+// valid directory). The request is unverified, which says nothing about the
+// signer; Middleware applies WebBotAuthOptions.OnDiscoveryFailure.
+//
+// Revoked marks a key the signer's origin has revoked: 403 without
+// Accept-Signature, so the signer does not sign again with the same key.
+//
+// Authorization is set for an authorization-layer outcome once identity is
+// established. It is answered with the standard AdCP error envelope, never
+// 403 with Accept-Signature, which would tell a correctly signing agent to
+// sign again. Code is its AdCP error code (PERMISSION_DENIED when empty, or
+// SERVICE_UNAVAILABLE for a retryable outage).
 //
 // Reason is for server-side logs only and must never be sent to the caller.
 type WBAError struct {
-	Status        int
-	Reason        string
-	Label         string
-	Authorization bool
-	Code          string
-	Wrapped       error
+	Status           int
+	Reason           string
+	Label            string
+	Authorization    bool
+	Code             string
+	DiscoveryFailure bool
+	Revoked          bool
+	Wrapped          error
 
 	// labels are the request's web-bot-auth labels in order, used to build
 	// Accept-Signature.
 	labels []string
-
-	// outage marks a signer-side outage (ErrIdentityUnavailable).
-	outage bool
 }
 
 func (e *WBAError) Error() string {
@@ -107,24 +133,20 @@ func wbaDeny(reason string) *WBAError {
 	return &WBAError{Status: http.StatusForbidden, Reason: reason, Authorization: true, Code: CodePermissionDenied}
 }
 
-// ErrIdentityUnavailable is matched (errors.Is) by a *WBAError for a
-// signer-side outage: the verifier could not confirm the signer's identity
-// because its key directory could not be fetched (a network error, a 5xx,
-// a timeout) or its revocation list could not be read or is stale past
-// grace. Such a request is answered with SERVICE_UNAVAILABLE (503,
-// retryable, Retry-After, AdCP envelope, no Accept-Signature), and nothing
-// is served under the signature: no anonymous fallback.
-var ErrIdentityUnavailable = errors.New("signing: signer identity cannot be confirmed (outage)")
+// ErrDiscoveryFailure is matched (errors.Is) by a *WBAError whose signature
+// could not be verified because the signer's key directory could not be
+// resolved and no unexpired cached copy holds the key (WBA §6.10).
+var ErrDiscoveryFailure = errors.New("signing: signer key directory discovery failed")
 
-// IsIdentityUnavailable reports whether err is a signer-side outage.
-func IsIdentityUnavailable(err error) bool { return errors.Is(err, ErrIdentityUnavailable) }
+// IsDiscoveryFailure reports whether err is a key discovery failure.
+func IsDiscoveryFailure(err error) bool { return errors.Is(err, ErrDiscoveryFailure) }
 
-func identityUnavailable(reason string, wrapped error) *WBAError {
-	return &WBAError{Status: http.StatusServiceUnavailable, Code: CodeServiceUnavailable, Reason: reason, Wrapped: wrapped, outage: true}
+func discoveryFailure(reason string, wrapped error) *WBAError {
+	return &WBAError{Status: http.StatusForbidden, Reason: reason, Wrapped: wrapped, DiscoveryFailure: true}
 }
 
-// Is reports a signer-side outage as ErrIdentityUnavailable.
-func (e *WBAError) Is(target error) bool { return target == ErrIdentityUnavailable && e.outage }
+// Is reports a discovery failure as ErrDiscoveryFailure.
+func (e *WBAError) Is(target error) bool { return target == ErrDiscoveryFailure && e.DiscoveryFailure }
 
 // AdCP error codes used for authorization outcomes after identity is
 // established.
@@ -153,7 +175,8 @@ var spendCommittingOperations = map[string]struct{}{
 }
 
 // IsSpendCommittingOperation reports whether op commits spend: the
-// operations a trust-record or revocation outage fails closed for. It
+// operations a trust-record or revocation outage fails closed for in the
+// authorization layer. It
 // covers create_media_buy, update_media_buy, buy_products, accept_proposal,
 // activate_signal, and every acquire_* operation.
 func IsSpendCommittingOperation(op string) bool {
@@ -164,12 +187,12 @@ func IsSpendCommittingOperation(op string) bool {
 }
 
 // ResponseHeader returns the headers to send with the failure: for a 403
-// that is not an authorization failure, Accept-Signature (RFC 9421 §5.1)
-// naming the components and parameters the profile requires, with a fresh
-// nonce the signer may use on its next attempt.
+// signature failure other than a revoked key, Accept-Signature (RFC 9421
+// §5.1) naming the components and parameters the profile requires, with a
+// fresh nonce the signer may use on its next attempt.
 func (e *WBAError) ResponseHeader() http.Header {
 	h := http.Header{}
-	if e.Status != http.StatusForbidden || e.Authorization {
+	if e.Status != http.StatusForbidden || e.Authorization || e.Revoked {
 		return h
 	}
 	labels := e.labels
@@ -216,7 +239,7 @@ func acceptSignatureValue(labels []string, nonce func() string) string {
 }
 
 func newWBANonce() string {
-	var b [32]byte
+	var b [wbaNonceBytes]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return ""
 	}
@@ -260,22 +283,73 @@ type WBAKeyResolver interface {
 	ResolveWBAKey(ctx context.Context, origin, keyID string) (*JWK, error)
 }
 
-// WBARevocationChecker reports whether origin has revoked keyID in its
-// signed revocation list (/.well-known/governance-revocations.json). An
-// error means the status is unknown; verification then fails closed.
-// OriginRevocationChecker is the production implementation.
-type WBARevocationChecker interface {
-	RevokedWBAKey(ctx context.Context, origin, keyID string) (bool, error)
+// RevocationState is a verified key's status in its origin's revocation
+// list, established in the authorization layer after verification.
+type RevocationState int
+
+const (
+	// RevocationUnchecked: no revocation checker ran.
+	RevocationUnchecked RevocationState = iota
+	// RevocationCurrent: a list within its freshness (or grace) does not
+	// revoke the key.
+	RevocationCurrent
+	// RevocationRevoked: the origin revoked the key. The request is
+	// refused with 403, without Accept-Signature.
+	RevocationRevoked
+	// RevocationNoList: the origin serves no revocation list. The identity
+	// is identity-established and cannot be bound for spend.
+	RevocationNoList
+	// RevocationStale: the list could not be read, or is past its
+	// next_update plus grace. The identity is not established for spend:
+	// spend-committing calls fail closed with SERVICE_UNAVAILABLE in the
+	// authorization layer.
+	RevocationStale
+)
+
+// String returns the state's name, for logs.
+func (s RevocationState) String() string {
+	switch s {
+	case RevocationCurrent:
+		return "current"
+	case RevocationRevoked:
+		return "revoked"
+	case RevocationNoList:
+		return "no_list"
+	case RevocationStale:
+		return "stale"
+	default:
+		return "unchecked"
+	}
 }
 
-// WBAVerifyOptions configures VerifyWebBotAuthRequest. Keys, Revocation,
-// and Replay are required.
+// WBARevocationChecker reports a key's state in origin's signed revocation
+// list (/.well-known/governance-revocations.json). The error, when non-nil,
+// explains a RevocationStale or RevocationNoList result for logs. It runs in
+// the authorization layer, after verification. OriginRevocationChecker is
+// the production implementation.
+type WBARevocationChecker interface {
+	CheckWBAKey(ctx context.Context, origin, keyID string) (RevocationState, error)
+}
+
+// CheckWBARevocation runs checker for every verified signer and records each
+// result in VerifiedSigner.Revocation. A revoked key, the originator's or a
+// relay's, returns a *WBAError with Revoked set (403, no Accept-Signature).
+func CheckWBARevocation(ctx context.Context, checker WBARevocationChecker, signers []*VerifiedSigner) error {
+	for _, s := range signers {
+		state, err := checker.CheckWBAKey(ctx, s.AgentURL, s.KeyID)
+		s.Revocation = state
+		if state == RevocationRevoked {
+			return &WBAError{Status: http.StatusForbidden, Label: s.Label, Reason: "signing key revoked", Revoked: true, Wrapped: err}
+		}
+	}
+	return nil
+}
+
+// WBAVerifyOptions configures VerifyWebBotAuthRequest. Keys and Replay are
+// required.
 type WBAVerifyOptions struct {
 	// Keys resolves (origin, thumbprint) to a directory key.
 	Keys WBAKeyResolver
-
-	// Revocation checks each verified key against its origin's list.
-	Revocation WBARevocationChecker
 
 	// Replay records each signature's nonce per identity. The identity, not
 	// the key, scopes the nonce, so key rotation does not reopen a replay.
@@ -303,7 +377,7 @@ type WBAVerifyOptions struct {
 }
 
 // errWBANotConfigured reports a verifier missing a required dependency.
-var errWBANotConfigured = errors.New("signing: Web Bot Auth verification requires Keys, Revocation, and Replay")
+var errWBANotConfigured = errors.New("signing: Web Bot Auth verification requires Keys and Replay")
 
 // VerifyWebBotAuthRequest verifies every web-bot-auth signature on r and
 // returns the verified signers in Signature-Input order. The first is the
@@ -311,11 +385,12 @@ var errWBANotConfigured = errors.New("signing: Web Bot Auth verification require
 // the signatures before it. Each VerifiedSigner's AgentURL is the signer's
 // canonical origin and its KeyID is the key's thumbprint.
 //
-// A failure is a *WBAError carrying the status to answer. A signer-side
-// outage (key directory or revocation list unavailable) matches
-// ErrIdentityUnavailable and must be answered with SERVICE_UNAVAILABLE,
-// serving nothing. The function verifies identity only: it reads no trust
-// record and grants no authority.
+// A failure is a *WBAError carrying the status to answer. A signature whose
+// key directory cannot be resolved matches ErrDiscoveryFailure: the request
+// is unverified, and what to do with it is local policy (WBA §6.10). The
+// function verifies identity only, from the key directory and replay state:
+// it reads no revocation list and no trust record, and grants no authority.
+// Run CheckWBARevocation, then bindings and grants, after it.
 //
 // A non-empty signed body must be strict JSON (AdCP bodies are JSON-RPC
 // or JSON): one value, no duplicate keys, including keys that differ only
@@ -330,7 +405,7 @@ func VerifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*Verifie
 
 func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*VerifiedSigner, []string, error) {
 	var labels []string
-	if opts.Keys == nil || opts.Revocation == nil || opts.Replay == nil {
+	if opts.Keys == nil || opts.Replay == nil {
 		return nil, nil, errWBANotConfigured
 	}
 	clock := opts.Clock
@@ -393,7 +468,7 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*Verifie
 	if err != nil {
 		return nil, labels, wbaFail(http.StatusForbidden, wba[0].label, "request body unreadable or too large")
 	}
-	requestURL := reconstructRequestURL(r, scheme)
+	requestURL := receivedTargetURI(r, scheme)
 	if len(opts.Authorities) > 0 {
 		u, err := url.Parse(requestURL)
 		if err != nil || !authorityAllowed(canonicalAuthority(u.Host, strings.ToLower(u.Scheme)), strings.ToLower(u.Scheme), opts.Authorities) {
@@ -414,8 +489,8 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*Verifie
 			return nil, labels, err
 		}
 		nonce, ok := stringParam(member.params, "nonce")
-		if !ok || len(nonce) < wbaMinNonceLen || len(nonce) > wbaMaxNonceLen {
-			return nil, labels, wbaFail(http.StatusForbidden, label, "missing or invalid nonce")
+		if !ok || !validWBANonce(nonce) {
+			return nil, labels, wbaFail(http.StatusForbidden, label, "missing nonce, or not 64 bytes in canonical base64")
 		}
 		agent, ok := agents.get(label)
 		if !ok || agent.inner || agent.item.value.kind != sfString {
@@ -488,20 +563,6 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*Verifie
 		if len(body) > 0 && !wbaDigestMatches(r.Header.Get(contentDigestHeader), body) {
 			return nil, labels, wbaFail(http.StatusForbidden, label, "request digest mismatch")
 		}
-		// The signature verified. A revocation list that cannot be read, or
-		// is stale past grace, leaves identity unconfirmed: a signer-side
-		// outage. Serve nothing under the signature (SERVICE_UNAVAILABLE),
-		// never 403 with Accept-Signature and never an anonymous fallback.
-		revoked, err := opts.Revocation.RevokedWBAKey(r.Context(), origin, keyID)
-		if err != nil {
-			if we := AsWBAError(err); we != nil && (we.Authorization || we.Status == http.StatusTooManyRequests || we.Code == CodeServiceUnavailable) {
-				return nil, labels, we
-			}
-			return nil, labels, identityUnavailable("origin revocation status unavailable", err)
-		}
-		if revoked {
-			return nil, labels, wbaDeny("signing key revoked")
-		}
 		expires, _ := intParam(member.params, "expires")
 		// One extra second keeps the entry alive through the last second
 		// of the window.
@@ -565,6 +626,41 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*Verifie
 		out[i] = c.signer
 	}
 	return out, labels, nil
+}
+
+// receivedTargetURI returns the request's target URI as received (RFC 9421
+// §2.2.2): the scheme, the Host field, and the request-target exactly as it
+// arrived, so percent-encoding is preserved. An absolute-form
+// request-target is used as is.
+func receivedTargetURI(r *http.Request, scheme string) string {
+	target := r.RequestURI
+	switch {
+	case strings.HasPrefix(target, "/"):
+		return scheme + "://" + r.Host + target
+	case target != "" && target != "*":
+		if u, err := url.Parse(target); err == nil && u.IsAbs() {
+			return target
+		}
+	}
+	host := r.Host
+	if host == "" {
+		host = r.URL.Host
+	}
+	if r.URL.IsAbs() {
+		scheme = r.URL.Scheme
+	}
+	return scheme + "://" + host + r.URL.RequestURI()
+}
+
+// sentTargetURI returns the target URI a client request will carry on the
+// wire: Go writes the request-target as URL.RequestURI() and the Host field
+// from Request.Host, else URL.Host.
+func sentTargetURI(r *http.Request) string {
+	host := r.Host
+	if host == "" {
+		host = r.URL.Host
+	}
+	return r.URL.Scheme + "://" + host + r.URL.RequestURI()
 }
 
 func authorityAllowed(authority, scheme string, allowed []string) bool {
@@ -649,9 +745,10 @@ func wbaWindow(member sfMember, now int64, directory bool, label string) error {
 	return nil
 }
 
-// wbaSignatureBase builds the RFC 9421 §2.5 signature base for member. The
-// derived components use the AdCP canonicalization shared with the RFC 9421
-// profile. A field component is the field's value, or with a key parameter
+// wbaSignatureBase builds the RFC 9421 §2.5 signature base for member.
+// rawURL is the target URI as sent or received, and @target-uri is that
+// string unchanged; @authority is its normalized authority. A field
+// component is the field's value, or with a key parameter
 // the re-serialized Dictionary member; @signature-params is the
 // re-serialized Inner List. A directory response signature may cover
 // "@authority";req, the authority of the request the response answers.
@@ -677,11 +774,13 @@ func wbaSignatureBase(method, rawURL string, h http.Header, member sfMember, dir
 			case componentMethod:
 				value = strings.ToUpper(method)
 			case componentTargetURI:
-				value, err = canonicalTargetURI(rawURL)
-				if err != nil {
-					return "", wbaFail(http.StatusForbidden, "", "request URL cannot be canonicalized")
-				}
+				// The target URI as received (RFC 9421 §2.2.2), not
+				// canonicalized: a signer built on another HTTP stack signs
+				// the URI it sent, percent-encoding included.
+				value = rawURL
 			case componentAuthority:
+				// RFC 9421 §2.2.3: the authority normalized per HTTP
+				// §4.2.3 (lowercase host, default port omitted).
 				value = canonicalAuthority(u.Host, strings.ToLower(u.Scheme))
 			default:
 				return "", wbaFail(http.StatusForbidden, "", "unsupported derived component")
@@ -723,7 +822,8 @@ func wbaSignatureBase(method, rawURL string, h http.Header, member sfMember, dir
 }
 
 // wbaKeyAlgorithm derives the signature algorithm from a directory key and
-// checks the key may verify: Ed25519 or P-256, use "sig" when present, no
+// checks the key may verify: Ed25519, P-256, or RSA (2048 to 8192 bits,
+// rsa-pss-sha512), use "sig" when present, no
 // private member, a matching alg when present, and key_ops containing
 // "verify" when present.
 func wbaKeyAlgorithm(jwk JWK) (Algorithm, error) {
@@ -734,6 +834,11 @@ func wbaKeyAlgorithm(jwk JWK) (Algorithm, error) {
 		alg, jwsAlg = AlgEd25519, string(jwkAlgEdDSA)
 	case jwk.Kty == "EC" && jwk.Crv == "P-256":
 		alg, jwsAlg = AlgES256, string(jwkAlgES256)
+	case jwk.Kty == "RSA" && jwk.Crv == "":
+		if _, err := rsaPublicKey(jwk); err != nil {
+			return "", wbaFail(http.StatusForbidden, "", "unsupported RSA directory key")
+		}
+		alg, jwsAlg = AlgRSAPSSSHA512, jwkAlgPS512
 	default:
 		return "", wbaFail(http.StatusForbidden, "", "unsupported directory key")
 	}
@@ -769,11 +874,7 @@ func wbaVerifyCrypto(member, signature sfMember, jwk JWK, base string) (Algorith
 	if signature.inner || signature.item.value.kind != sfBinary {
 		return "", wbaFail(http.StatusBadRequest, "", "signature must be sf-binary")
 	}
-	pub, err := jwk.PublicKey()
-	if err != nil {
-		return "", wbaFail(http.StatusForbidden, "", "invalid directory key")
-	}
-	if !verifySignature(alg, pub, []byte(base), signature.item.value.b) {
+	if !verifyWithJWK(alg, jwk, []byte(base), signature.item.value.b) {
 		return "", wbaFail(http.StatusForbidden, "", "signature did not verify")
 	}
 	return alg, nil

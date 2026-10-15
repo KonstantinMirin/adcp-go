@@ -19,14 +19,18 @@ import (
 // TrustRecordError is a trust record that provides no authority. It is
 // one of two kinds, which the spec treats differently for a bound origin:
 //   - not listed (Unlisted or Absent): the operator's record was read and
-//     does not list the origin with the role, publishes no record (a 404 or
-//     410 before any 200 from that operator), or the origin has no
-//     registrable domain. A bound origin falls back to identity-established.
-//     Absent is also the one case that permits a configured legacy
-//     (brand.json) fallback for grants.
-//   - unavailable (neither flag): the record could not be fetched or read.
-//     A fetch failure is never absence: spend-committing calls fail with
-//     SERVICE_UNAVAILABLE, other calls continue under the cached binding.
+//     does not list the origin with the role, the operator has never
+//     published one (a 404 or 410 before any 200 from it), or the origin
+//     has no registrable domain. A bound origin falls back to
+//     identity-established. Absent is also the one case that permits a
+//     configured legacy (brand.json) fallback for grants.
+//   - unavailable (neither flag): the record could not be fetched or read,
+//     including a 404 or 410 from an operator that has served a record: a
+//     discovery failure, never absence and never a removal. The last record
+//     read stays authoritative (operators retire agents by publishing an
+//     empty agents[]); spend-committing calls fail with SERVICE_UNAVAILABLE,
+//     and other calls may continue on the last record within the seller's
+//     OutageContinuation bound.
 type TrustRecordError struct {
 	Absent   bool
 	Unlisted bool
@@ -94,10 +98,10 @@ type EvaluatedTrustRecord struct {
 	SourceURL      string
 	Record         *TrustRecord
 	ExpiresAt      time.Time
-	// Removed reports a record that was read before and is now gone (404
-	// or 410): a removal, not an outage. Record is then empty, so it lists
-	// no agent and makes no grant, and no legacy fallback applies.
-	Removed bool
+	// Stale reports the last record read, returned during an outage within
+	// the evaluator's OutageContinuation bound; ExpiresAt is then the end of
+	// that bound.
+	Stale bool
 }
 
 // Agent returns the record's single agents[] entry for origin with role.
@@ -122,6 +126,13 @@ type TrustRecordEvaluatorOptions struct {
 	// bounded in-memory history; public deployments must supply a durable
 	// one. See AuthorityHistory.
 	History AuthorityHistory
+	// OutageContinuation is seller policy: how long past its freshness the
+	// last record read keeps authorizing non-spend calls (bindings, and
+	// grants for non-spend operations) while the operator's record cannot
+	// be read. Spend-committing calls never continue on a stale record.
+	// Defaults to 4x PollingInterval; a negative value disables
+	// continuation.
+	OutageContinuation time.Duration
 	// Clock defaults to time.Now.
 	Clock func() time.Time
 }
@@ -145,6 +156,7 @@ type TrustRecordEvaluator struct {
 	maxRecords int
 	maxPerHost int
 	clock      func() time.Time
+	outage     time.Duration
 
 	mu       sync.Mutex
 	cache    map[string]*cachedRecord
@@ -206,6 +218,7 @@ func NewTrustRecordEvaluator(opts TrustRecordEvaluatorOptions) (*TrustRecordEval
 		failures:        map[string]trustFailure{},
 		pending:         map[string]*trustCall{},
 		history:         opts.History,
+		outage:          opts.OutageContinuation,
 		responses:       map[string]cachedResponse{},
 		responsePending: map[string]*responseCall{},
 		hostsInflight:   map[string]int{},
@@ -219,6 +232,12 @@ func NewTrustRecordEvaluator(opts TrustRecordEvaluatorOptions) (*TrustRecordEval
 	}
 	if e.maxRecords <= 0 {
 		e.maxRecords = 256
+	}
+	switch {
+	case e.outage == 0:
+		e.outage = 4 * e.interval
+	case e.outage < 0:
+		e.outage = 0
 	}
 	if e.maxPerHost <= 0 {
 		e.maxPerHost = 4
@@ -396,10 +415,11 @@ func (e *TrustRecordEvaluator) resolve(ctx context.Context, domain, recordURL st
 				return nil, trustErr("trust record history unavailable", herr)
 			}
 			if state.Served {
-				// A record read before and now gone is a removal: every
-				// origin it listed is delisted, and brand.json does not
-				// come back.
-				return &EvaluatedTrustRecord{OperatorDomain: domain, SourceURL: source, Record: &TrustRecord{}, ExpiresAt: expires, Removed: true}, nil
+				// The operator has published a record: a 404 now is a
+				// discovery failure, not absence and not a removal. The
+				// last record read stays authoritative, and brand.json
+				// does not come back.
+				return nil, trustErr(fmt.Sprintf("trust record not found (HTTP %d) after the operator published one", status), nil)
 			}
 			if hop == 0 {
 				return nil, &TrustRecordError{Absent: true, Reason: "no trust record is published"}
@@ -472,8 +492,9 @@ type Listing struct {
 	// Record is the evaluated record when Listed.
 	Record *EvaluatedTrustRecord
 	// WithinGrace, for Unavailable, reports that the last record that
-	// listed the origin is within 4x the polling interval past its
-	// freshness, so non-spend calls may continue under a binding.
+	// listed the origin is within the OutageContinuation bound past its
+	// freshness, so non-spend calls may continue under a binding. Record is
+	// then that last record, marked Stale, expiring at the bound.
 	WithinGrace bool
 	// Err is the evaluation error, for logs.
 	Err error
@@ -484,14 +505,15 @@ type Listing struct {
 // never restores access.
 //   - The last record read stays authoritative: if it did not list the
 //     origin, the origin stays Unlisted even when a refresh fails, whatever
-//     the cause (including a rate or concurrency cap).
-//   - A 404 or 410 is Unlisted: after a record has been read it is a
-//     removal, and without that history (another replica, a restart) a
-//     bound origin's operator was once authoritative anyway, so the result
-//     is the same on every replica.
+//     the cause (including a rate or concurrency cap, or a 404 after the
+//     operator published a record).
+//   - A 404 or 410 from an operator that has never published a record is
+//     Unlisted (no record).
 //   - Otherwise an unreadable record is Unavailable, WithinGrace while the
-//     last record that listed the origin is no more than 4x the polling
-//     interval past its freshness.
+//     last record that listed the origin is no more than OutageContinuation
+//     past its freshness. Without authority history (another replica, a
+//     restart, no durable History) there is no last record, and an outage
+//     is Unavailable without grace.
 func (e *TrustRecordEvaluator) CheckListing(ctx context.Context, origin, role string) Listing {
 	rec, err := e.Evaluate(ctx, origin, role)
 	if err == nil {
@@ -513,8 +535,45 @@ func (e *TrustRecordEvaluator) CheckListing(ctx context.Context, origin, role st
 	if _, merr := last.Agent(origin, role); merr != nil {
 		return Listing{Status: Unlisted, Err: err}
 	}
-	grace := 4 * e.interval
-	return Listing{Status: Unavailable, WithinGrace: e.clock().Before(last.ExpiresAt.Add(grace)), Err: err}
+	l := Listing{Status: Unavailable, Err: err}
+	if stale := e.staleWithinBound(last); stale != nil {
+		l.WithinGrace, l.Record = true, stale
+	}
+	return l
+}
+
+// staleWithinBound returns a copy of last marked Stale and expiring at the
+// OutageContinuation bound, or nil when the bound has passed.
+func (e *TrustRecordEvaluator) staleWithinBound(last *EvaluatedTrustRecord) *EvaluatedTrustRecord {
+	until := last.ExpiresAt.Add(e.outage)
+	if e.outage <= 0 || !e.clock().Before(until) {
+		return nil
+	}
+	stale := last.clone()
+	stale.ExpiresAt, stale.Stale = until, true
+	return stale
+}
+
+// evaluateForGrant evaluates a grantor's or intermediary's record. During
+// an outage a non-spend claim continues on the last record read within the
+// OutageContinuation bound; a spend claim never does.
+func (e *TrustRecordEvaluator) evaluateForGrant(ctx context.Context, domain string, spend bool) (*EvaluatedTrustRecord, error) {
+	rec, err := e.Evaluate(ctx, domain, "")
+	if err == nil || spend || !IsTrustRecordUnavailable(err) {
+		return rec, err
+	}
+	operator, ok := psl.RegistrableDomain(domain)
+	if !ok {
+		return nil, err
+	}
+	state, herr := e.history.LoadAuthority(ctx, operator)
+	if herr != nil || state.LastRecord == nil {
+		return nil, err
+	}
+	if stale := e.staleWithinBound(state.LastRecord); stale != nil {
+		return stale, nil
+	}
+	return nil, err
 }
 
 // fetchResponse shares transport bytes per URL while each owner validates
@@ -620,14 +679,25 @@ func (e *TrustRecordEvaluator) coolHost(host string, now time.Time) {
 	}
 }
 
+// ErrRevocationListRequired is returned by Bind for a signer whose origin
+// does not serve a current revocation list (VerifiedSigner.Revocation is
+// not RevocationCurrent): an identity that serves no revocation list stays
+// identity-established and cannot be bound for spend.
+var ErrRevocationListRequired = errors.New("identity: binding requires the origin to serve a current revocation list")
+
 // Bind evaluates the trust record of a verified Web Bot Auth signer's
 // operator, which must list the signer's origin with role (default
-// adcp:buying), and then records the binding in store. This is the explicit,
+// adcp:buying), and then records the binding in store. The signer must
+// carry a current revocation state (run signing.CheckWBARevocation first;
+// Middleware does). This is the explicit,
 // audited seller decision that turns an identity-established origin into a
 // principal; verification alone never does.
 func (e *TrustRecordEvaluator) Bind(ctx context.Context, signer *signing.VerifiedSigner, principalID string, store BindingStore, opts BindOptions) (*EvaluatedTrustRecord, error) {
 	if signer == nil || signer.Profile != signing.ProfileTagWebBotAuth || signer.AgentURL == "" {
 		return nil, errors.New("identity: binding requires a verified Web Bot Auth identity")
+	}
+	if signer.Revocation != signing.RevocationCurrent {
+		return nil, ErrRevocationListRequired
 	}
 	role := opts.Role
 	if role == "" {

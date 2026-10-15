@@ -3,7 +3,6 @@ package identity
 import (
 	"context"
 	"errors"
-	"slices"
 	"strings"
 	"sync"
 
@@ -91,45 +90,39 @@ func (b *OriginBindings) PrincipalForOrigin(_ context.Context, origin string) (s
 // BindingGate is the signing.WBAAuthorizer that turns a verified origin
 // into a principal. An unbound origin is identity-established (it returns
 // ""; the middleware then serves it as an anonymous caller beyond
-// UnboundFor). A bound origin is re-evaluated against its operator's trust
-// record on every request, through the evaluator's cache, which is bounded
-// by the revocation polling interval:
-//   - listed with the role: the bound principal;
-//   - delisted (the record no longer lists it, or no record is published):
-//     identity-established again, as at first contact, except that it may
-//     still poll and cancel tasks it created while listed (TaskOperations
-//     keep the principal; the application must scope task lookups to the
-//     principal, as it does for any caller). The binding itself is kept,
-//     so the origin still cannot fall back to the RFC 9421 profile, and
-//     TrustRecordEvaluator.Bind refuses to bind it again while it stays
-//     unlisted;
-//   - record unreadable (a fetch failure is never a delisting, and an
-//     outage never restores access): if the last record read did not list
-//     the origin, it stays delisted; otherwise a spend-committing
-//     operation fails with the retryable SERVICE_UNAVAILABLE, and any other
-//     operation continues under the binding only while the last record
-//     that listed the origin is within 4x the polling interval past its
-//     freshness, then also gets SERVICE_UNAVAILABLE. A 404 or 410 is a
-//     removal (delisted), on every replica.
+// UnboundFor). A bound origin needs a revocation list and a current
+// listing:
+//   - its key's revocation state (VerifiedSigner.Revocation, from the
+//     middleware's revocation check): an origin that serves no revocation
+//     list, or one no checker ran for, is identity-established and cannot
+//     act for its principal; while its list is stale (unreadable, or past
+//     next_update plus grace), a spend-committing operation fails with the
+//     retryable SERVICE_UNAVAILABLE;
+//   - its operator's trust record, re-evaluated on every request through
+//     the evaluator's cache, which is bounded by the revocation polling
+//     interval. Listed with the role: the bound principal. Delisted (the
+//     last record read does not list it, or the operator never published
+//     one): identity-established, as at first contact, with no exception.
+//     The binding itself is kept, so the origin still cannot fall back to
+//     the RFC 9421 profile, and TrustRecordEvaluator.Bind refuses to bind it
+//     again while it stays unlisted. Record unreadable (a fetch failure,
+//     including a 404 after the operator published a record, is never a
+//     delisting, and an outage never restores access): a spend-committing
+//     operation fails with SERVICE_UNAVAILABLE, and any other operation
+//     continues under the binding only while the last record that listed
+//     the origin is within the evaluator's OutageContinuation bound (seller
+//     policy, 4x the polling interval by default), then also gets
+//     SERVICE_UNAVAILABLE.
 type BindingGate struct {
 	Bindings signing.OriginBindingLookup
 	Records  *TrustRecordEvaluator
 	// Role defaults to adcp:buying. Configure the role your receiving
 	// surface needs.
 	Role string
-	// SpendCommitting classifies operations for the outage rule. Defaults
+	// SpendCommitting classifies operations for the outage rules. Defaults
 	// to signing.IsSpendCommittingOperation.
 	SpendCommitting func(operation string) bool
-	// TaskOperations are the task polling and cancellation operations a
-	// delisted origin may still call for work it started while listed (the
-	// one exception to its demotion). Defaults to DefaultTaskOperations.
-	TaskOperations []string
 }
-
-// DefaultTaskOperations are the AdCP and protocol task polling and
-// cancellation operations: get_task_status, tasks/get, tasks/result, and
-// tasks/cancel.
-var DefaultTaskOperations = []string{"get_task_status", "tasks/get", "tasks/result", "tasks/cancel"}
 
 // AuthorizeWBA implements signing.WBAAuthorizer.
 func (g *BindingGate) AuthorizeWBA(ctx context.Context, signer *signing.VerifiedSigner, operation string) (string, error) {
@@ -141,6 +134,21 @@ func (g *BindingGate) AuthorizeWBA(ctx context.Context, signer *signing.Verified
 		return "", signing.NewAuthorizationError(signing.CodeServiceUnavailable, "binding lookup failed", err)
 	}
 	if !bound {
+		return "", nil
+	}
+	spend := signing.IsSpendCommittingOperation(operation)
+	if g.SpendCommitting != nil {
+		spend = g.SpendCommitting(operation)
+	}
+	switch signer.Revocation {
+	case signing.RevocationCurrent:
+	case signing.RevocationStale:
+		if spend {
+			return "", signing.NewAuthorizationError(signing.CodeServiceUnavailable, "origin revocation list is stale", nil)
+		}
+	default:
+		// No revocation list (or no check): identity-established, never
+		// bound for spend.
 		return "", nil
 	}
 	if g.Records == nil {
@@ -155,25 +163,10 @@ func (g *BindingGate) AuthorizeWBA(ctx context.Context, signer *signing.Verified
 	case Listed:
 		return principal, nil
 	case Unlisted:
-		// Delisted, removed, or never published: identity-established
-		// again. A stale delisting stays a delisting through an outage. The
-		// one exception is work already in flight: task polling and
-		// cancellation keep the principal, so the application can scope
-		// them to the tasks that principal created while listed. Nothing
-		// new starts under the binding.
-		ops := g.TaskOperations
-		if ops == nil {
-			ops = DefaultTaskOperations
-		}
-		if slices.Contains(ops, operation) {
-			return principal, nil
-		}
+		// Delisted or never published: identity-established again. A
+		// stale delisting stays a delisting through an outage.
 		return "", nil
 	default:
-		spend := signing.IsSpendCommittingOperation(operation)
-		if g.SpendCommitting != nil {
-			spend = g.SpendCommitting(operation)
-		}
 		if spend || !l.WithinGrace {
 			return "", signing.NewAuthorizationError(signing.CodeServiceUnavailable, "operator trust record unavailable", l.Err)
 		}

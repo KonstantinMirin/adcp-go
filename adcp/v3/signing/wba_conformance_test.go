@@ -105,10 +105,6 @@ func (s staticWBAKeys) ResolveWBAKey(_ context.Context, origin, keyID string) (*
 	return nil, nil
 }
 
-type noRevocations struct{}
-
-func (noRevocations) RevokedWBAKey(context.Context, string, string) (bool, error) { return false, nil }
-
 func vectorDirectories(t *testing.T, v wbaVector, keys map[string]wbaVectorKey) staticWBAKeys {
 	t.Helper()
 	dirs := staticWBAKeys{}
@@ -143,10 +139,9 @@ func verifyWBAVector(t *testing.T, v wbaVector, keys map[string]wbaVectorKey) ([
 		}
 	}
 	return VerifyWebBotAuthRequest(vectorRequest(v), WBAVerifyOptions{
-		Keys:       vectorDirectories(t, v, keys),
-		Revocation: noRevocations{},
-		Replay:     replay,
-		Clock:      func() time.Time { return time.Unix(v.ReferenceNow, 0) },
+		Keys:   vectorDirectories(t, v, keys),
+		Replay: replay,
+		Clock:  func() time.Time { return time.Unix(v.ReferenceNow, 0) },
 	})
 }
 
@@ -212,7 +207,7 @@ func TestWBANegativeVectors(t *testing.T) {
 				}
 				nonce, ok := stringParam(m.params, "nonce")
 				require.True(t, ok)
-				require.GreaterOrEqual(t, len(nonce), wbaMinNonceLen)
+				require.True(t, validWBANonce(nonce), "the offered nonce is 64 bytes")
 			} else {
 				require.Empty(t, h.Get(acceptSignatureHeader))
 			}

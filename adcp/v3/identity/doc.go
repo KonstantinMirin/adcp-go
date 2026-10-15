@@ -28,5 +28,19 @@
 // re-evaluated at least as often as the revocation polling interval, and it
 // maps an origin to one principal. Binding onto a principal that already
 // uses the RFC 9421 profile needs explicit approval, and a bound origin is
-// refused the RFC 9421 profile (signing.MiddlewareOptions.BoundOrigins).
+// refused the RFC 9421 profile (signing.MiddlewareOptions.BoundOrigins). An
+// origin must serve a current revocation list to be bound; one that serves
+// none stays identity-established.
+//
+// # Outages
+//
+// A trust record that cannot be read, including a 404 or 410 after the
+// operator published one, is a discovery failure: never absence, never a
+// delisting, and never a reason to fall back to brand.json. The last record
+// read stays authoritative; operators retire an agent by publishing an empty
+// agents[]. Spend-committing calls fail with SERVICE_UNAVAILABLE during an
+// outage, as they do while the signer's revocation list is stale. Other calls
+// may continue on the last record within TrustRecordEvaluatorOptions.
+// OutageContinuation, which is seller policy (4x the polling interval by
+// default).
 package identity

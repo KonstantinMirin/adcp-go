@@ -1,8 +1,10 @@
 package signing
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -136,7 +138,7 @@ func TestWBASignVerifyRoundTrip(t *testing.T) {
 			if tc.body == "" {
 				require.Empty(t, r.Header.Get("Content-Digest"))
 			}
-			signers, err := VerifyWebBotAuthRequest(r, WBAVerifyOptions{Keys: resolver, Revocation: noRevocations{}, Replay: NewMemoryReplayStore(0), Clock: wbaClock})
+			signers, err := VerifyWebBotAuthRequest(r, WBAVerifyOptions{Keys: resolver, Replay: NewMemoryReplayStore(0), Clock: wbaClock})
 			require.NoError(t, err)
 			require.Len(t, signers, 1)
 			jwk, _ := PublicDirectoryKey(tc.key)
@@ -171,13 +173,20 @@ func TestWBARejections(t *testing.T) {
 		body   string
 		tamper tamper
 		status int
-		authz  bool
+		// discovery marks a key discovery failure (WBA §6.10): 403 with
+		// Accept-Signature, distinguishable so the middleware can apply
+		// its local policy.
+		discovery bool
 	}{
 		{"body changed after signing", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
 			r.Body = http.NoBody
 			r.Body = newBody(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"other"}}`)
 		}, http.StatusForbidden, false},
-		{"signature-agent swapped to another origin", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
+		{"signature-agent swapped to an origin with no directory", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
+			r.Header.Set("Signature-Agent", `sig1="https://attacker.example.com"`)
+		}, http.StatusForbidden, true},
+		{"signature-agent swapped to another origin's directory", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
+			rig.dirs.publish(t, "https://attacker.example.com", wbaTestNow.Add(-time.Hour), 24*time.Hour, rig.key)
 			r.Header.Set("Signature-Agent", `sig1="https://attacker.example.com"`)
 		}, http.StatusForbidden, false},
 		{"signature-agent type other than directory", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
@@ -284,30 +293,46 @@ func TestWBARejections(t *testing.T) {
 		}, http.StatusBadRequest, false},
 		{"malformed signed JSON body", "{not json", nil, http.StatusBadRequest, false},
 		{"duplicate keys in signed JSON body", `{"a":1,"a":2}`, nil, http.StatusBadRequest, false},
-		{"revoked key", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
-			jwk, _ := PublicDirectoryKey(rig.key)
-			rig.revs.set(t, revocationPayload{Updated: rfc3339(wbaTestNow.Add(-time.Minute)), NextUpdate: rfc3339(wbaTestNow.Add(10 * time.Minute)), RevokedKids: []string{jwk.Kid}})
-		}, http.StatusForbidden, true},
-		{"revocation list unavailable: signer-side outage, not a signature failure", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
-			rig.revs.fetchErr = errors.New("connection refused")
-		}, http.StatusServiceUnavailable, false},
-		{"directory cannot be fetched: signer-side outage", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
+		{"directory cannot be fetched: discovery failure, not an outage", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
 			rig.dirs.fail(rig.origin, errors.New("timeout"))
-		}, http.StatusServiceUnavailable, false},
-		{"directory 5xx: signer-side outage", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
+		}, http.StatusForbidden, true},
+		{"directory 5xx: discovery failure", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
 			rig.dirs.mu.Lock()
 			rig.dirs.dirs[rig.origin] = &DirectoryResponse{Status: http.StatusBadGateway, Header: http.Header{}}
 			rig.dirs.mu.Unlock()
-		}, http.StatusServiceUnavailable, false},
-		{"directory absent (404): signature failure", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
+		}, http.StatusForbidden, true},
+		{"directory 429: discovery failure", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
+			rig.dirs.mu.Lock()
+			rig.dirs.dirs[rig.origin] = &DirectoryResponse{Status: http.StatusTooManyRequests, Header: http.Header{}}
+			rig.dirs.mu.Unlock()
+		}, http.StatusForbidden, true},
+		{"directory absent (404): discovery failure", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
 			rig.dirs.mu.Lock()
 			delete(rig.dirs.dirs, rig.origin)
 			rig.dirs.mu.Unlock()
-		}, http.StatusForbidden, false},
-		{"directory absent (410): signature failure", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
+		}, http.StatusForbidden, true},
+		{"directory absent (410): discovery failure", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
 			rig.dirs.mu.Lock()
 			rig.dirs.dirs[rig.origin] = &DirectoryResponse{Status: http.StatusGone, Header: http.Header{}}
 			rig.dirs.mu.Unlock()
+		}, http.StatusForbidden, true},
+		{"directory that does not parse: discovery failure", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
+			rig.dirs.mu.Lock()
+			rig.dirs.dirs[rig.origin] = &DirectoryResponse{Status: http.StatusOK, Header: http.Header{"Content-Type": {DirectoryMediaType}}, Body: []byte(`{"keys":`)}
+			rig.dirs.mu.Unlock()
+		}, http.StatusForbidden, true},
+		{"nonce of 32 bytes", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
+			r.Header.Set("Signature-Input", replaceNonce(r.Header.Get("Signature-Input"), base64.RawURLEncoding.EncodeToString(make([]byte, 32))))
+		}, http.StatusForbidden, false},
+		{"nonce of 65 bytes", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
+			r.Header.Set("Signature-Input", replaceNonce(r.Header.Get("Signature-Input"), base64.RawURLEncoding.EncodeToString(make([]byte, 65))))
+		}, http.StatusForbidden, false},
+		{"nonce in padded base64url", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
+			r.Header.Set("Signature-Input", replaceNonce(r.Header.Get("Signature-Input"), base64.URLEncoding.EncodeToString(bytes.Repeat([]byte{0xfb}, 64))))
+		}, http.StatusForbidden, false},
+		{"nonce in non-canonical base64", body, func(t *testing.T, rig *wbaRig, r *http.Request) {
+			n := base64.RawURLEncoding.EncodeToString(make([]byte, 64))
+			r.Header.Set("Signature-Input", replaceNonce(r.Header.Get("Signature-Input"), n[:len(n)-1]+"B"))
 		}, http.StatusForbidden, false},
 	}
 	for _, tc := range cases {
@@ -319,9 +344,9 @@ func TestWBARejections(t *testing.T) {
 			}
 			_, err := VerifyWebBotAuthRequest(r, rig.opts())
 			we := requireWBAError(t, err, tc.status)
-			require.Equal(t, tc.authz, we.Authorization)
-			require.Equal(t, tc.status == http.StatusServiceUnavailable, IsIdentityUnavailable(err), "outages are distinguishable")
-			if tc.status == http.StatusForbidden && !tc.authz {
+			require.False(t, we.Authorization, "the signature path never answers with an authorization error")
+			require.Equal(t, tc.discovery, IsDiscoveryFailure(err), "discovery failures are distinguishable")
+			if tc.status == http.StatusForbidden {
 				require.NotEmpty(t, we.ResponseHeader().Get("Accept-Signature"))
 			} else {
 				require.Empty(t, we.ResponseHeader().Get("Accept-Signature"))
@@ -340,9 +365,8 @@ func TestWBARequiresVerifierDependencies(t *testing.T) {
 	rig := newWBARig(t)
 	r := rig.signedRequest(t, "")
 	for _, opts := range []WBAVerifyOptions{
-		{Revocation: rig.checker, Replay: rig.replay},
-		{Keys: rig.resolver, Replay: rig.replay},
-		{Keys: rig.resolver, Revocation: rig.checker},
+		{Replay: rig.replay},
+		{Keys: rig.resolver},
 	} {
 		_, err := VerifyWebBotAuthRequest(r, opts)
 		require.ErrorIs(t, err, errWBANotConfigured)
@@ -355,7 +379,7 @@ func TestWBAReplayIsPerOriginAcrossKeyRotation(t *testing.T) {
 	rig := newWBARig(t)
 	second := newEd25519(t)
 	rig.dirs.publish(t, rig.origin, wbaTestNow.Add(-time.Hour), 24*time.Hour, rig.key, second)
-	nonce := "Mn-ZM8SnGESx0-rmyYMuTkJFerfbwEii2C0qNkDP8ug"
+	nonce := "Mn-ZM8SnGESx0-rmyYMuTkJFerfbwEii2C0qNkDP8ugpcuv0pcrt6Da2ifr-6MTmfVeZhnFymLeAofeXJbFaxA"
 	sign := func(key ed25519.PrivateKey) *http.Request {
 		r := httptest.NewRequest(http.MethodGet, "https://seller.example.com/adcp/get_principal", nil)
 		require.NoError(t, SignWebBotAuthRequest(r, key, WBASignOptions{AgentOrigin: rig.origin, Clock: wbaClock, NonceOverride: nonce}))
@@ -376,7 +400,7 @@ func TestWBAReplayIsPerOriginAcrossKeyRotation(t *testing.T) {
 	rig.dirs.publish(t, "https://other.example.com", wbaTestNow.Add(-time.Hour), 24*time.Hour, otherKey)
 	r := httptest.NewRequest(http.MethodGet, "https://seller.example.com/adcp/get_principal", nil)
 	require.NoError(t, SignWebBotAuthRequest(r, otherKey, WBASignOptions{AgentOrigin: "https://other.example.com", Clock: wbaClock, NonceOverride: nonce}))
-	_, err = VerifyWebBotAuthRequest(r, WBAVerifyOptions{Keys: rig.resolver, Revocation: noRevocations{}, Replay: rig.replay, Clock: wbaClock})
+	_, err = VerifyWebBotAuthRequest(r, WBAVerifyOptions{Keys: rig.resolver, Replay: rig.replay, Clock: wbaClock})
 	require.NoError(t, err)
 }
 
@@ -414,7 +438,7 @@ func TestWBARelayMustCoverEveryEarlierComponent(t *testing.T) {
 	good := r.Clone(context.Background())
 	require.NoError(t, SignWebBotAuthRelay(good, relayKey, WBASignOptions{AgentOrigin: relayOrigin, Label: "relay", Clock: wbaClock}))
 	require.Contains(t, good.Header.Get("Signature-Input"), `"x-trace"`, "the relay signer covers the earlier signature's components")
-	signers, err := VerifyWebBotAuthRequest(good, WBAVerifyOptions{Keys: keys, Revocation: noRevocations{}, Replay: NewMemoryReplayStore(0), Clock: wbaClock})
+	signers, err := VerifyWebBotAuthRequest(good, WBAVerifyOptions{Keys: keys, Replay: NewMemoryReplayStore(0), Clock: wbaClock})
 	require.NoError(t, err)
 	require.Equal(t, []string{rig.origin, relayOrigin}, []string{signers[0].AgentURL, signers[1].AgentURL})
 
@@ -440,7 +464,7 @@ func TestWBARelayMustCoverEveryEarlierComponent(t *testing.T) {
 	brandSig, _ := sigs.get("brand")
 	bad.Header.Set("Signature-Input", sfDict{{key: "brand", member: brandMember}, {key: "relay", member: rm}}.serialize())
 	bad.Header.Set("Signature", sfDict{{key: "brand", member: brandSig}, {key: "relay", member: sfMember{item: sfItem{value: sfBare{kind: sfBinary, b: rsig}}}}}.serialize())
-	_, err = VerifyWebBotAuthRequest(bad, WBAVerifyOptions{Keys: keys, Revocation: noRevocations{}, Replay: NewMemoryReplayStore(0), Clock: wbaClock})
+	_, err = VerifyWebBotAuthRequest(bad, WBAVerifyOptions{Keys: keys, Replay: NewMemoryReplayStore(0), Clock: wbaClock})
 	we := requireWBAError(t, err, http.StatusForbidden)
 	require.Equal(t, "relay", we.Label)
 }
@@ -640,4 +664,109 @@ func TestWBAAuthorities(t *testing.T) {
 	require.NoError(t, SignWebBotAuthRequest(r, rig.key, WBASignOptions{AgentOrigin: rig.origin, Clock: wbaClock}))
 	_, err = VerifyWebBotAuthRequest(r, opts)
 	requireWBAStatus(t, err, http.StatusForbidden)
+}
+
+// replaceNonce swaps the nonce parameter of a serialized Signature-Input.
+func replaceNonce(input, nonce string) string {
+	start := strings.Index(input, `nonce="`) + len(`nonce="`)
+	end := start + strings.Index(input[start:], `"`)
+	return input[:start] + nonce + input[end:]
+}
+
+// TestWBANonceEncodings: the signer emits 64 random bytes as unpadded
+// base64url; the verifier accepts exactly 64 bytes as unpadded base64url or
+// padded standard base64, the encodings Cloudflare's web-bot-auth library
+// emits and accepts.
+func TestWBANonceEncodings(t *testing.T) {
+	rig := newWBARig(t)
+	r := rig.signedRequest(t, "")
+	in, err := parseSFDictionary(r.Header.Get("Signature-Input"))
+	require.NoError(t, err)
+	m, _ := in.get("sig1")
+	nonce, _ := stringParam(m.params, "nonce")
+	require.Len(t, nonce, 86)
+	raw, err := base64.RawURLEncoding.DecodeString(nonce)
+	require.NoError(t, err)
+	require.Len(t, raw, 64)
+
+	std := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xfb, 0xff}, 32)) // carries '+', '/', '='
+	require.Contains(t, std, "+")
+	r = httptest.NewRequest(http.MethodGet, "https://seller.example.com/adcp/get_principal", nil)
+	require.NoError(t, SignWebBotAuthRequest(r, rig.key, WBASignOptions{AgentOrigin: rig.origin, Clock: wbaClock, NonceOverride: std}))
+	_, err = VerifyWebBotAuthRequest(r, rig.opts())
+	require.NoError(t, err, "padded standard base64 is accepted")
+
+	for _, bad := range []string{
+		base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
+		base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{0xfb}, 64)),
+		base64.URLEncoding.EncodeToString(bytes.Repeat([]byte{0xfb}, 64)),
+	} {
+		require.False(t, validWBANonce(bad), bad)
+		require.Error(t, SignWebBotAuthRequest(httptest.NewRequest(http.MethodGet, "https://s.example.com/", nil), rig.key,
+			WBASignOptions{AgentOrigin: rig.origin, NonceOverride: bad}))
+	}
+}
+
+// TestWBATargetURIAsReceived: @target-uri is the target URI as received
+// (RFC 9421 §2.2.2), percent-encoding included, so a signer on another HTTP
+// stack that signs the URI it sent verifies; @authority is normalized.
+func TestWBATargetURIAsReceived(t *testing.T) {
+	rig := newWBARig(t)
+	const sent = "https://seller.example.com/a%7Eb/mcp/?q=%7e&x=a+b"
+	client := httptest.NewRequest(http.MethodGet, sent, nil)
+	require.NoError(t, SignWebBotAuthRequest(client, rig.key, WBASignOptions{AgentOrigin: rig.origin, Clock: wbaClock}))
+	received := func(signed *http.Request, requestTarget, host string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "https://"+host+requestTarget, nil)
+		r.RequestURI = requestTarget
+		r.Host = host
+		for _, h := range []string{"Signature", "Signature-Input", "Signature-Agent"} {
+			r.Header.Set(h, signed.Header.Get(h))
+		}
+		return r
+	}
+	server := received(client, "/a%7Eb/mcp/?q=%7e&x=a+b", "seller.example.com")
+	in, _ := parseSFDictionary(server.Header.Get("Signature-Input"))
+	m, _ := in.get("sig1")
+	base, err := wbaSignatureBase(server.Method, receivedTargetURI(server, "https"), server.Header, m, false)
+	require.NoError(t, err)
+	require.Contains(t, base, `"@target-uri": `+sent+"\n", "not canonicalized")
+	_, err = VerifyWebBotAuthRequest(server, rig.opts())
+	require.NoError(t, err)
+
+	// A signature over the decoded path does not verify against the
+	// encoded request-target, and vice versa: no canonicalization either way.
+	decoded := httptest.NewRequest(http.MethodGet, "https://seller.example.com/a~b/mcp/?q=%7e&x=a+b", nil)
+	require.NoError(t, SignWebBotAuthRequest(decoded, rig.key, WBASignOptions{AgentOrigin: rig.origin, Clock: wbaClock}))
+	_, err = VerifyWebBotAuthRequest(received(decoded, "/a%7Eb/mcp/?q=%7e&x=a+b", "seller.example.com"), rig.opts())
+	requireWBAStatus(t, err, http.StatusForbidden)
+
+	// @authority is normalized (RFC 9421 §2.2.3): a received Host with
+	// upper case and the default port verifies a signature over the
+	// normalized authority, since both sides normalize it.
+	explicit := httptest.NewRequest(http.MethodGet, "https://Seller.Example.com:443/x", nil)
+	require.NoError(t, SignWebBotAuthRequest(explicit, rig.key, WBASignOptions{AgentOrigin: rig.origin, Clock: wbaClock}))
+	_, err = VerifyWebBotAuthRequest(received(explicit, "/x", "Seller.Example.com:443"), rig.opts())
+	require.NoError(t, err)
+}
+
+type fakeRevocationStates map[string]RevocationState
+
+func (f fakeRevocationStates) CheckWBAKey(_ context.Context, origin, _ string) (RevocationState, error) {
+	return f[origin], nil
+}
+
+// TestCheckWBARevocation: revocation runs after verification, records each
+// signer's state, and refuses a revoked key, a relay's included, with 403
+// and no Accept-Signature.
+func TestCheckWBARevocation(t *testing.T) {
+	signers := []*VerifiedSigner{{AgentURL: "https://a.example.com", Label: "a"}, {AgentURL: "https://r.example.com", Label: "r"}}
+	require.NoError(t, CheckWBARevocation(context.Background(), fakeRevocationStates{"https://a.example.com": RevocationStale, "https://r.example.com": RevocationNoList}, signers))
+	require.Equal(t, RevocationStale, signers[0].Revocation)
+	require.Equal(t, RevocationNoList, signers[1].Revocation)
+	err := CheckWBARevocation(context.Background(), fakeRevocationStates{"https://a.example.com": RevocationCurrent, "https://r.example.com": RevocationRevoked}, signers)
+	we := requireWBAError(t, err, http.StatusForbidden)
+	require.True(t, we.Revoked)
+	require.Equal(t, "r", we.Label)
+	require.Empty(t, we.ResponseHeader().Get("Accept-Signature"))
+	require.False(t, IsDiscoveryFailure(err))
 }

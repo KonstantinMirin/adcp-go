@@ -186,24 +186,21 @@ func TestEvaluateAbsenceAndNoDowngrade(t *testing.T) {
 	r.now = r.now.Add(61 * time.Second)
 	_, err = r.eval.Evaluate(ctx, "brand-7k3q.com", "")
 	require.NoError(t, err)
-	// After a 200 the record disappears: a removal, not absence (so no
-	// fallback to brand.json) and not an outage. It lists and grants
-	// nothing.
+	// After a 200 the record disappears: a discovery failure, not absence
+	// (so no fallback to brand.json) and not a removal. The last record
+	// read stays authoritative.
 	r.server.set(trustURL("brand-7k3q.com"), http.StatusNotFound, "")
 	r.now = r.now.Add(2 * time.Minute)
-	rec, err := r.eval.Evaluate(ctx, "brand-7k3q.com", "")
-	require.NoError(t, err)
-	require.True(t, rec.Removed)
-	require.Empty(t, rec.Record.Grants)
-	require.Empty(t, rec.Record.Agents)
+	_, err = r.eval.Evaluate(ctx, "brand-7k3q.com", "")
+	require.True(t, IsTrustRecordUnavailable(err), "%v", err)
+	require.False(t, IsTrustRecordAbsent(err))
 
-	// A hop target that is gone after the pointer was read is a removal too.
+	// A hop target that is gone is a discovery failure too.
 	hosted := "https://records.host.example.net/brand/trust.json"
 	r2 := newEvalRig(t)
 	r2.server.set(trustURL("example.com"), 200, `{"authoritative_location":"`+hosted+`"}`)
-	rec, err = r2.eval.Evaluate(ctx, "example.com", "")
-	require.NoError(t, err)
-	require.True(t, rec.Removed)
+	_, err = r2.eval.Evaluate(ctx, "example.com", "")
+	require.True(t, IsTrustRecordUnavailable(err), "%v", err)
 }
 
 func TestEvaluateFreshnessAndNegativeCache(t *testing.T) {
@@ -362,11 +359,11 @@ func TestBindingsAndGate(t *testing.T) {
 	r := newEvalRig(t)
 	r.server.set(trustURL("example.com"), 200, buyerRecord)
 	gate := &BindingGate{Bindings: b, Records: r.eval}
-	signer := &signing.VerifiedSigner{AgentURL: "https://buyer.example.com", Profile: signing.ProfileTagWebBotAuth}
+	signer := &signing.VerifiedSigner{AgentURL: "https://buyer.example.com", Profile: signing.ProfileTagWebBotAuth, Revocation: signing.RevocationCurrent}
 	got, err := gate.AuthorizeWBA(ctx, signer, "create_media_buy")
 	require.NoError(t, err)
 	require.Equal(t, "p1", got)
-	unbound := &signing.VerifiedSigner{AgentURL: "https://new.example.com", Profile: signing.ProfileTagWebBotAuth}
+	unbound := &signing.VerifiedSigner{AgentURL: "https://new.example.com", Profile: signing.ProfileTagWebBotAuth, Revocation: signing.RevocationCurrent}
 	got, err = gate.AuthorizeWBA(ctx, unbound, "get_principal")
 	require.NoError(t, err)
 	require.Empty(t, got, "an unbound origin is identity-established")
@@ -396,12 +393,12 @@ func TestBindingsAndGate(t *testing.T) {
 		require.NoError(t, err, op)
 		require.Empty(t, got, op)
 	}
-	// Work already in flight: a delisted origin may still poll and cancel
-	// its own tasks, under its principal.
+	// No exception for task polling or cancellation: delisted is
+	// identity-established.
 	for _, op := range []string{"get_task_status", "tasks/get", "tasks/cancel"} {
 		got, err = gate.AuthorizeWBA(ctx, signer, op)
 		require.NoError(t, err, op)
-		require.Equal(t, "p1", got, op)
+		require.Empty(t, got, op)
 	}
 	_, still, _ := b.PrincipalForOrigin(ctx, "https://buyer.example.com")
 	require.True(t, still)
@@ -414,7 +411,7 @@ func TestBindingsAndGate(t *testing.T) {
 	b2 := NewOriginBindings()
 	require.NoError(t, b2.Bind(ctx, "https://agent.absent-7k3q.com", "p9", BindOptions{}))
 	got, err = (&BindingGate{Bindings: b2, Records: r2.eval}).AuthorizeWBA(ctx,
-		&signing.VerifiedSigner{AgentURL: "https://agent.absent-7k3q.com", Profile: signing.ProfileTagWebBotAuth}, "create_media_buy")
+		&signing.VerifiedSigner{AgentURL: "https://agent.absent-7k3q.com", Profile: signing.ProfileTagWebBotAuth, Revocation: signing.RevocationCurrent}, "create_media_buy")
 	require.NoError(t, err)
 	require.Empty(t, got)
 
@@ -425,25 +422,31 @@ func TestBindingsAndGate(t *testing.T) {
 	require.NoError(t, err)
 	p, _, _ = b.PrincipalForOrigin(ctx, unbound.AgentURL)
 	require.Equal(t, "p5", p)
-	_, err = r.eval.Bind(ctx, &signing.VerifiedSigner{AgentURL: "https://sales.example.com", Profile: signing.ProfileTagWebBotAuth}, "p6", b, BindOptions{})
+	_, err = r.eval.Bind(ctx, &signing.VerifiedSigner{AgentURL: "https://sales.example.com", Profile: signing.ProfileTagWebBotAuth, Revocation: signing.RevocationCurrent}, "p6", b, BindOptions{})
 	require.Error(t, err, "the required role is adcp:buying")
-	_, err = r.eval.Bind(ctx, &signing.VerifiedSigner{AgentURL: "https://sales.example.com", Profile: signing.ProfileTagWebBotAuth}, "p6", b, BindOptions{Role: RoleSales})
+	_, err = r.eval.Bind(ctx, &signing.VerifiedSigner{AgentURL: "https://sales.example.com", Profile: signing.ProfileTagWebBotAuth, Revocation: signing.RevocationCurrent}, "p6", b, BindOptions{Role: RoleSales})
 	require.NoError(t, err)
 	_, err = r.eval.Bind(ctx, &signing.VerifiedSigner{AgentURL: "https://new.example.com", Profile: signing.ProfileTagRequestSigning}, "p7", b, BindOptions{})
 	require.Error(t, err, "binding requires a Web Bot Auth identity")
 	_, err = r.eval.Bind(ctx, nil, "p7", b, BindOptions{})
 	require.Error(t, err)
+	// An origin that serves no revocation list (or whose list is stale, or
+	// was never checked) cannot be bound for spend.
+	for _, state := range []signing.RevocationState{signing.RevocationNoList, signing.RevocationStale, signing.RevocationUnchecked} {
+		_, err = r.eval.Bind(ctx, &signing.VerifiedSigner{AgentURL: "https://new.example.com", Profile: signing.ProfileTagWebBotAuth, Revocation: state}, "p8", NewOriginBindings(), BindOptions{})
+		require.ErrorIs(t, err, ErrRevocationListRequired, state.String())
+	}
 }
 
 // TestBindingGateOutageRules: an outage never restores access. The last
-// record read stays authoritative; non-spend calls continue under a binding
-// only within grace (4x the polling interval past the listing record's
-// freshness); a 404/410 is a removal on every replica; caps that force an
-// "outage" cannot bypass a delisting.
+// record read stays authoritative, through a 404 or 410 too; non-spend calls
+// continue under a binding only within the OutageContinuation bound (4x the
+// polling interval past the listing record's freshness by default); caps
+// that force an "outage" cannot bypass a delisting.
 func TestBindingGateOutageRules(t *testing.T) {
 	ctx := context.Background()
 	origin := "https://buyer.example.com"
-	signer := &signing.VerifiedSigner{AgentURL: origin, Profile: signing.ProfileTagWebBotAuth}
+	signer := &signing.VerifiedSigner{AgentURL: origin, Profile: signing.ProfileTagWebBotAuth, Revocation: signing.RevocationCurrent}
 	listed := `{"agents":[{"url":"https://buyer.example.com/mcp","roles":["adcp:buying"]}]}`
 	delisted := `{"agents":[{"url":"https://other.example.com","roles":["adcp:buying"]}]}`
 	newGate := func(t *testing.T) (*evalRig, *BindingGate) {
@@ -504,22 +507,87 @@ func TestBindingGateOutageRules(t *testing.T) {
 		expectUnavailable(t, err)
 	})
 
-	t.Run("404 for a bound origin's operator is a removal, even without history", func(t *testing.T) {
+	t.Run("404 from an operator that never published: identity-established", func(t *testing.T) {
 		_, gate := newGate(t) // the fake serves 404 for an unknown URL
 		got, err := gate.AuthorizeWBA(ctx, signer, "get_media_buys")
 		require.NoError(t, err)
 		require.Empty(t, got)
 	})
 
-	t.Run("410 after a read is a removal", func(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusGone} {
+		t.Run(fmt.Sprintf("%d after a read is a discovery failure: the last record stands", status), func(t *testing.T) {
+			r, gate := newGate(t)
+			r.server.set(trustURL("example.com"), 200, listed)
+			_, _ = gate.AuthorizeWBA(ctx, signer, "get_media_buys")
+			r.server.set(trustURL("example.com"), status, "")
+			r.now = r.now.Add(2 * time.Minute)
+			got, err := gate.AuthorizeWBA(ctx, signer, "get_media_buys")
+			require.NoError(t, err)
+			require.Equal(t, "p1", got, "not a delisting")
+			_, err = gate.AuthorizeWBA(ctx, signer, "create_media_buy")
+			expectUnavailable(t, err)
+		})
+	}
+
+	t.Run("an empty agents[] retires the agent", func(t *testing.T) {
 		r, gate := newGate(t)
 		r.server.set(trustURL("example.com"), 200, listed)
 		_, _ = gate.AuthorizeWBA(ctx, signer, "get_media_buys")
-		r.server.set(trustURL("example.com"), http.StatusGone, "")
+		r.server.set(trustURL("example.com"), 200, `{"agents":[]}`)
 		r.now = r.now.Add(2 * time.Minute)
 		got, err := gate.AuthorizeWBA(ctx, signer, "get_media_buys")
 		require.NoError(t, err)
 		require.Empty(t, got)
+	})
+
+	t.Run("OutageContinuation is seller policy", func(t *testing.T) {
+		for _, tc := range []struct {
+			bound time.Duration
+			after time.Duration
+			cont  bool
+		}{
+			{10 * time.Minute, 9 * time.Minute, true},
+			{10 * time.Minute, 11 * time.Minute, false},
+			{-1, 30 * time.Second, false},
+		} {
+			server := newTrustServer()
+			now := testNow
+			eval, err := NewTrustRecordEvaluator(TrustRecordEvaluatorOptions{Fetch: server.fetch, Clock: func() time.Time { return now }, PollingInterval: time.Minute, OutageContinuation: tc.bound})
+			require.NoError(t, err)
+			b := NewOriginBindings()
+			require.NoError(t, b.Bind(ctx, origin, "p1", BindOptions{}))
+			gate := &BindingGate{Bindings: b, Records: eval}
+			server.set(trustURL("example.com"), 200, listed)
+			_, _ = gate.AuthorizeWBA(ctx, signer, "get_media_buys")
+			server.fail(trustURL("example.com"), errors.New("connection refused"))
+			now = now.Add(time.Minute + tc.after) // the record's 1 min freshness, then the outage
+			got, err := gate.AuthorizeWBA(ctx, signer, "get_media_buys")
+			if tc.cont {
+				require.NoError(t, err)
+				require.Equal(t, "p1", got)
+			} else {
+				expectUnavailable(t, err)
+			}
+		}
+	})
+
+	t.Run("revocation state", func(t *testing.T) {
+		r, gate := newGate(t)
+		r.server.set(trustURL("example.com"), 200, listed)
+		for _, state := range []signing.RevocationState{signing.RevocationNoList, signing.RevocationUnchecked} {
+			s := *signer
+			s.Revocation = state
+			got, err := gate.AuthorizeWBA(ctx, &s, "create_media_buy")
+			require.NoError(t, err)
+			require.Empty(t, got, "no revocation list: identity-established, never bound for spend (%s)", state)
+		}
+		stale := *signer
+		stale.Revocation = signing.RevocationStale
+		_, err := gate.AuthorizeWBA(ctx, &stale, "create_media_buy")
+		expectUnavailable(t, err)
+		got, err := gate.AuthorizeWBA(ctx, &stale, "get_media_buys")
+		require.NoError(t, err)
+		require.Equal(t, "p1", got, "a stale list blocks spend only")
 	})
 
 	t.Run("a cap-forced outage cannot bypass a delisting", func(t *testing.T) {
@@ -553,8 +621,8 @@ func TestBindingGateOutageRules(t *testing.T) {
 
 // TestAuthorityHistoryResistsFlooding: one party with many free hosting
 // subdomains (a PSL PRIVATE suffix) cannot evict another operator's
-// authority history, so a brand's removal still counts as a removal (and
-// the brand.json fallback stays disabled) after the flood.
+// authority history, so a brand's later 404 is still a discovery failure,
+// not absence (the brand.json fallback stays disabled), after the flood.
 func TestAuthorityHistoryResistsFlooding(t *testing.T) {
 	ctx := context.Background()
 	r := newEvalRig(t)
@@ -577,9 +645,9 @@ func TestAuthorityHistoryResistsFlooding(t *testing.T) {
 
 	r.server.set(trustURL("brand-7k3q.com"), http.StatusNotFound, "")
 	r.now = r.now.Add(2 * time.Minute)
-	rec, err := r.eval.Evaluate(ctx, "brand-7k3q.com", "")
-	require.NoError(t, err)
-	require.True(t, rec.Removed, "still a removal, so authorized_operators does not come back")
+	_, err = r.eval.Evaluate(ctx, "brand-7k3q.com", "")
+	require.False(t, IsTrustRecordAbsent(err), "not absence, so authorized_operators does not come back")
+	require.True(t, IsTrustRecordUnavailable(err))
 
 	// A refused tenant simply has no history: its own later 404 is absence.
 	over := fmt.Sprintf("tenant%d.github.io", historyPerOperator+5)
@@ -614,9 +682,9 @@ func (h *sharedHistory) StoreAuthority(_ context.Context, domain string, s Autho
 }
 
 // TestDurableAuthorityHistory: with a shared History, a replica that never
-// read the record still treats a 404 as a removal and keeps the last
-// record through an outage; a history that cannot be read or written
-// fails the evaluation closed.
+// read the record still treats a 404 as a discovery failure, not absence,
+// and keeps the last record through an outage; a history that cannot be
+// read or written fails the evaluation closed.
 func TestDurableAuthorityHistory(t *testing.T) {
 	ctx := context.Background()
 	hist := &sharedHistory{states: map[string]AuthorityState{}}
@@ -639,11 +707,15 @@ func TestDurableAuthorityHistory(t *testing.T) {
 	require.Equal(t, Unavailable, l.Status)
 	require.True(t, l.WithinGrace)
 
-	// Another replica after removal: a removal, not absence.
+	// Another replica after a 404: not absence; the last record stands.
 	server.set(trustURL("example.com"), http.StatusNotFound, "")
-	rec, err := newEval().Evaluate(ctx, "example.com", "")
-	require.NoError(t, err)
-	require.True(t, rec.Removed)
+	e := newEval()
+	_, err = e.Evaluate(ctx, "example.com", "")
+	require.False(t, IsTrustRecordAbsent(err))
+	l = e.CheckListing(ctx, "https://buyer.example.com", RoleBuying)
+	require.Equal(t, Unavailable, l.Status)
+	require.True(t, l.WithinGrace)
+	require.True(t, l.Record.Stale)
 
 	// A history that cannot be written or read fails closed.
 	server.set(trustURL("other.com"), 200, `{"grants":[]}`)

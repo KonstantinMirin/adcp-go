@@ -12,18 +12,18 @@ import (
 // operator domain.
 type AuthorityState struct {
 	// Served reports that the operator's trust.json has returned a 200, so
-	// a later 404 or 410 is a removal rather than absence (and the
-	// brand.json authorized_operators fallback stays disabled).
+	// a later 404 or 410 is a discovery failure rather than absence: the
+	// last record stays authoritative and the brand.json
+	// authorized_operators fallback stays disabled (no downgrade).
 	Served bool
-	// LastRecord is the last record read for the operator (Removed set
-	// after a removal), which stays authoritative through an outage. Nil
-	// if none has been read.
+	// LastRecord is the last record read for the operator, which stays
+	// authoritative through an outage. Nil if none has been read.
 	LastRecord *EvaluatedTrustRecord
 }
 
 // AuthorityHistory persists authority history for a TrustRecordEvaluator.
-// It is security state: losing it re-enables the brand.json fallback after
-// a removal, or turns a delisting into an outage. The default keeps it in
+// It is security state: losing it re-enables the brand.json fallback once a
+// brand's trust.json stops resolving, or turns a delisting into an outage. The default keeps it in
 // memory, bounded with per-operator quotas, so it does not survive
 // restarts or span replicas; public deployments must supply a durable one.
 //

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -14,7 +15,7 @@ import (
 // JWKThumbprint returns the RFC 7638 SHA-256 thumbprint of jwk's public key,
 // base64url-encoded without padding (RFC 8037 Appendix A.3 for Ed25519).
 // Only the required members take part: crv, kty, x for OKP; crv, kty, x, y
-// for EC. Under the Web Bot Auth profile a key's kid is its thumbprint.
+// for EC; e, kty, n for RSA. Under the Web Bot Auth profile a key's kid is its thumbprint.
 func JWKThumbprint(jwk JWK) (string, error) {
 	// The required members, in lexicographic order, with no whitespace
 	// (RFC 7638 §3.3). Struct fields marshal in declaration order.
@@ -39,6 +40,15 @@ func JWKThumbprint(jwk JWK) (string, error) {
 			X   string `json:"x"`
 			Y   string `json:"y"`
 		}{jwk.Crv, jwk.Kty, jwk.X, jwk.Y}
+	case "RSA":
+		if jwk.N == "" || jwk.E == "" {
+			return "", errors.New("signing: incomplete RSA JWK")
+		}
+		members = struct {
+			E   string `json:"e"`
+			Kty string `json:"kty"`
+			N   string `json:"n"`
+		}{jwk.E, jwk.Kty, jwk.N}
 	default:
 		return "", fmt.Errorf("signing: unsupported JWK kty %q", jwk.Kty)
 	}
@@ -53,7 +63,8 @@ func JWKThumbprint(jwk JWK) (string, error) {
 }
 
 // PublicDirectoryKey returns the public JWK a Web Bot Auth key directory
-// publishes for privateKey (ed25519.PrivateKey or a P-256 *ecdsa.PrivateKey):
+// publishes for privateKey (ed25519.PrivateKey, a P-256 *ecdsa.PrivateKey, or
+// an *rsa.PrivateKey of 2048 to 8192 bits, which signs with rsa-pss-sha512):
 // kid set to the RFC 7638 thumbprint, use "sig", and no AdCP purpose member,
 // since purpose belongs to the origin under the profile.
 func PublicDirectoryKey(privateKey any) (JWK, error) {
@@ -71,6 +82,11 @@ func PublicDirectoryKey(privateKey any) (JWK, error) {
 		}
 		x, y := pad32(k.X), pad32(k.Y)
 		jwk = JWK{Kty: "EC", Crv: "P-256", X: b64UrlEncodeRaw(x), Y: b64UrlEncodeRaw(y)}
+	case *rsa.PrivateKey:
+		if k == nil || k.N.BitLen() < rsaMinModulus || k.N.BitLen() > rsaMaxModulus {
+			return JWK{}, errors.New("signing: Web Bot Auth RSA keys are 2048 to 8192 bits")
+		}
+		jwk = JWK{Kty: "RSA", N: b64UrlEncodeRaw(k.N.Bytes()), E: b64UrlEncodeRaw(big.NewInt(int64(k.E)).Bytes())}
 	default:
 		return JWK{}, fmt.Errorf("signing: unsupported private key type %T", privateKey)
 	}

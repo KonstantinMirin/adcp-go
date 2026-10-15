@@ -153,50 +153,114 @@ func requireAdCPEnvelope(t *testing.T, rec *httptest.ResponseRecorder, code stri
 	}
 }
 
-// TestMiddlewareSignerSideOutage: when identity cannot be confirmed (the
-// revocation list cannot be read, or the key directory cannot be fetched),
-// every signed request gets SERVICE_UNAVAILABLE and nothing is served
-// under the signature: no anonymous fallback, no Accept-Signature. A
-// revoked key is PERMISSION_DENIED; an absent directory is a signature
-// failure.
-func TestMiddlewareSignerSideOutage(t *testing.T) {
-	serve := func(t *testing.T, rig *wbaRig, body string) (*httptest.ResponseRecorder, *captured) {
+// requireGenericAuthError asserts a signature-path failure: the WBA status,
+// Accept-Signature only when wanted, and the one generic authentication
+// error body (DR-0023).
+func requireGenericAuthError(t *testing.T, rec *httptest.ResponseRecorder, status int, acceptSignature bool) {
+	t.Helper()
+	require.Equal(t, status, rec.Code)
+	require.Equal(t, acceptSignature, rec.Header().Get("Accept-Signature") != "", "Accept-Signature")
+	require.Empty(t, rec.Header().Get("Retry-After"))
+	require.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	require.JSONEq(t, string(genericAuthenticationError), rec.Body.String())
+}
+
+// TestMiddlewareSignaturePathHasNoOutages: the signature path answers only
+// with WBA statuses (DR-0023). A key directory that cannot be resolved is a
+// discovery failure (403 with Accept-Signature by default, or anonymous by
+// policy), never 503; a revocation list that cannot be read is recorded for
+// the authorization layer and does not block verification; a revoked key is
+// 403 without Accept-Signature.
+func TestMiddlewareSignaturePathHasNoOutages(t *testing.T) {
+	serve := func(t *testing.T, rig *wbaRig, opts WebBotAuthOptions, body string, mw MiddlewareOptions) (*httptest.ResponseRecorder, *captured) {
 		var c captured
-		auth := &fakeAuthorizer{principals: map[string]string{rig.origin: "p"}}
-		h := Middleware(MiddlewareOptions{WebBotAuth: &WebBotAuthOptions{Keys: rig.resolver, Revocation: rig.checker, Authorizer: auth, Clock: wbaClock},
-			Replay: rig.replay, Logger: discardLogger()})(captureHandler(&c))
+		opts.Keys, opts.Revocation, opts.Clock = rig.resolver, rig.checker, wbaClock
+		if opts.Authorizer == nil {
+			opts.Authorizer = &fakeAuthorizer{principals: map[string]string{rig.origin: "p"}}
+		}
+		mw.WebBotAuth, mw.Replay, mw.Logger = &opts, rig.replay, discardLogger()
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, rig.signedRequest(t, body))
+		Middleware(mw)(captureHandler(&c)).ServeHTTP(rec, rig.signedRequest(t, body))
 		return rec, &c
 	}
-	for _, op := range []string{"create_media_buy", "get_media_buys", "get_adcp_capabilities"} {
+
+	t.Run("revocation list unreadable: verified, stale for the authorization layer", func(t *testing.T) {
+		for _, op := range []string{"create_media_buy", "get_media_buys"} {
+			rig := newWBARig(t)
+			rig.revs.fetchErr = errors.New("connection refused")
+			rec, c := serve(t, rig, WebBotAuthOptions{}, mcpCall(op), MiddlewareOptions{})
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			require.True(t, c.called, op)
+			require.Equal(t, RevocationStale, c.signer.Revocation)
+		}
+	})
+	t.Run("no revocation list: verified, recorded as no_list", func(t *testing.T) {
 		rig := newWBARig(t)
-		rig.revs.fetchErr = errors.New("connection refused")
-		rec, c := serve(t, rig, mcpCall(op))
-		requireAdCPEnvelope(t, rec, CodeServiceUnavailable)
-		require.False(t, c.called, "nothing is served under an unconfirmed signature: %s", op)
+		rig.revs.mu.Lock()
+		rig.revs.status = http.StatusNotFound
+		rig.revs.mu.Unlock()
+		rec, c := serve(t, rig, WebBotAuthOptions{}, mcpCall("get_media_buys"), MiddlewareOptions{})
+		require.Equal(t, http.StatusOK, rec.Code)
+		require.Equal(t, RevocationNoList, c.signer.Revocation)
+	})
+	t.Run("current list", func(t *testing.T) {
+		rig := newWBARig(t)
+		_, c := serve(t, rig, WebBotAuthOptions{}, mcpCall("get_media_buys"), MiddlewareOptions{})
+		require.Equal(t, RevocationCurrent, c.signer.Revocation)
+	})
+	t.Run("revoked key: 403 without Accept-Signature", func(t *testing.T) {
+		rig := newWBARig(t)
+		jwk, _ := PublicDirectoryKey(rig.key)
+		rig.revs.set(t, revocationPayload{Updated: rfc3339(wbaTestNow.Add(-time.Minute)), NextUpdate: rfc3339(wbaTestNow.Add(10 * time.Minute)), RevokedKids: []string{jwk.Kid}})
+		rec, c := serve(t, rig, WebBotAuthOptions{}, mcpCall("get_media_buys"), MiddlewareOptions{})
+		requireGenericAuthError(t, rec, http.StatusForbidden, false)
+		require.False(t, c.called)
+	})
+	for name, breakDir := range map[string]func(*wbaRig){
+		"timeout": func(rig *wbaRig) { rig.dirs.fail(rig.origin, errors.New("i/o timeout")) },
+		"404":     func(rig *wbaRig) { rig.dirs.mu.Lock(); delete(rig.dirs.dirs, rig.origin); rig.dirs.mu.Unlock() },
+		"503": func(rig *wbaRig) {
+			rig.dirs.mu.Lock()
+			rig.dirs.dirs[rig.origin] = &DirectoryResponse{Status: 503}
+			rig.dirs.mu.Unlock()
+		},
+		"malformed": func(rig *wbaRig) {
+			rig.dirs.mu.Lock()
+			rig.dirs.dirs[rig.origin].Body = []byte("{")
+			rig.dirs.mu.Unlock()
+		},
+	} {
+		t.Run("directory "+name+": discovery failure rejected by default", func(t *testing.T) {
+			rig := newWBARig(t)
+			breakDir(rig)
+			rec, c := serve(t, rig, WebBotAuthOptions{}, mcpCall("get_adcp_capabilities"), MiddlewareOptions{})
+			requireGenericAuthError(t, rec, http.StatusForbidden, true)
+			require.False(t, c.called)
+		})
+		t.Run("directory "+name+": anonymous by policy", func(t *testing.T) {
+			rig := newWBARig(t)
+			breakDir(rig)
+			rec, c := serve(t, rig, WebBotAuthOptions{OnDiscoveryFailure: DiscoveryFailureAnonymous}, mcpCall("get_adcp_capabilities"), MiddlewareOptions{})
+			require.Equal(t, http.StatusOK, rec.Code)
+			require.True(t, c.called)
+			require.Nil(t, c.signer, "an unverified request carries no signer")
+			// An operation that requires a signature is still refused.
+			rig = newWBARig(t)
+			breakDir(rig)
+			rec, c = serve(t, rig, WebBotAuthOptions{OnDiscoveryFailure: DiscoveryFailureAnonymous}, mcpCall("create_media_buy"), MiddlewareOptions{RequiredFor: []string{"create_media_buy"}})
+			requireGenericAuthError(t, rec, http.StatusForbidden, true)
+			require.False(t, c.called)
+		})
 	}
-
-	rig := newWBARig(t)
-	rig.dirs.fail(rig.origin, errors.New("i/o timeout"))
-	rec, c := serve(t, rig, mcpCall("get_adcp_capabilities"))
-	requireAdCPEnvelope(t, rec, CodeServiceUnavailable)
-	require.False(t, c.called)
-
-	rig = newWBARig(t)
-	rig.dirs.mu.Lock()
-	delete(rig.dirs.dirs, rig.origin) // the fake serves 404
-	rig.dirs.mu.Unlock()
-	rec, c = serve(t, rig, mcpCall("get_adcp_capabilities"))
-	require.Equal(t, http.StatusForbidden, rec.Code)
-	require.NotEmpty(t, rec.Header().Get("Accept-Signature"), "an absent directory is a signature failure")
-	require.False(t, c.called)
-
-	rig = newWBARig(t)
-	jwk, _ := PublicDirectoryKey(rig.key)
-	rig.revs.set(t, revocationPayload{Updated: rfc3339(wbaTestNow.Add(-time.Minute)), NextUpdate: rfc3339(wbaTestNow.Add(10 * time.Minute)), RevokedKids: []string{jwk.Kid}})
-	rec, _ = serve(t, rig, mcpCall("get_media_buys"))
-	requireAdCPEnvelope(t, rec, CodePermissionDenied)
+	t.Run("cached directory keeps verifying through an outage", func(t *testing.T) {
+		rig := newWBARig(t)
+		_, c := serve(t, rig, WebBotAuthOptions{}, mcpCall("get_media_buys"), MiddlewareOptions{})
+		require.True(t, c.called)
+		rig.dirs.fail(rig.origin, errors.New("i/o timeout"))
+		rec, c := serve(t, rig, WebBotAuthOptions{}, mcpCall("get_media_buys"), MiddlewareOptions{})
+		require.Equal(t, http.StatusOK, rec.Code)
+		require.NotNil(t, c.signer)
+	})
 }
 
 func TestMiddlewareWebBotAuthFailuresUseStatusCodes(t *testing.T) {
@@ -213,8 +277,7 @@ func TestMiddlewareWebBotAuthFailuresUseStatusCodes(t *testing.T) {
 	r.Header.Set("Signature-Agent", `sig1="https://attacker.example.com"`)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, r)
-	require.Equal(t, http.StatusForbidden, rec.Code)
-	require.NotEmpty(t, rec.Header().Get("Accept-Signature"))
+	requireGenericAuthError(t, rec, http.StatusForbidden, true)
 	require.Empty(t, rec.Header().Get("WWW-Authenticate"), "no request_signature_* codes under Web Bot Auth")
 	require.NotContains(t, rec.Body.String(), "request_signature")
 	require.False(t, c.called)
@@ -223,8 +286,7 @@ func TestMiddlewareWebBotAuthFailuresUseStatusCodes(t *testing.T) {
 	r.Header.Set("Signature-Input", "garbage(")
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, r)
-	require.Equal(t, http.StatusBadRequest, rec.Code)
-	require.Empty(t, rec.Header().Get("Accept-Signature"))
+	requireGenericAuthError(t, rec, http.StatusBadRequest, false)
 
 	// Custom rejection rendering.
 	var seen *WBAError
@@ -241,7 +303,9 @@ func TestMiddlewareWebBotAuthFailuresUseStatusCodes(t *testing.T) {
 	rec = httptest.NewRecorder()
 	h2.ServeHTTP(rec, r)
 	require.NotNil(t, seen)
-	require.True(t, seen.Authorization)
+	require.True(t, seen.Revoked)
+	require.False(t, seen.Authorization, "a revoked key is a signature-path failure")
+	require.Empty(t, seen.ResponseHeader().Get("Accept-Signature"))
 }
 
 func TestMiddlewareWebBotAuthRelaysDoNotInheritAuthority(t *testing.T) {
