@@ -303,7 +303,7 @@ mw := signing.Middleware(signing.MiddlewareOptions{
 - **MCP handlers.** Read the signer with `VerifiedSignerFromToolRequest(req)`. A stateful MCP session binds handlers to its `initialize` request's context, so the middleware also carries every verified signer, under either profile, in the per-request `auth.TokenInfo` (only `Extra` is set, never `UserID`). Install the middleware inside any bearer-token middleware.
 - **Bodies.** A non-empty signed body must be strict JSON. Keys that differ only in case count as duplicates. Anything else gets `400`.
 
-`VerifyWebBotAuthRequest` is the standalone verifier. `VerifiedSigner.Profile`, `PrincipalID`, `Revocation`, and `CoveredComponents` report what verified. The draft's Appendix E.1.1 RSA-PSS vector (thumbprint, signature base, padded-base64 nonce, and signature) verifies too. The draft vectors under `testdata/wba-profile/` (adcontextprotocol/adcp#7894) all pass, and the signer reproduces their signatures byte for byte.
+`VerifyWebBotAuthRequest` is the standalone verifier. `VerifiedSigner.Profile`, `PrincipalID`, `Revocation`, and `CoveredComponents` report what verified. The draft's Appendix E.1.1 RSA-PSS vector (thumbprint, signature base, padded-base64 nonce, and signature) verifies too. The draft vectors under `testdata/wba-profile/` (adcontextprotocol/adcp#7894) all pass, and the signer reproduces their signatures byte for byte. The interop fixtures under `testdata/wba-interop/` (from adcontextprotocol/adcp-client, signed by Cloudflare's `web-bot-auth@0.2.0` and by the TypeScript SDK; provenance in `UPSTREAM.json`) verify too, percent-encoded path included, and the Go signer reproduces the TypeScript-signed requests byte for byte.
 
 ## JWKS resolution
 
