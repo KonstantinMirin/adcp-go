@@ -97,7 +97,8 @@ func (b *OriginBindings) PrincipalForOrigin(_ context.Context, origin string) (s
 //     list, or one no checker ran for, is identity-established and cannot
 //     act for its principal; while its list is stale (unreadable, or past
 //     next_update plus grace), a spend-committing operation fails with the
-//     retryable SERVICE_UNAVAILABLE;
+//     retryable SERVICE_UNAVAILABLE, and while the revocation store cannot
+//     be read every operation does;
 //   - its operator's trust record, re-evaluated on every request through
 //     the evaluator's cache, which is bounded by the revocation polling
 //     interval. Listed with the role: the bound principal. Delisted (the
@@ -146,9 +147,11 @@ func (g *BindingGate) AuthorizeWBA(ctx context.Context, signer *signing.Verified
 		if spend {
 			return "", signing.NewAuthorizationError(signing.CodeServiceUnavailable, "origin revocation list is stale", nil)
 		}
+	case signing.RevocationUnavailable:
+		return "", signing.NewAuthorizationError(signing.CodeServiceUnavailable, "revocation store unavailable", nil)
 	default:
 		// No revocation list (or no check): identity-established, never
-		// bound for spend.
+		// bound.
 		return "", nil
 	}
 	if g.Records == nil {

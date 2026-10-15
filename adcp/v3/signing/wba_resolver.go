@@ -61,7 +61,11 @@ const DefaultDirectoryMaxStale = 24 * time.Hour
 // invalid directory, or a fetch the resolver's own limits refuse) is not
 // evidence: it never evicts the cached entry, which keeps verifying until
 // MaxStale has passed since the last successful fetch, and the failure is
-// retried after a 60-second cooldown. With no usable cached entry, the
+// retried after a 60-second cooldown. A refresh the resolver's own limits
+// refuse keeps the cached entry for only one more cache period, so load on
+// the verifier cannot stretch a removed key's life to MaxStale; refreshes
+// of cached origins do not compete with first discoveries for the global
+// discovery slots. With no usable cached entry, the
 // lookup fails with a discovery failure (ErrDiscoveryFailure): the request
 // is unverified. Concurrent lookups for one origin share a single fetch,
 // and one slow origin does not block another.
@@ -179,7 +183,10 @@ func (d *DirectoryResolver) ResolveWBAKey(ctx context.Context, origin, keyID str
 	call := d.pending[origin]
 	if call == nil {
 		refused := ""
-		if len(d.pending) >= d.maxOrigins {
+		// Refreshing a cached origin does not compete with first discovery
+		// for the global slots (the cache bounds such refreshes), so a
+		// flood of new origins cannot hold a known signer's refresh off.
+		if e == nil && len(d.pending) >= d.maxOrigins {
 			refused = "key directory discovery capacity exceeded"
 		} else {
 			op := operatorBucket(origin)
@@ -195,10 +202,13 @@ func (d *DirectoryResolver) ResolveWBAKey(ctx context.Context, origin, keyID str
 		}
 		if refused != "" {
 			// A fetch the verifier's own limits refuse is a discovery
-			// failure too (WBA §6.10).
+			// failure too (WBA §6.10). A refusal is local, not evidence of
+			// an outage at the origin, so the cached keys stay usable only
+			// for one more cache period, not for MaxStale: load on the
+			// verifier cannot keep a removed key alive for long.
 			d.mu.Unlock()
-			if s := stale(); s != nil {
-				return s.lookup(keyID), nil
+			if e != nil && now.Before(minTime(e.expires, e.refreshAt.Add(directoryCacheTTL))) {
+				return e.lookup(keyID), nil
 			}
 			return nil, discoveryFailure(refused, nil)
 		}
@@ -221,6 +231,12 @@ func (d *DirectoryResolver) ResolveWBAKey(ctx context.Context, origin, keyID str
 		d.mu.Unlock()
 		if s != nil {
 			return s.lookup(keyID), nil
+		}
+		// Every waiter gets its own copy: the verifier annotates the error
+		// with its request's labels.
+		if we := AsWBAError(call.err); we != nil {
+			c := *we
+			return nil, &c
 		}
 		return nil, call.err
 	}
@@ -271,9 +287,9 @@ func (d *DirectoryResolver) refresh(ctx context.Context, origin string, call *di
 	refreshAt := now.Add(directoryCacheTTL)
 	expires := now.Add(d.maxStale)
 	if exp, ok := directoryExpiry(resp); ok {
-		refreshAt = minTime(refreshAt, exp)
 		expires = minTime(expires, exp)
 	}
+	refreshAt = minTime(refreshAt, expires)
 	e := &directoryEntry{origin: origin, resp: resp, keys: keys, refreshAt: refreshAt, expires: expires}
 	if old := d.cache[origin]; old != nil {
 		e.elem = old.elem

@@ -367,12 +367,15 @@ type OriginRevocationCheckerOptions struct {
 	// evicted, so one operator cannot crowd out others. It also bounds
 	// concurrent first discoveries per operator.
 	MaxOriginsPerOperator int
-	// GraceMultiplier sets the fail-closed point at next_update plus this
-	// many polling intervals. Defaults to 2, as in the Python SDK.
+	// GraceMultiplier sets the point at which a list becomes
+	// RevocationStale: next_update plus this many polling intervals. Defaults to 2, as in the Python SDK.
 	GraceMultiplier float64
 	// History persists retained revocations. Defaults to an in-memory
 	// history of 4 x MaxOrigins origins with per-operator quotas that
-	// refuse rather than evict (an origin that does not fit fails closed).
+	// refuse rather than evict (an origin that does not fit is
+	// RevocationStale until a store succeeds, while its verified list keeps
+	// revoking). A History that cannot be read makes the state
+	// RevocationUnavailable.
 	// It does not survive restarts or span replicas, so public deployments
 	// must supply a durable one.
 	History RevocationHistory
@@ -388,13 +391,14 @@ type OriginRevocationCheckerOptions struct {
 // Revocation is monotonic: every revoked key and detail seen for an origin
 // is retained across refreshes and across evictions through History (the
 // default in-memory History refuses an origin that would exceed its quotas,
-// which then fails closed, rather than forgetting another's), a list older
+// which is then RevocationStale, rather than forgetting another's), a list older
 // than the retained one is refused, and keyCompromise and the
 // earliest invalidity_date win. Only thumbprint-shaped kids (the only kids
 // a Web Bot Auth keyid can match) are retained, at most 1024 per origin; a
 // list over the bound fails that origin closed. Refreshes are single-flight
 // per origin, detached from the caller, and never hold a lock across I/O.
-// Past next_update plus the grace, checks fail closed.
+// Past next_update plus the grace, the state is RevocationStale, which
+// fails spend-committing calls closed in the authorization layer.
 type OriginRevocationChecker struct {
 	keys           WBAKeyResolver
 	fetch          RevocationFetcher
@@ -422,6 +426,9 @@ type revocationFailure struct {
 // errNoRevocationList is a revocation list fetch answered 404 or 410.
 var errNoRevocationList = errors.New("signing: origin serves no revocation list")
 
+// errRevocationStore is a RevocationHistory read failure.
+var errRevocationStore = errors.New("signing: revocation history unavailable")
+
 type revocationCall struct {
 	done chan struct{}
 	err  error
@@ -439,7 +446,7 @@ type originRevocations struct {
 	interval     time.Duration
 	refreshing   *revocationCall
 	// unpersisted is set while History refuses or fails to store the
-	// retained list: the origin then fails closed, since its revocations
+	// retained list: the origin is then RevocationStale, since its revocations
 	// would not survive an eviction or restart.
 	unpersisted error
 }
@@ -514,22 +521,31 @@ func NewOriginRevocationChecker(opts OriginRevocationCheckerOptions) (*OriginRev
 //     does not;
 //   - RevocationNoList when the origin serves no list (404 or 410) and no
 //     list has been retained for it;
+//   - RevocationUnavailable when the History cannot be read, so the
+//     revocations retained for the origin are unknown;
 //   - RevocationStale otherwise: the list cannot be read or verified, it is
-//     past next_update plus the grace, the History cannot keep it, or a
-//     discovery limit refused the fetch. A previously retained list keeps
-//     revoking its keys whatever the state.
+//     past next_update plus the grace, the History cannot store it, or a
+//     discovery limit refused the fetch. A previously retained or verified
+//     list keeps revoking its keys whatever the state.
 func (c *OriginRevocationChecker) CheckWBAKey(ctx context.Context, origin, keyID string) (RevocationState, error) {
-	if l := c.retained(origin); l != nil && l.IsRevoked(keyID) {
+	l, err := c.retained(ctx, origin)
+	if err != nil {
+		return RevocationUnavailable, err
+	}
+	if l != nil && l.IsRevoked(keyID) {
 		return RevocationRevoked, nil
 	}
 	state, err := c.admit(ctx, origin)
 	if err != nil {
-		if errors.Is(err, errNoRevocationList) {
+		switch {
+		case errors.Is(err, errNoRevocationList):
 			return RevocationNoList, err
+		case errors.Is(err, errRevocationStore):
+			return RevocationUnavailable, err
 		}
 		return RevocationStale, err
 	}
-	l, err := state.fresh(ctx, c)
+	l, err = state.fresh(ctx, c)
 	if err != nil {
 		state.mu.Lock()
 		retained := state.current
@@ -548,7 +564,7 @@ func (c *OriginRevocationChecker) CheckWBAKey(ctx context.Context, origin, keyID
 // Details returns the retained revocation detail for (origin, keyID), for
 // assessing compromise exposure with RevocationDetails.Exposes.
 func (c *OriginRevocationChecker) Details(origin, keyID string) (RevocationDetails, bool) {
-	l := c.retained(origin)
+	l, _ := c.retained(context.Background(), origin)
 	if l == nil || !l.IsRevoked(keyID) {
 		return RevocationDetails{}, false
 	}
@@ -557,7 +573,7 @@ func (c *OriginRevocationChecker) Details(origin, keyID string) (RevocationDetai
 
 // RevokedKids returns the sorted kids retained as revoked for origin.
 func (c *OriginRevocationChecker) RevokedKids(origin string) []string {
-	l := c.retained(origin)
+	l, _ := c.retained(context.Background(), origin)
 	if l == nil {
 		return nil
 	}
@@ -569,10 +585,13 @@ func (c *OriginRevocationChecker) RevokedKids(origin string) []string {
 	return out
 }
 
-func (c *OriginRevocationChecker) retained(origin string) *RevocationList {
+// retained returns the revocations held for origin: the admitted state's
+// list, or the History's. A History read failure is reported, never
+// treated as "nothing retained".
+func (c *OriginRevocationChecker) retained(ctx context.Context, origin string) (*RevocationList, error) {
 	origin, err := webBotAuthOrigin(origin)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	c.mu.Lock()
 	state := c.origins[origin]
@@ -580,10 +599,13 @@ func (c *OriginRevocationChecker) retained(origin string) *RevocationList {
 	if state != nil {
 		state.mu.Lock()
 		defer state.mu.Unlock()
-		return state.current
+		return state.current, nil
 	}
-	l, _ := c.history.LoadRevocations(context.Background(), origin)
-	return l
+	l, err := c.history.LoadRevocations(ctx, origin)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", errRevocationStore, err)
+	}
+	return l, nil
 }
 
 // operatorBucket is the quota group of an origin: its registrable domain,
@@ -661,12 +683,23 @@ func (c *OriginRevocationChecker) discover(ctx context.Context, origin string, c
 	defer cancel()
 	state := &originRevocations{origin: origin}
 	hist, err := c.history.LoadRevocations(ctx, origin)
-	if err == nil && hist != nil {
+	if err != nil {
+		err = fmt.Errorf("%w: %w", errRevocationStore, err)
+	} else if hist != nil {
 		state.current = hist
 		state.interval = min(hist.NextUpdate.Sub(hist.Updated), revocationMaxInterval)
 	}
 	if err == nil {
 		_, err = state.fresh(ctx, c)
+	}
+	// A verified list the History could not store is admitted anyway: it
+	// must keep revoking its keys, and fresh keeps the origin stale until a
+	// store succeeds.
+	state.mu.Lock()
+	keep := err != nil && state.unpersisted != nil && state.current != nil
+	state.mu.Unlock()
+	if keep {
+		err = nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -745,7 +778,7 @@ func (c *OriginRevocationChecker) pruneFailures() {
 func (s *originRevocations) fresh(ctx context.Context, c *OriginRevocationChecker) (*RevocationList, error) {
 	s.mu.Lock()
 	now := c.clock()
-	if s.current != nil && now.Before(s.current.NextUpdate) {
+	if s.current != nil && s.unpersisted == nil && now.Before(s.current.NextUpdate) {
 		l := s.current
 		s.mu.Unlock()
 		return l, nil

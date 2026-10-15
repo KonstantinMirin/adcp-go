@@ -162,8 +162,8 @@ type MiddlewareOptions struct {
 	// request carrying Signature-Agent or a web-bot-auth tag is then
 	// verified under Web Bot Auth only and never falls back to the RFC 9421
 	// profile, including under ObserveOnly. Failures are answered with the
-	// profile's statuses (400, 403 with Accept-Signature, 429), not
-	// request_signature_* codes. A non-empty Web Bot Auth signed body must be
+	// profile's statuses (400, 403 with Accept-Signature, 403 without it for
+	// a revoked key, 429), not request_signature_* codes. A non-empty Web Bot Auth signed body must be
 	// strict JSON (no duplicate or case-folded duplicate keys) or it is
 	// rejected with 400. When nil, Web Bot Auth requests take the RFC 9421
 	// path as before, and the middleware logs at INFO that the RFC 9421
@@ -190,8 +190,10 @@ type WebBotAuthOptions struct {
 	// is refused with 403 and no Accept-Signature. Every other state is
 	// recorded in VerifiedSigner.Revocation for the Authorizer:
 	// identity.BindingGate treats an origin with no list, or no checker, as
-	// identity-established, and fails spend-committing calls closed with
-	// SERVICE_UNAVAILABLE while the list is stale. Nil skips the check, so
+	// identity-established, fails spend-committing calls closed with
+	// SERVICE_UNAVAILABLE while the list is stale, and fails every bound
+	// call with SERVICE_UNAVAILABLE while the revocation store is
+	// unavailable. Nil skips the check, so
 	// no origin can be bound.
 	Revocation WBARevocationChecker
 

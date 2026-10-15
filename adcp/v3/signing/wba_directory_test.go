@@ -78,6 +78,17 @@ func TestVerifyDirectoryResponseRejectsTampering(t *testing.T) {
 			r.Header.Del("Signature")
 			r.Header.Del("Signature-Input")
 		}, origin, wbaTestNow},
+		{"private member in another case", func(r *DirectoryResponse) {
+			resign(r, []byte(strings.Replace(string(r.Body), `"use":"sig"`, `"use":"sig","D":"AAAA"`, 1)))
+			r.Header.Del("Signature")
+			r.Header.Del("Signature-Input")
+		}, origin, wbaTestNow},
+		{"only a non-canonical (padded) key encoding", func(r *DirectoryResponse) {
+			jwk, _ := PublicDirectoryKey(keyA)
+			resign(r, []byte(`{"keys":[{"kty":"OKP","crv":"Ed25519","x":"`+jwk.X+`="}]}`))
+			r.Header.Del("Signature")
+			r.Header.Del("Signature-Input")
+		}, origin, wbaTestNow},
 		{"symmetric key material", func(r *DirectoryResponse) {
 			resign(r, []byte(`{"keys":[{"kty":"oct","k":"c2VjcmV0"}]}`))
 			r.Header.Del("Signature")
@@ -449,4 +460,102 @@ func TestDirectoryResolverOperatorIsolation(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	require.Equal(t, 1, dirs.count("https://good.example.org"))
+}
+
+// TestDirectoryResolverLocalRefusals: refreshing a cached origin never
+// competes with first discovery for the global slots, and when the
+// resolver's own limits refuse a refresh, the cached keys stay usable for
+// one more cache period only, never for MaxStale.
+func TestDirectoryResolverLocalRefusals(t *testing.T) {
+	now := wbaTestNow
+	clock := func() time.Time { return now }
+	dirs := newFakeDirectories()
+	a, b, c := "https://a.example.com", "https://b.example.com", "https://c.example.net"
+	key := newEd25519(t)
+	jwk, _ := PublicDirectoryKey(key)
+	for _, o := range []string{a, b, c} {
+		dirs.publish(t, o, now.Add(-time.Minute), 24*time.Hour, key)
+	}
+	ctx := context.Background()
+
+	// Global cap: one slot, held by a stalled first discovery of c.
+	d := NewDirectoryResolver(DirectoryResolverOptions{Fetch: dirs.fetch, Clock: clock, MaxOrigins: 1})
+	_, err := d.ResolveWBAKey(ctx, a, jwk.Kid)
+	require.NoError(t, err)
+	release := make(chan struct{})
+	dirs.mu.Lock()
+	dirs.block[c] = release
+	dirs.mu.Unlock()
+	go func() { _, _ = d.ResolveWBAKey(context.Background(), c, jwk.Kid) }()
+	require.Eventually(t, func() bool { return dirs.count(c) == 1 }, time.Second, time.Millisecond)
+	now = now.Add(6 * time.Minute)
+	got, err := d.ResolveWBAKey(ctx, a, jwk.Kid)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Equal(t, 2, dirs.count(a), "the cached origin was refreshed despite the full global cap")
+	close(release)
+
+	// Per-operator cap: a refused refresh serves the cache for one more
+	// cache period, then fails as a discovery failure.
+	now = wbaTestNow
+	d = NewDirectoryResolver(DirectoryResolverOptions{Fetch: dirs.fetch, Clock: clock, MaxPendingPerOperator: 1})
+	_, err = d.ResolveWBAKey(ctx, a, jwk.Kid)
+	require.NoError(t, err)
+	release = make(chan struct{})
+	defer close(release)
+	dirs.mu.Lock()
+	dirs.block[b] = release
+	dirs.mu.Unlock()
+	go func() { _, _ = d.ResolveWBAKey(context.Background(), b, jwk.Kid) }()
+	require.Eventually(t, func() bool { return dirs.count(b) == 1 }, time.Second, time.Millisecond)
+	now = now.Add(6 * time.Minute)
+	got, err = d.ResolveWBAKey(ctx, a, jwk.Kid)
+	require.NoError(t, err)
+	require.NotNil(t, got, "within one cache period of the refresh point")
+	now = now.Add(5 * time.Minute)
+	_, err = d.ResolveWBAKey(ctx, a, jwk.Kid)
+	require.True(t, IsDiscoveryFailure(err), "a local refusal does not stretch the cache to MaxStale")
+}
+
+// TestDirectoryResolverFailureErrorsArePerRequest: concurrent waiters on one
+// failed discovery each get their own error, so one request's labels never
+// reach another's Accept-Signature.
+func TestDirectoryResolverFailureErrorsArePerRequest(t *testing.T) {
+	rig := newWBARig(t)
+	release := make(chan struct{})
+	rig.dirs.mu.Lock()
+	rig.dirs.errs[rig.origin] = errors.New("timeout")
+	rig.dirs.block[rig.origin] = release
+	rig.dirs.mu.Unlock()
+	rig.resolver = NewDirectoryResolver(DirectoryResolverOptions{Fetch: rig.dirs.fetch, Clock: wbaClock})
+	labels := []string{"alpha", "bravo", "charlie", "delta"}
+	type result struct {
+		label  string
+		header string
+	}
+	results := make(chan result, len(labels))
+	var wg sync.WaitGroup
+	for _, label := range labels {
+		r := httptest.NewRequest(http.MethodGet, "https://seller.example.com/adcp/get_principal", nil)
+		require.NoError(t, SignWebBotAuthRequest(r, rig.key, WBASignOptions{AgentOrigin: rig.origin, Label: label, Clock: wbaClock}))
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := VerifyWebBotAuthRequest(r, rig.opts())
+			we := AsWBAError(err)
+			if we == nil {
+				results <- result{label, ""}
+				return
+			}
+			results <- result{label, we.ResponseHeader().Get("Accept-Signature")}
+		}()
+	}
+	require.Eventually(t, func() bool { return rig.dirs.count(rig.origin) == 1 }, time.Second, time.Millisecond)
+	time.Sleep(20 * time.Millisecond) // let every waiter join the shared fetch
+	close(release)
+	wg.Wait()
+	close(results)
+	for res := range results {
+		require.True(t, strings.HasPrefix(res.header, res.label+"="), "%s got %q", res.label, res.header)
+	}
 }

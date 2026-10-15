@@ -478,8 +478,9 @@ type ListingStatus int
 const (
 	// Listed: the operator's record lists the origin with the role.
 	Listed ListingStatus = iota
-	// Unlisted: the last record read does not list it (including a removed
-	// record, no published record, or no registrable domain).
+	// Unlisted: the last record read does not list it (including an empty
+	// agents[]), the operator has never published a record, or the origin
+	// has no registrable domain.
 	Unlisted
 	// Unavailable: the record cannot be read now, and the last record read
 	// listed the origin (or there is none).
@@ -520,7 +521,7 @@ func (e *TrustRecordEvaluator) CheckListing(ctx context.Context, origin, role st
 		return Listing{Status: Listed, Record: rec}
 	}
 	if !IsTrustRecordUnavailable(err) {
-		// Not listed, absent or removed, or no registrable domain.
+		// Not listed, never published, or no registrable domain.
 		return Listing{Status: Unlisted, Err: err}
 	}
 	domain, ok := psl.RegistrableDomain(origin)
@@ -682,7 +683,7 @@ func (e *TrustRecordEvaluator) coolHost(host string, now time.Time) {
 // ErrRevocationListRequired is returned by Bind for a signer whose origin
 // does not serve a current revocation list (VerifiedSigner.Revocation is
 // not RevocationCurrent): an identity that serves no revocation list stays
-// identity-established and cannot be bound for spend.
+// identity-established and cannot be bound.
 var ErrRevocationListRequired = errors.New("identity: binding requires the origin to serve a current revocation list")
 
 // Bind evaluates the trust record of a verified Web Bot Auth signer's

@@ -727,7 +727,9 @@ func TestWBATargetURIAsReceived(t *testing.T) {
 	server := received(client, "/a%7Eb/mcp/?q=%7e&x=a+b", "seller.example.com")
 	in, _ := parseSFDictionary(server.Header.Get("Signature-Input"))
 	m, _ := in.get("sig1")
-	base, err := wbaSignatureBase(server.Method, receivedTargetURI(server, "https"), server.Header, m, false)
+	target, ok := receivedTargetURI(server, "https")
+	require.True(t, ok)
+	base, err := wbaSignatureBase(server.Method, target, server.Header, m, false)
 	require.NoError(t, err)
 	require.Contains(t, base, `"@target-uri": `+sent+"\n", "not canonicalized")
 	_, err = VerifyWebBotAuthRequest(server, rig.opts())
@@ -769,4 +771,24 @@ func TestCheckWBARevocation(t *testing.T) {
 	require.Equal(t, "r", we.Label)
 	require.Empty(t, we.ResponseHeader().Get("Accept-Signature"))
 	require.False(t, IsDiscoveryFailure(err))
+}
+
+// TestWBAAbsoluteFormTargetMustMatchConnection: an absolute-form
+// request-target is used as received only when its scheme and authority
+// match the connection, so a signature captured over one scheme cannot be
+// replayed over another.
+func TestWBAAbsoluteFormTargetMustMatchConnection(t *testing.T) {
+	rig := newWBARig(t)
+	r := httptest.NewRequest(http.MethodGet, "http://seller.example.com/x", nil)
+	require.NoError(t, SignWebBotAuthRequest(r, rig.key, WBASignOptions{AgentOrigin: rig.origin, Clock: wbaClock}))
+	opts := rig.opts()
+	opts.Scheme = "https" // the connection is TLS; the signed target says http
+	_, err := VerifyWebBotAuthRequest(r, opts)
+	requireWBAStatus(t, err, http.StatusForbidden)
+
+	r = httptest.NewRequest(http.MethodGet, "https://seller.example.com/x", nil)
+	require.NoError(t, SignWebBotAuthRequest(r, rig.key, WBASignOptions{AgentOrigin: rig.origin, Clock: wbaClock}))
+	r.Host = "other.example.com"
+	_, err = VerifyWebBotAuthRequest(r, rig.opts())
+	requireWBAStatus(t, err, http.StatusForbidden)
 }

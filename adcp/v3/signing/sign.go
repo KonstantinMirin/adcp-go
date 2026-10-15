@@ -108,6 +108,9 @@ func NewSigner(opts SignerOptions) (*Signer, error) {
 		if opts.AgentOrigin == "" {
 			return nil, fmt.Errorf("signing: RSA keys sign only under Web Bot Auth (set AgentOrigin)")
 		}
+		if n := opts.PrivateKey.(*rsa.PrivateKey).N.BitLen(); n < rsaMinModulus || n > rsaMaxModulus {
+			return nil, fmt.Errorf("signing: Web Bot Auth RSA keys are %d to %d bits", rsaMinModulus, rsaMaxModulus)
+		}
 		alg = AlgRSAPSSSHA512
 	default:
 		return nil, fmt.Errorf("signing: unsupported private key type %T", opts.PrivateKey)

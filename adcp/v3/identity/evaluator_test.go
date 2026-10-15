@@ -581,9 +581,13 @@ func TestBindingGateOutageRules(t *testing.T) {
 			require.NoError(t, err)
 			require.Empty(t, got, "no revocation list: identity-established, never bound for spend (%s)", state)
 		}
+		unavailable := *signer
+		unavailable.Revocation = signing.RevocationUnavailable
+		_, err := gate.AuthorizeWBA(ctx, &unavailable, "get_media_buys")
+		expectUnavailable(t, err)
 		stale := *signer
 		stale.Revocation = signing.RevocationStale
-		_, err := gate.AuthorizeWBA(ctx, &stale, "create_media_buy")
+		_, err = gate.AuthorizeWBA(ctx, &stale, "create_media_buy")
 		expectUnavailable(t, err)
 		got, err := gate.AuthorizeWBA(ctx, &stale, "get_media_buys")
 		require.NoError(t, err)

@@ -276,7 +276,9 @@ func UsesWebBotAuth(h http.Header) bool {
 // WBAKeyResolver resolves a Web Bot Auth key by the pair (origin, key ID),
 // never by the key ID alone (WBA §5.4): the origin is the one the covered
 // Signature-Agent member names. It returns (nil, nil) when the origin's
-// directory does not hold the key. It is the resolver for many signers that
+// directory does not hold the key. A resolver that cannot resolve the
+// directory returns a *WBAError with Status 403 and DiscoveryFailure set,
+// so the verifier reports ErrDiscoveryFailure. It is the resolver for many signers that
 // a seller with many buyers uses instead of a hand-written keyid-to-agent
 // map; DirectoryResolver is the production implementation.
 type WBAKeyResolver interface {
@@ -297,13 +299,19 @@ const (
 	// refused with 403, without Accept-Signature.
 	RevocationRevoked
 	// RevocationNoList: the origin serves no revocation list. The identity
-	// is identity-established and cannot be bound for spend.
+	// stays identity-established: it cannot be bound, and a binding gives
+	// it no principal.
 	RevocationNoList
 	// RevocationStale: the list could not be read, or is past its
 	// next_update plus grace. The identity is not established for spend:
 	// spend-committing calls fail closed with SERVICE_UNAVAILABLE in the
-	// authorization layer.
+	// authorization layer. Other calls proceed.
 	RevocationStale
+	// RevocationUnavailable: the revocations retained for the origin
+	// cannot be read (a revocation-store failure), so none of its calls
+	// may act under a binding: the authorization layer answers
+	// SERVICE_UNAVAILABLE.
+	RevocationUnavailable
 )
 
 // String returns the state's name, for logs.
@@ -317,6 +325,8 @@ func (s RevocationState) String() string {
 		return "no_list"
 	case RevocationStale:
 		return "stale"
+	case RevocationUnavailable:
+		return "unavailable"
 	default:
 		return "unchecked"
 	}
@@ -468,7 +478,10 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*Verifie
 	if err != nil {
 		return nil, labels, wbaFail(http.StatusForbidden, wba[0].label, "request body unreadable or too large")
 	}
-	requestURL := receivedTargetURI(r, scheme)
+	requestURL, ok := receivedTargetURI(r, scheme)
+	if !ok {
+		return nil, labels, wbaFail(http.StatusForbidden, wba[0].label, "absolute-form request-target does not match the connection's scheme and Host")
+	}
 	if len(opts.Authorities) > 0 {
 		u, err := url.Parse(requestURL)
 		if err != nil || !authorityAllowed(canonicalAuthority(u.Host, strings.ToLower(u.Scheme)), strings.ToLower(u.Scheme), opts.Authorities) {
@@ -631,16 +644,24 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*Verifie
 // receivedTargetURI returns the request's target URI as received (RFC 9421
 // §2.2.2): the scheme, the Host field, and the request-target exactly as it
 // arrived, so percent-encoding is preserved. An absolute-form
-// request-target is used as is.
-func receivedTargetURI(r *http.Request, scheme string) string {
-	target := r.RequestURI
+// request-target is used as is, and only when its scheme is the
+// connection's and its authority is the Host field's (ok is false
+// otherwise), so a signature captured over one scheme cannot be replayed
+// over another.
+func receivedTargetURI(r *http.Request, scheme string) (target string, ok bool) {
+	raw := r.RequestURI
 	switch {
-	case strings.HasPrefix(target, "/"):
-		return scheme + "://" + r.Host + target
-	case target != "" && target != "*":
-		if u, err := url.Parse(target); err == nil && u.IsAbs() {
-			return target
+	case strings.HasPrefix(raw, "/"):
+		return scheme + "://" + r.Host + raw, true
+	case raw != "" && raw != "*":
+		u, err := url.Parse(raw)
+		if err != nil || !u.IsAbs() {
+			return "", false
 		}
+		if !strings.EqualFold(u.Scheme, scheme) || canonicalAuthority(u.Host, scheme) != canonicalAuthority(r.Host, scheme) {
+			return "", false
+		}
+		return raw, true
 	}
 	host := r.Host
 	if host == "" {
@@ -649,7 +670,7 @@ func receivedTargetURI(r *http.Request, scheme string) string {
 	if r.URL.IsAbs() {
 		scheme = r.URL.Scheme
 	}
-	return scheme + "://" + host + r.URL.RequestURI()
+	return scheme + "://" + host + r.URL.RequestURI(), true
 }
 
 // sentTargetURI returns the target URI a client request will carry on the
@@ -845,6 +866,13 @@ func wbaKeyAlgorithm(jwk JWK) (Algorithm, error) {
 	if (jwk.Use != "" && jwk.Use != "sig") || jwk.PrivateD != "" || jwk.TestOnlyPrivateD != "" {
 		return "", wbaFail(http.StatusForbidden, "", "directory key is not a public signing key")
 	}
+	// One key, one thumbprint: key members must be canonical unpadded
+	// base64url, so the same key cannot appear under several thumbprints.
+	for _, m := range []string{jwk.X, jwk.Y, jwk.N, jwk.E} {
+		if m != "" && !canonicalB64URL(m) {
+			return "", wbaFail(http.StatusForbidden, "", "directory key member is not canonical base64url")
+		}
+	}
 	if jwk.Alg != "" && jwk.Alg != jwsAlg {
 		return "", wbaFail(http.StatusForbidden, "", "directory key algorithm mismatch")
 	}
@@ -852,6 +880,11 @@ func wbaKeyAlgorithm(jwk JWK) (Algorithm, error) {
 		return "", wbaFail(http.StatusForbidden, "", "directory key cannot verify")
 	}
 	return alg, nil
+}
+
+func canonicalB64URL(s string) bool {
+	b, err := base64.RawURLEncoding.Strict().DecodeString(s)
+	return err == nil && base64.RawURLEncoding.EncodeToString(b) == s
 }
 
 func containsString(list []string, s string) bool {

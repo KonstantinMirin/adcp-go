@@ -169,8 +169,11 @@ func parseDirectoryKeys(body []byte) (map[string]JWK, error) {
 		if err := json.Unmarshal(raw, &members); err != nil {
 			return nil, errors.New("signing: key directory entry is not an object")
 		}
-		for _, private := range []string{"d", "p", "q", "dp", "dq", "qi", "k"} {
-			if _, ok := members[private]; ok {
+		// encoding/json matches struct fields case-insensitively, so match
+		// private member names under case folding too.
+		for name := range members {
+			switch strictjson.Fold(name) {
+			case strictjson.Fold("d"), strictjson.Fold("p"), strictjson.Fold("q"), strictjson.Fold("dp"), strictjson.Fold("dq"), strictjson.Fold("qi"), strictjson.Fold("k"):
 				return nil, errors.New("signing: key directory entry carries private key material")
 			}
 		}

@@ -29,11 +29,12 @@ type GrantRequest struct {
 	// signing.ProfileTagWebBotAuth (the default) or
 	// signing.ProfileTagRequestSigning.
 	SigningProfile string
-	// Spend marks a claim for a spend-committing operation. While a record
-	// on the chain cannot be read, a spend claim gets SERVICE_UNAVAILABLE;
-	// any other claim continues on the last record read within the
-	// evaluator's OutageContinuation bound.
-	Spend bool
+	// NonSpend marks a claim for an operation that commits no spend. While
+	// a record on the chain cannot be read, only such a claim continues on
+	// the last record read, within the evaluator's OutageContinuation
+	// bound; every other claim (the default, so a caller that does not say
+	// fails closed) gets SERVICE_UNAVAILABLE.
+	NonSpend bool
 }
 
 // Grant evaluation outcomes. A denial surfaces externally as
@@ -138,11 +139,10 @@ type GrantHook func(ctx context.Context, req GrantRequest) (bool, error)
 //     so LegacyAuthorization (brand.json authorized_operators) runs only
 //     when the brand has never published one. A fetch failure, including a
 //     404 or 410 after a record was published, is never absence and invokes
-//     neither hook: the last record read stands. A spend claim
-//     (GrantRequest.Spend) then gets SERVICE_UNAVAILABLE; any other claim
-//     is evaluated on the last records read while they are within the
+//     neither hook: the last record read stands. A claim marked NonSpend is
+//     evaluated on the last records read while they are within the
 //     evaluator's OutageContinuation bound, and gets SERVICE_UNAVAILABLE
-//     after it.
+//     after it; any other claim gets SERVICE_UNAVAILABLE at once.
 //
 // Under Web Bot Auth, the signer's operator must also currently list the
 // signer's origin with adcp:buying.
@@ -196,14 +196,14 @@ func (g *GrantEvaluator) Check(ctx context.Context, req GrantRequest) (GrantAuth
 	if req.SigningProfile == signing.ProfileTagWebBotAuth {
 		// Web Bot Auth authority always needs a current operator role entry.
 		var deny *GrantAuthorization
-		if signerRec, deny = g.signerListing(ctx, origin, req.Spend); deny != nil {
+		if signerRec, deny = g.signerListing(ctx, origin, !req.NonSpend); deny != nil {
 			return *deny, nil
 		}
 		if signerOp == brandOp && brandOp == accountOp {
 			return GrantAuthorization{Authorized: true, ExpiresAt: signerRec.ExpiresAt}, nil
 		}
 	}
-	brandRec, err := g.Records.evaluateForGrant(ctx, req.BrandDomain, req.Spend)
+	brandRec, err := g.Records.evaluateForGrant(ctx, req.BrandDomain, !req.NonSpend)
 	if err != nil {
 		if IsTrustRecordAbsent(err) {
 			if g.LegacyAuthorization != nil {
@@ -227,7 +227,7 @@ func (g *GrantEvaluator) Check(ctx context.Context, req GrantRequest) (GrantAuth
 		// brand has no trust record. Once the brand serves 200, grants have
 		// one source and need the signer's operator role entry.
 		var deny *GrantAuthorization
-		if signerRec, deny = g.signerListing(ctx, origin, req.Spend); deny != nil {
+		if signerRec, deny = g.signerListing(ctx, origin, !req.NonSpend); deny != nil {
 			return *deny, nil
 		}
 		if signerOp == brandOp && brandOp == accountOp {
@@ -260,7 +260,7 @@ func (g *GrantEvaluator) Check(ctx context.Context, req GrantRequest) (GrantAuth
 		// operator directly, for example the platform hosting its agent.
 		links = [][]TrustGrant{match(brandRec.Record.Grants, signerOp, g.now())}
 	case len(first) > 0:
-		intermediary, err := g.Records.evaluateForGrant(ctx, accountOp, req.Spend)
+		intermediary, err := g.Records.evaluateForGrant(ctx, accountOp, !req.NonSpend)
 		switch {
 		case err == nil:
 		case IsTrustRecordUnavailable(err):
@@ -450,10 +450,11 @@ type GrantClaim struct {
 	Countries       []string
 	// Scope defaults to adcp:media_buying.
 	Scope string
-	// Spend marks a claim for a spend-committing operation (see
-	// GrantRequest.Spend). RequireAccountForOperation sets it from the
-	// operation.
-	Spend bool
+	// NonSpend marks a claim for an operation that commits no spend (see
+	// GrantRequest.NonSpend). RequireAccountForOperation and
+	// RequireDeclaration set it from the operation; a claim passed to
+	// RequireClaim without it is treated as spend.
+	NonSpend bool
 }
 
 // GrantGate applies grant evaluation before account side effects: at
@@ -470,6 +471,21 @@ type GrantGate struct {
 	// OperationClaim, when set, resolves the claim for an account and an
 	// operation, choosing the scope the operation needs.
 	OperationClaim func(ctx context.Context, accountID, operation string) (GrantClaim, error)
+	// SpendCommitting classifies operations for the outage rules, as on
+	// BindingGate. Defaults to signing.IsSpendCommittingOperation. An empty
+	// operation counts as spend.
+	SpendCommitting func(operation string) bool
+}
+
+// nonSpend reports whether operation is known to commit no spend.
+func (g *GrantGate) nonSpend(operation string) bool {
+	if operation == "" {
+		return false
+	}
+	if g.SpendCommitting != nil {
+		return !g.SpendCommitting(operation)
+	}
+	return !signing.IsSpendCommittingOperation(operation)
 }
 
 // RequireClaim authorizes claim for signer. A nil signer (no established
@@ -490,10 +506,18 @@ func (g *GrantGate) RequireClaim(ctx context.Context, claim GrantClaim, signer *
 		if signer.PrincipalID == "" {
 			return unboundDenial()
 		}
-		if claim.Spend && signer.Revocation != signing.RevocationCurrent {
-			// The identity is not established for spend while its
-			// revocation list is stale or absent.
+		switch signer.Revocation {
+		case signing.RevocationCurrent:
+		case signing.RevocationStale:
+			// Not established for spend while the list is stale.
+			if !claim.NonSpend {
+				return trustUnavailableError()
+			}
+		case signing.RevocationUnavailable:
 			return trustUnavailableError()
+		default:
+			// No revocation list, or no check: never bound.
+			return unboundDenial()
 		}
 	}
 	res, err := g.Evaluator.Check(ctx, GrantRequest{
@@ -504,7 +528,7 @@ func (g *GrantGate) RequireClaim(ctx context.Context, claim GrantClaim, signer *
 		BrandID:         claim.BrandID,
 		Countries:       claim.Countries,
 		SigningProfile:  profile,
-		Spend:           claim.Spend,
+		NonSpend:        claim.NonSpend,
 	})
 	if err != nil {
 		return grantAbsentError()
@@ -570,7 +594,7 @@ func (g *GrantGate) RequireAccountForOperation(ctx context.Context, accountID, o
 			return grantAbsentError()
 		}
 	}
-	claim.Spend = claim.Spend || signing.IsSpendCommittingOperation(operation)
+	claim.NonSpend = g.nonSpend(operation)
 	return g.RequireClaim(ctx, claim, signer)
 }
 
@@ -598,6 +622,7 @@ func (g *GrantGate) RequireDeclaration(ctx context.Context, account adcp.Account
 			BrandDomain:     account.Brand.Domain,
 			AccountOperator: account.Operator,
 			BrandID:         account.Brand.BrandID,
+			NonSpend:        g.nonSpend("sync_accounts"),
 		}, signer)
 	}
 	if account.AccountID != "" {

@@ -594,7 +594,19 @@ func TestGrantGate(t *testing.T) {
 	stale.Revocation = signing.RevocationStale
 	code, _ = permissionDetails(t, gate.RequireAccountForOperation(ctx, "acc_brand", "create_media_buy", &stale))
 	require.Equal(t, "SERVICE_UNAVAILABLE", code)
+	code, _ = permissionDetails(t, gate.RequireAccount(ctx, "acc_brand", &stale))
+	require.Equal(t, "SERVICE_UNAVAILABLE", code, "no operation counts as spend")
 	require.NoError(t, gate.RequireAccountForOperation(ctx, "acc_brand", "get_media_buys", &stale))
+	require.NoError(t, gate.RequireDeclaration(ctx, decl, &stale), "sync_accounts commits no spend")
+	unavailable := *signer
+	unavailable.Revocation = signing.RevocationUnavailable
+	code, _ = permissionDetails(t, gate.RequireAccountForOperation(ctx, "acc_brand", "get_media_buys", &unavailable))
+	require.Equal(t, "SERVICE_UNAVAILABLE", code, "a revocation-store outage blocks every bound call")
+	noList := *signer
+	noList.Revocation = signing.RevocationNoList
+	code, details = permissionDetails(t, gate.RequireAccountForOperation(ctx, "acc_brand", "create_media_buy", &noList))
+	require.Equal(t, "PERMISSION_DENIED", code, "no list is never bound: not retryable")
+	require.Nil(t, details)
 	callReq := toolRequestWithSigner(signer)
 	callReq.Params = &mcp.CallToolParamsRaw{Name: "create_media_buy"}
 	require.NoError(t, gate.RequireAccountForToolRequest(ctx, callReq, "acc_brand"))
@@ -624,8 +636,9 @@ func TestGrantGate(t *testing.T) {
 func TestGrantOutageRules(t *testing.T) {
 	ctx := context.Background()
 	req := GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"}
+	req.NonSpend = true
 	spend := req
-	spend.Spend = true
+	spend.NonSpend = false
 	brandGrants := `{"grants":[{"grantee":"agency-7k3q.com","scopes":["adcp:media_buying"]}]}`
 	requireUnavailable := func(t *testing.T, res GrantAuthorization) {
 		t.Helper()
@@ -668,15 +681,40 @@ func TestGrantOutageRules(t *testing.T) {
 			"agency-7k3q.com": `{"agents":[{"url":"https://buy.agency-7k3q.com/mcp","roles":["adcp:buying"]}],"grants":[{"grantee":"platform-7k3q.com","scopes":["adcp:media_buying"]}]}`,
 		}))
 		g := &GrantEvaluator{Records: r.eval}
-		chain := GrantRequest{AgentOrigin: platformAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"}
+		chain := GrantRequest{AgentOrigin: platformAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com", NonSpend: true}
 		res, _ := g.Check(ctx, chain)
 		require.True(t, res.Authorized)
 		r.server.set(trustURL("agency-7k3q.com"), http.StatusNotFound, "")
 		r.now = r.now.Add(2 * time.Minute)
 		res, _ = g.Check(ctx, chain)
 		require.True(t, res.Authorized, "a 404 is not a removal: the second link stands within the bound")
-		chain.Spend = true
+		chain.NonSpend = false
 		res, _ = g.Check(ctx, chain)
+		requireUnavailable(t, res)
+	})
+
+	t.Run("signer's operator record 404 after a read", func(t *testing.T) {
+		r := grantRig(t, with(baseRecords, map[string]string{"brand-7k3q.com": brandGrants}))
+		g := &GrantEvaluator{Records: r.eval}
+		res, _ := g.Check(ctx, req)
+		require.True(t, res.Authorized)
+		r.server.set(trustURL("agency-7k3q.com"), http.StatusNotFound, "")
+		r.now = r.now.Add(2 * time.Minute)
+		res, _ = g.Check(ctx, req)
+		require.True(t, res.Authorized, "the signer's last listing stands for a non-spend claim")
+		res, _ = g.Check(ctx, spend)
+		requireUnavailable(t, res)
+	})
+
+	t.Run("a claim not marked NonSpend fails closed", func(t *testing.T) {
+		r := grantRig(t, with(baseRecords, map[string]string{"brand-7k3q.com": brandGrants}))
+		g := &GrantEvaluator{Records: r.eval}
+		unmarked := GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"}
+		res, _ := g.Check(ctx, unmarked)
+		require.True(t, res.Authorized)
+		r.server.fail(trustURL("brand-7k3q.com"), errors.New("connection refused"))
+		r.now = r.now.Add(2 * time.Minute)
+		res, _ = g.Check(ctx, unmarked)
 		requireUnavailable(t, res)
 	})
 

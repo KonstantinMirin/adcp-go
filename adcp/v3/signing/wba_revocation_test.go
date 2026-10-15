@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -421,11 +422,15 @@ func TestMemoryRevocationHistory(t *testing.T) {
 
 // refusingHistory wraps the memory history and can be made to refuse.
 type refusingHistory struct {
-	inner  *memoryRevocationHistory
-	refuse atomic.Bool
+	inner   *memoryRevocationHistory
+	refuse  atomic.Bool
+	loadErr atomic.Bool
 }
 
 func (h *refusingHistory) LoadRevocations(ctx context.Context, origin string) (*RevocationList, error) {
+	if h.loadErr.Load() {
+		return nil, errors.New("store down")
+	}
 	return h.inner.LoadRevocations(ctx, origin)
 }
 
@@ -438,8 +443,9 @@ func (h *refusingHistory) StoreRevocations(ctx context.Context, origin string, l
 
 // TestOriginRevocationCheckerFailsClosedWhenHistoryRefuses: an origin whose
 // revocations the History cannot keep (over its quota, or a store outage)
-// fails closed rather than being checked against state an eviction or a
-// restart would forget, and recovers once the History accepts it.
+// is stale (no spend) rather than current, its verified list keeps revoking,
+// and it recovers once the History accepts it. A History that cannot be
+// read makes the state unavailable, never "nothing retained".
 func TestOriginRevocationCheckerFailsClosedWhenHistoryRefuses(t *testing.T) {
 	now := wbaTestNow
 	clock := func() time.Time { return now }
@@ -456,19 +462,23 @@ func TestOriginRevocationCheckerFailsClosedWhenHistoryRefuses(t *testing.T) {
 		rig.revs.set(t, revocationPayload{Updated: rfc3339(updated), NextUpdate: rfc3339(updated.Add(5 * time.Minute)), RevokedKids: []string{kid}})
 	}
 
-	// Discovery while the History refuses: SERVICE_UNAVAILABLE, not admitted.
+	// Discovery while the History refuses: stale, so no spend, but the
+	// verified list is kept and keeps revoking its keys.
 	hist.refuse.Store(true)
 	publish()
 	_, err = revokedWBAKey(checker, ctx, rig.origin, unrevoked)
 	requireRevocationState(t, err, RevocationStale)
-
-	// Accepted after the cooldown.
-	hist.refuse.Store(false)
-	now = now.Add(discoveryNegativeTTL + time.Second)
-	publish()
 	revoked, err := revokedWBAKey(checker, ctx, rig.origin, kid)
 	require.NoError(t, err)
-	require.True(t, revoked)
+	require.True(t, revoked, "a verified list the History refused still revokes")
+
+	// Persisted on the next refresh once the History accepts it.
+	hist.refuse.Store(false)
+	now = now.Add(revocationMinInterval + time.Second)
+	publish()
+	state, err := checker.CheckWBAKey(ctx, rig.origin, unrevoked)
+	require.NoError(t, err)
+	require.Equal(t, RevocationCurrent, state)
 
 	// An admitted origin whose next list cannot be stored fails closed too.
 	hist.refuse.Store(true)
@@ -487,6 +497,14 @@ func TestOriginRevocationCheckerFailsClosedWhenHistoryRefuses(t *testing.T) {
 	revoked, err = revokedWBAKey(checker, ctx, rig.origin, kid)
 	require.NoError(t, err)
 	require.True(t, revoked)
+
+	// A History read failure for an origin not held in memory.
+	failing := &refusingHistory{inner: newMemoryRevocationHistory(16)}
+	failing.loadErr.Store(true)
+	c2, err := NewOriginRevocationChecker(OriginRevocationCheckerOptions{Keys: rig.resolver, Fetch: rig.revs.fetch, Clock: clock, History: failing})
+	require.NoError(t, err)
+	_, err = revokedWBAKey(c2, ctx, rig.origin, kid)
+	requireRevocationState(t, err, RevocationUnavailable)
 }
 
 // revocationStateError carries a CheckWBAKey state other than revoked or

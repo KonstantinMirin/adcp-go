@@ -232,7 +232,8 @@ type VerifiedSigner struct {
 	// Revocation is the Web Bot Auth key's state in its origin's
 	// revocation list, set by CheckWBARevocation (the middleware runs it
 	// after verification, before the Authorizer). The authorization layer
-	// reads it: RevocationNoList cannot be bound for spend, and
-	// RevocationStale fails spend-committing calls closed.
+	// reads it: RevocationNoList cannot be bound, RevocationStale fails
+	// spend-committing calls closed, and RevocationUnavailable fails every
+	// call that would act under a binding.
 	Revocation RevocationState
 }

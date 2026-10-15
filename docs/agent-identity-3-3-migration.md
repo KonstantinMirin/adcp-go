@@ -30,7 +30,7 @@ Everything here is **opt-in and experimental**.
 2. Sign with the Web Bot Auth profile:
 
    ```go
-   priv, _, _ := signing.LoadPrivateKey(pemBytes) // Ed25519 or P-256; an *rsa.PrivateKey (2048+ bits) also works here
+   priv, _, _ := signing.LoadPrivateKey(pemBytes) // Ed25519 or P-256 (PrivateKey may also be an *rsa.PrivateKey of 2048 to 8192 bits)
    client, _ := signing.NewSignedHTTPClient(signing.SignedHTTPClientOptions{
        PrivateKey:         priv,
        AgentOrigin:        "https://buyer.example.com",
@@ -89,7 +89,7 @@ mw := signing.Middleware(signing.MiddlewareOptions{
   - RSA keys verify with `rsa-pss-sha512` (2048 to 8192 bits), as in the draft's Appendix E vectors.
 - **Key directories.** A plain, unsigned JWK Set is accepted by default; signatures that are present must verify. `DirectoryResolverOptions.RequireSignedDirectory` refuses unsigned directories.
   - **Discovery failures** (WBA §6.10) cover a directory that doesn't resolve: network or TLS error, timeout, any status other than `200` (including 404, 410, 429, 5xx), an invalid directory, or a fetch refused by the resolver's own limits.
-  - A discovery failure never evicts a cached directory. Its keys keep verifying for up to `MaxStale` (24 h by default, never past the directory signatures' expiry).
+  - A discovery failure never evicts a cached directory. Its keys keep verifying for up to `MaxStale` (24 h by default, never past the directory signatures' expiry). When the refusal comes from the resolver's own limits, they keep verifying for one more 5-minute cache period only.
   - With no usable cached copy, the request is unverified, and what happens is local policy (`WebBotAuthOptions.OnDiscoveryFailure`). The default is `403` with `Accept-Signature`. `DiscoveryFailureAnonymous` serves the request as anonymous, except operations in `RequiredFor`.
   - A directory that resolves without the key is evidence that the key was removed.
 - **Errors are split by layer.**
@@ -102,8 +102,9 @@ mw := signing.Middleware(signing.MiddlewareOptions{
   - `request_signature_*` codes remain for the RFC 9421 profile.
 - **Revocation** runs in the authorization layer (`signing.CheckWBARevocation`, from `WebBotAuthOptions.Revocation`) and is recorded in `VerifiedSigner.Revocation`:
   - **revoked:** refused, `403` with no `Accept-Signature`;
-  - **no list:** identity-established, and `Bind` refuses it (`identity.ErrRevocationListRequired`), so it can't be bound for spend;
-  - **stale** (unreadable, or past grace): spend-committing calls get `SERVICE_UNAVAILABLE` from `BindingGate` and `GrantGate`, and other calls proceed.
+  - **no list:** identity-established, and `Bind` refuses it (`identity.ErrRevocationListRequired`), so it can't be bound;
+  - **stale** (unreadable, past grace, or not storable in the `RevocationHistory`): spend-committing calls get `SERVICE_UNAVAILABLE` from `BindingGate` and `GrantGate`, and other calls proceed. The last verified list keeps revoking its keys;
+  - **unavailable** (the `RevocationHistory` can't be read): every bound call gets `SERVICE_UNAVAILABLE`.
 - **Identity-established.** A verified origin with no binding gets what an anonymous caller gets.
   - Operations in `UnboundFor` (default `get_adcp_capabilities` and `get_principal`) run with the verified identity attached. List there whatever needs the identity.
   - Any other operation is served exactly as an anonymous request, with no verified signer, so your application answers it as it answers anonymous callers. An operation in `RequiredFor` or `ProtocolMethodsRequiredFor` is refused with `PERMISSION_DENIED`.
@@ -133,7 +134,7 @@ mw := signing.Middleware(signing.MiddlewareOptions{
     - a self-operated brand (it is `account.operator`) grants the signer's operator directly, for example the platform hosting its agent;
     - the brand grants `account.operator`, which grants the signer's operator.
   - Before spend-committing calls, call `gate.RequireAccountForToolRequest(ctx, req, accountID)`. An operation outside media buying needs an explicit scope (`OperationClaim`).
-  - A grantor or intermediary record that can't be read is never `grant_absent`. That includes a `404`/`410` after the record was read. The last-read grants stand: a non-spend claim is evaluated on them within `OutageContinuation`. A spend claim (`GrantRequest.Spend`, set by `RequireAccountForOperation`) gets `SERVICE_UNAVAILABLE`, as does any claim after the bound. `authorized_operators` doesn't come back: there is no downgrade.
+  - A grantor or intermediary record that can't be read is never `grant_absent`. That includes a `404`/`410` after the record was read. The last-read grants stand: a non-spend claim is evaluated on them within `OutageContinuation`. Only a claim marked `NonSpend` continues: `RequireAccountForOperation` and `RequireDeclaration` set it from the operation, using `GrantGate.SpendCommitting`. Any other claim gets `SERVICE_UNAVAILABLE`, which includes an unmarked claim (fail closed) and any claim after the bound. `authorized_operators` doesn't come back: there is no downgrade.
   - `GrantEvaluator.LegacyAuthorization` (brand.json `authorized_operators`) runs only while the brand has never served a trust.json. `SellerAuthorization` is your discretion for uncovered claims and is disabled by `exclusive_grants`.
 - **Revocation.** `OriginRevocationChecker` retains every thumbprint-shaped revoked kid, at most 1024 per origin. It keeps `keyCompromise` and the earliest `invalidity_date`, and refuses older lists. Revocations survive eviction of an origin through `RevocationHistory`. The default history is in memory and refuses rather than evicts: at most 32 origins and 8,192 kids per quota group (the same grouping as the authority history), plus global bounds. An origin that doesn't fit is `RevocationStale` (no spend), and no other origin's revocations are forgotten. A stale list still revokes everything it revoked. **Public deployments must supply a durable `RevocationHistory`**, so revocations hold across restarts and replicas. `RevocationDetails.Exposes(receivedAt)` tells you which accepted buys came from suspect requests; never unwind them automatically.
 - **Advertising.** Advertise the profile with `identity.RequestSigningCapabilities{Profiles: []string{signing.ProfileTagRequestSigning, signing.ProfileTagWebBotAuth}}`, and advertise onboarding with `identity.AccountCapabilities.AgentOnboarding` (list `account.agent_onboarding` in `experimental_features`).
