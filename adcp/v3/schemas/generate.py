@@ -52,6 +52,9 @@ KNOWN_TYPES = {
     'SignalPricing', 'ActivationKey', 'CatalogResult',
     'EventSourceResult', 'LogEventResult',
     'CheckGovernanceCondition',
+    # validate_input warning items require `field` without declaring it, so a
+    # generated struct would drop it; hand-written in types.go (lint EXEMPT).
+    'ValidateInputWarning',
     # oneOf schemas — hand-writing flattens the union into a single struct with
     # all variant fields.
     'PricingOption', 'Deployment', 'PublisherPropertySelector',
@@ -134,6 +137,10 @@ TOOL_SCHEMAS = [
     "media-buy/create-media-buy-request.json",
     "media-buy/create-media-buy-response.json",
     "media-buy/update-media-buy-request.json",
+    "media-buy/request-proposals-request.json",
+    "media-buy/request-proposals-response.json",
+    "media-buy/decline-proposals-request.json",
+    "media-buy/decline-proposals-response.json",
     "media-buy/get-media-buys-request.json",
     "media-buy/get-media-buys-response.json",
     "media-buy/get-media-buy-delivery-request.json",
@@ -166,6 +173,8 @@ TOOL_SCHEMAS = [
     "creative/preview-creative-response.json",
     "creative/list-creative-formats-request.json",
     "creative/list-creative-formats-response.json",
+    "creative/validate-input-request.json",
+    "creative/validate-input-response.json",
     # Signals
     "signals/get-signals-request.json",
     "signals/get-signals-response.json",
@@ -309,6 +318,7 @@ CORE_SCHEMAS = [
 # Schemas that are not standalone tool requests/responses, but are important
 # SDK input shapes referenced by tool schemas.
 SUPPORT_SCHEMAS = [
+    "creative/validate-input-result.json",
     "media-buy/package-request.json",
     "media-buy/package-update.json",
     "media-buy/proposal-refinement.json",
@@ -1058,6 +1068,22 @@ INLINE_SCHEMA_TYPES = OrderedDict([
         "creative/preview-creative-request.json#/properties/requests/items",
     ),
     (
+        "DeclineProposalResult",
+        "media-buy/decline-proposals-response.json#/properties/results/items",
+    ),
+    (
+        "ValidateInputTarget",
+        "creative/validate-input-request.json#/properties/targets/items",
+    ),
+    (
+        "ValidateInputResultTarget",
+        "creative/validate-input-result.json#/properties/target",
+    ),
+    (
+        "ValidateInputViolation",
+        "creative/validate-input-result.json#/properties/violations/items",
+    ),
+    (
         "ForcedDirective",
         "compliance/comply-test-controller-response.json#/oneOf/3/properties/forced",
     ),
@@ -1137,6 +1163,7 @@ FIELD_DESCRIPTION_FALLBACK_SPECS = {
 # `additionalProperties: false`; open registrations are explicit so a new inline
 # helper cannot silently default to data-dropping open-object semantics.
 CLOSED_INLINE_SCHEMA_TYPES = frozenset({
+    'DeclineProposalResult',
     'RefinementConstraints',
     'CPMConstraint',
     'ImpressionsConstraint',
@@ -1258,6 +1285,9 @@ OPEN_INLINE_SCHEMA_TYPES = frozenset({
     'ArtifactWebhookConfig',
     'PreviewCreativeInput',
     'PreviewCreativeBatchRequest',
+    'ValidateInputTarget',
+    'ValidateInputResultTarget',
+    'ValidateInputViolation',
     'DeliveryAttributionWindow',
     'DeliveryReportingDimensions',
     'DeliveryReportingGeoDimension',
@@ -1330,6 +1360,10 @@ OPEN_INLINE_SCHEMA_TYPES = frozenset({
 # INLINE_TYPE_HINTS for sibling schema pointers. lint.py verifies these siblings
 # keep the same property set before we keep reusing a single Go type.
 SHARED_INLINE_OVERRIDES = {
+    "GetProductsIncompleteItem": [
+        "media-buy/get-products-response.json#/properties/incomplete/items",
+        "media-buy/request-proposals-response.json#/properties/incomplete/items",
+    ],
     "MetricQualifier": [
         "core/delivery-metric-aggregate.json#/oneOf/0/properties/qualifier",
         "core/missing-metric.json#/oneOf/0/properties/qualifier",
@@ -1356,6 +1390,7 @@ SHARED_INLINE_OVERRIDES = {
 # the same field and requiredness shape.
 CROSS_TYPE_INLINE_HINTS = {
     ('PerformanceFeedback', 'measurement_period'): 'DatetimeRange',
+    ('RequestProposalsResponse', 'incomplete'): 'GetProductsIncompleteItem',
 }
 
 # Named enum helpers generated from inline JSON Schema pointers. These cover
@@ -1511,10 +1546,18 @@ INLINE_TYPE_HINTS = {
     ('PreviewCreativeRequest', 'inputs'): 'PreviewCreativeInput',
     ('PreviewCreativeRequest', 'requests'): 'PreviewCreativeBatchRequest',
     ('PreviewCreativeBatchRequest', 'inputs'): 'PreviewCreativeInput',
+    ('ValidateInputRequest', 'targets'): 'ValidateInputTarget',
+    ('ValidateInputResult', 'target'): 'ValidateInputResultTarget',
+    ('ValidateInputResult', 'violations'): 'ValidateInputViolation',
+    ('ValidateInputResult', 'warnings'): 'ValidateInputWarning',
     ('ForcedDirectiveSuccess', 'forced'): 'ForcedDirective',
     ('SyncPlansRequest', 'plans'): 'Plan',
     ('GetProductsResponse', 'proposals'): 'Proposal',
     ('RefineProposalsRequest', 'adcp_major_version'): '*int',
+    ('RequestProposalsRequest', 'adcp_major_version'): '*int',
+    ('DeclineProposalsRequest', 'adcp_major_version'): '*int',
+    ('RequestProposalsResponse', 'incomplete'): 'GetProductsIncompleteItem',
+    ('DeclineProposalsResponse', 'results'): 'DeclineProposalResult',
     ('RefineProposalsRequest', 'refinements'): 'ProposalRefinement',
     ('ProposalRefinement', 'constraints'): '*RefinementConstraints',
     ('ProposalRefinement', 'criteria'): '*ProductDiscoveryCriteria',
@@ -1922,6 +1965,10 @@ INTENTIONAL_ANY_FIELDS = {
     ('CheckGovernanceRequest', 'payload'): 'governance can evaluate different protocol payloads',
     ('CheckGovernanceFinding', 'details'): 'governance finding details are structured but category-specific',
     ('ReportPlanOutcomeFinding', 'details'): 'outcome finding details are structured but category-specific',
+    ('RequestProposalsResponse', 'purchase_continuation'): 'deprecated 3.x projection-only coordinator state that a native 3.2 seller must not emit; removed in 4.0',
+    ('ValidateInputViolation', 'expected'): 'validate_input expected values are untyped: a string, a number or a range',
+    ('ValidateInputViolation', 'predicted'): 'validate_input predicted values are untyped: a string, a number or a range',
+    ('ValidateInputViolation', 'retry_with'): 'validate_input retry hints are advisory, platform-shaped input',
     # 3.1 forward-compatible allowances for auto-discovered referenced schemas.
     ('ProductFormatDeclaration', 'params'): 'canonical format parameters are schema-specific',
     ('VendorMetricValue', 'breakdown'): 'vendor metric breakdowns are vendor-defined',

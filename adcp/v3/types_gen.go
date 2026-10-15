@@ -9530,6 +9530,15 @@ type AuditObservation struct {
 
 // --- Support schema types ---
 
+// ValidateInputResult — Per-target result of a validate_input call. The `result_kind` discriminator (replacing the earlier
+type ValidateInputResult struct {
+	Target                 ValidateInputResultTarget `json:"target"`
+	ResultKind             string                    `json:"result_kind"`                        // Discriminator for the validation outcome. See schema description for the three
+	Violations             []ValidateInputViolation  `json:"violations,omitempty"`               // When `result_kind` is `validated_fail`, the specific constraints the manifest
+	Warnings               []ValidateInputWarning    `json:"warnings,omitempty"`                 // Non-blocking observations (e.g. LEAN policy advisories such as hover-triggered
+	MacroResolutionResults []MacroResolutionResult   `json:"macro_resolution_results,omitempty"` // Per-token compatibility against the selected target. Required or unsafe
+}
+
 // PackageInput — Package configuration for media buy creation. **Format selector contract (normative).** New 3.2
 type PackageInput struct {
 	AdcpVersion string `json:"adcp_version,omitempty"` // Release-precision AdCP version (VERSION.RELEASE, e.g. "3.0", "3.1"
@@ -10047,6 +10056,28 @@ type MacroResolutionCapability struct {
 	TranslationTarget  *MacroTranslationTarget `json:"translation_target,omitempty"`
 }
 
+// MacroResolutionResult — Path-addressable preflight result for one declaration. `resolvable` means the selected execution
+type MacroResolutionResult struct {
+	DeclarationID       string                   `json:"declaration_id"`
+	AssetPath           string                   `json:"asset_path"` // JSON Pointer to the asset carrying the declaration.
+	Token               string                   `json:"token"`
+	Dialect             MacroDialect             `json:"dialect"`
+	DialectNamespace    string                   `json:"dialect_namespace,omitempty"`
+	DialectRevision     string                   `json:"dialect_revision,omitempty"`
+	DialectSemantic     string                   `json:"dialect_semantic"`
+	MappingStatus       MacroMappingStatus       `json:"mapping_status"`
+	UniversalSemantic   UniversalMacro           `json:"universal_semantic,omitempty"`
+	Operation           MacroProcessingOperation `json:"operation"`
+	PerformedBy         MacroResolver            `json:"performed_by,omitempty"`
+	RequestedEncoding   MacroEncoding            `json:"requested_encoding"`
+	Required            bool                     `json:"required"`
+	UnavailableBehavior string                   `json:"unavailable_behavior"`
+	Status              string                   `json:"status"`
+	Reason              MacroResolutionReason    `json:"reason"`
+	MatchedEncodings    []MacroEncoding          `json:"matched_encodings,omitempty"` // Exact advertised profiles considered for this match, when relevant.
+	Message             string                   `json:"message,omitempty"`
+}
+
 // MacroTranslationTarget — The exact downstream-native token produced by a `translate_to_native` operation. The output asset
 type MacroTranslationTarget struct {
 	Token             string             `json:"token"`
@@ -10430,6 +10461,13 @@ type GetProductsRejected struct {
 type GetProductsTargetingResolution struct {
 	BriefTargeting Targeting `json:"brief_targeting"` // Structured delivery constraints the seller resolved from explicit hard
 	Ext            any       `json:"ext,omitempty"`
+}
+
+// ProposalDecline — Terminal buyer feedback for one immutable proposal snapshot.
+type ProposalDecline struct {
+	ProposalID string                `json:"proposal_id"` // Immutable proposal ID returned by request_proposals or refine_proposals.
+	Reason     ProposalDeclineReason `json:"reason"`
+	Detail     string                `json:"detail,omitempty"` // Optional short, non-identifying explanation. MUST NOT identify a competitor or
 }
 
 // PriceGuidance — Pricing guidance for auction-based bidding. Helps buyers calibrate bids with historical percentiles.
@@ -12481,6 +12519,30 @@ type PreviewCreativeBatchRequest struct {
 	ItemLimit        int                    `json:"item_limit,omitempty"`        // Maximum number of catalog items to render in this preview.
 }
 
+type DeclineProposalResult struct {
+	Outcome    string `json:"outcome"`
+	ProposalID string `json:"proposal_id"`
+	Reason     string `json:"reason,omitempty"` // Why the seller could not apply a decline. Present only for outcome unable.
+}
+
+type ValidateInputTarget struct {
+	Kind string `json:"kind"`
+	ID   string `json:"id"` // Agent-local capability_id from get_adcp_capabilities
+}
+
+type ValidateInputResultTarget struct {
+	Kind string `json:"kind"`
+	ID   string `json:"id"` // Canonical format name (e.g., 'image'), product_id, URI-form third-party format
+}
+
+type ValidateInputViolation struct {
+	Rule      string         `json:"rule"`                 // Rule name (e.g., 'duration_ms_range', 'aspect_ratio', 'max_file_size_kb').
+	Expected  any            `json:"expected,omitempty"`   // Expected value or range (e.g., '28000-32000', '9:16', 200).
+	Predicted any            `json:"predicted,omitempty"`  // Platform's pre-flight estimate for this field (NOT the actual output — there
+	Field     string         `json:"field"`                // Path to the violating field (e.g., 'assets.video_main.duration_ms').
+	RetryWith map[string]any `json:"retry_with,omitempty"` // Optional advisory adjustment hint. Platforms MAY suggest a corrected input
+}
+
 // ForcedDirective — Echo of the registered directive. The next matching operation call from this sandbox account will
 type ForcedDirective struct {
 	Arm          string   `json:"arm"`                     // Arm the seller will emit on the next forced operation response.
@@ -12876,6 +12938,68 @@ type UpdateMediaBuyRequest struct {
 	IdempotencyKey         string                  `json:"idempotency_key"`                    // Client-generated idempotency key for safe retries. If an update fails without
 	Context                any                     `json:"context,omitempty"`
 	Ext                    any                     `json:"ext,omitempty"`
+}
+
+// RequestProposalsRequest — Ask a seller to create one or more indicative media-plan proposals from a brief. Provide exactly
+type RequestProposalsRequest struct {
+	Account                *CanonicalAccountRef      `json:"account,omitempty"` // Alternative brand source for proposal terms. Provide either this natural-key
+	AdcpVersion            string                    `json:"adcp_version,omitempty"`
+	AdcpMajorVersion       *int                      `json:"adcp_major_version,omitempty"`
+	ContextID              string                    `json:"context_id,omitempty"` // MCP compatibility field: servers ignore this value; A2A uses transport-native
+	Context                any                       `json:"context,omitempty"`
+	GovernanceContext      string                    `json:"governance_context,omitempty"`
+	PushNotificationConfig *PushNotificationConfig   `json:"push_notification_config,omitempty"`
+	IdempotencyKey         string                    `json:"idempotency_key"` // Client-generated key required for retry-safe proposal creation.
+	Brand                  *BrandKey                 `json:"brand,omitempty"` // Alternative brand source for proposal terms. Provide either top-level brand or
+	Brief                  string                    `json:"brief"`           // Campaign goal, strategy, and requirements that are not represented in
+	Criteria               *ProductDiscoveryCriteria `json:"criteria,omitempty"`
+	Opportunity            *OpportunityContext       `json:"opportunity,omitempty"` // Optional planning-cycle context that the seller associates with every proposal
+}
+
+// RequestProposalsResponse — One or more immutable draft media-plan proposals and compact canonical products referenced by
+type RequestProposalsResponse struct {
+	Outcome     string                      `json:"outcome,omitempty"`
+	Status      string                      `json:"status,omitempty"`
+	TaskID      string                      `json:"task_id,omitempty"`
+	Message     string                      `json:"message,omitempty"`
+	Errors      []AdcpError                 `json:"errors,omitempty"`
+	Context     any                         `json:"context,omitempty"`
+	Ext         any                         `json:"ext,omitempty"`
+	AdcpVersion string                      `json:"adcp_version,omitempty"`
+	Reason      string                      `json:"reason,omitempty"`
+	Suggestions []string                    `json:"suggestions,omitempty"`
+	Proposals   []CanonicalProposal         `json:"proposals,omitempty"`
+	Products    []CanonicalProduct          `json:"products,omitempty"`
+	Incomplete  []GetProductsIncompleteItem `json:"incomplete,omitempty"` // Usable partial discovery result retained from the established get_products
+	// Deprecated: Deprecated AdCP 3.x projection instruction for purchasing products returned without a proposal.
+	PurchaseContinuation map[string]any                  `json:"purchase_continuation,omitempty"` // Deprecated AdCP 3.x projection instruction for purchasing products returned
+	TargetingResolution  *GetProductsTargetingResolution `json:"targeting_resolution,omitempty"`  // Response-level confirmation of structured targeting interpreted from explicit
+	Replayed             *bool                           `json:"replayed,omitempty"`
+}
+
+// DeclineProposalsRequest — Terminally decline one or more immutable proposals. Repeating an already-applied decline with a
+type DeclineProposalsRequest struct {
+	AdcpVersion            string                  `json:"adcp_version,omitempty"`
+	AdcpMajorVersion       *int                    `json:"adcp_major_version,omitempty"`
+	ContextID              string                  `json:"context_id,omitempty"` // MCP compatibility field: servers ignore this value; A2A uses transport-native
+	Context                any                     `json:"context,omitempty"`
+	GovernanceContext      string                  `json:"governance_context,omitempty"`
+	PushNotificationConfig *PushNotificationConfig `json:"push_notification_config,omitempty"`
+	IdempotencyKey         string                  `json:"idempotency_key"`       // Client-generated key required for retry-safe proposal decline.
+	Declines               []ProposalDecline       `json:"declines"`              // Proposal declines to apply. proposal_id is the semantic uniqueness key and
+	Opportunity            *OpportunityContext     `json:"opportunity,omitempty"` // Optional planning-cycle update. Every named proposal MUST belong to this
+}
+
+// DeclineProposalsResponse — One ordered terminal result for each requested proposal decline.
+type DeclineProposalsResponse struct {
+	Status   string                  `json:"status,omitempty"`
+	TaskID   string                  `json:"task_id,omitempty"`
+	Message  string                  `json:"message,omitempty"`
+	Errors   []AdcpError             `json:"errors,omitempty"`
+	Context  any                     `json:"context,omitempty"`
+	Ext      any                     `json:"ext,omitempty"`
+	Results  []DeclineProposalResult `json:"results,omitempty"`
+	Replayed *bool                   `json:"replayed,omitempty"`
 }
 
 // GetMediaBuysRequest — Request parameters for retrieving media buy status, creative approval state, and optional delivery
@@ -13342,6 +13466,33 @@ type PreviewCreativeRequest struct {
 	PushNotificationConfig *PushNotificationConfig       `json:"push_notification_config,omitempty"` // Optional webhook configuration for terminal completion/failure notifications
 	Context                any                           `json:"context,omitempty"`
 	Ext                    any                           `json:"ext,omitempty"`
+}
+
+// ValidateInputRequest — Request payload for the validate_input task. Lets buyers preflight a creative manifest against
+type ValidateInputRequest struct {
+	Account  *AccountReference     `json:"account,omitempty"` // Optional account scope for seller-specific product validation. Required by
+	Brand    *BrandReference       `json:"brand,omitempty"`   // Optional brand scope when account is omitted or the seller keys sandbox
+	Manifest CreativeManifest      `json:"manifest"`          // Creative manifest to validate.
+	Targets  []ValidateInputTarget `json:"targets,omitempty"` // Discriminated list of validation targets. Each entry mirrors the `target`
+}
+
+// ValidateInputResponse — Response payload for the validate_input task. Returns per-target manifest validation results — one
+type ValidateInputResponse struct {
+	AdcpVersion string `json:"adcp_version,omitempty"` // Release-precision AdCP version (VERSION.RELEASE, e.g. "3.0", "3.1"
+	// Deprecated: DEPRECATED in favor of adcp_version (release-precision string).
+	AdcpMajorVersion       int                     `json:"adcp_major_version,omitempty"`       // DEPRECATED in favor of adcp_version (release-precision string). Servers MUST
+	ContextID              string                  `json:"context_id,omitempty"`               // Transport-managed conversation identifier. On A2A, this maps to the native
+	Context                any                     `json:"context,omitempty"`                  // Per-request opaque caller-supplied correlation object echoed unchanged in the
+	TaskID                 string                  `json:"task_id,omitempty"`                  // Unique identifier for tracking asynchronous operations. Present when a task
+	Status                 TaskStatus              `json:"status"`                             // Current AdCP task state or structured outcome. Indicates whether the task
+	Message                string                  `json:"message,omitempty"`                  // Human-readable summary of the task result. Provides natural language
+	Timestamp              string                  `json:"timestamp,omitempty"`                // ISO 8601 timestamp when the response was generated. Useful for debugging
+	Replayed               *bool                   `json:"replayed,omitempty"`                 // Set to true when this response was returned from the idempotency cache rather
+	AdcpError              AdcpError               `json:"adcp_error,omitempty"`               // Transport-envelope error signal for fatal task failures. Per the two-layer
+	PushNotificationConfig *PushNotificationConfig `json:"push_notification_config,omitempty"` // AdCP application-layer webhook configuration for async task updates over MCP
+	GovernanceContext      string                  `json:"governance_context,omitempty"`       // Opaque authorization context issued only by an approved check_governance
+	Payload                map[string]any          `json:"payload,omitempty"`                  // Conceptual grouping for the task-specific response data defined by individual
+	Results                []ValidateInputResult   `json:"results"`                            // Per-target validation results.
 }
 
 // GetSignalsRequest — Request parameters for discovering and refining signals. Use signal_spec for natural language
