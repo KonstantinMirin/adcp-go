@@ -467,14 +467,18 @@ func TestDirectoryResolverOperatorIsolation(t *testing.T) {
 // resolver's own limits refuse a refresh, the cached keys stay usable for
 // one more cache period only, never for MaxStale.
 func TestDirectoryResolverLocalRefusals(t *testing.T) {
-	now := wbaTestNow
-	clock := func() time.Time { return now }
+	// The clock is read by background discovery goroutines, so it is
+	// atomic.
+	var nowNanos atomic.Int64
+	setNow := func(t time.Time) { nowNanos.Store(t.UnixNano()) }
+	setNow(wbaTestNow)
+	clock := func() time.Time { return time.Unix(0, nowNanos.Load()) }
 	dirs := newFakeDirectories()
 	a, b, c := "https://a.example.com", "https://b.example.com", "https://c.example.net"
 	key := newEd25519(t)
 	jwk, _ := PublicDirectoryKey(key)
 	for _, o := range []string{a, b, c} {
-		dirs.publish(t, o, now.Add(-time.Minute), 24*time.Hour, key)
+		dirs.publish(t, o, wbaTestNow.Add(-time.Minute), 24*time.Hour, key)
 	}
 	ctx := context.Background()
 
@@ -488,7 +492,7 @@ func TestDirectoryResolverLocalRefusals(t *testing.T) {
 	dirs.mu.Unlock()
 	go func() { _, _ = d.ResolveWBAKey(context.Background(), c, jwk.Kid) }()
 	require.Eventually(t, func() bool { return dirs.count(c) == 1 }, time.Second, time.Millisecond)
-	now = now.Add(6 * time.Minute)
+	setNow(clock().Add(6 * time.Minute))
 	got, err := d.ResolveWBAKey(ctx, a, jwk.Kid)
 	require.NoError(t, err)
 	require.NotNil(t, got)
@@ -497,7 +501,7 @@ func TestDirectoryResolverLocalRefusals(t *testing.T) {
 
 	// Per-operator cap: a refused refresh serves the cache for one more
 	// cache period, then fails as a discovery failure.
-	now = wbaTestNow
+	setNow(wbaTestNow)
 	d = NewDirectoryResolver(DirectoryResolverOptions{Fetch: dirs.fetch, Clock: clock, MaxPendingPerOperator: 1})
 	_, err = d.ResolveWBAKey(ctx, a, jwk.Kid)
 	require.NoError(t, err)
@@ -508,11 +512,11 @@ func TestDirectoryResolverLocalRefusals(t *testing.T) {
 	dirs.mu.Unlock()
 	go func() { _, _ = d.ResolveWBAKey(context.Background(), b, jwk.Kid) }()
 	require.Eventually(t, func() bool { return dirs.count(b) == 1 }, time.Second, time.Millisecond)
-	now = now.Add(6 * time.Minute)
+	setNow(clock().Add(6 * time.Minute))
 	got, err = d.ResolveWBAKey(ctx, a, jwk.Kid)
 	require.NoError(t, err)
 	require.NotNil(t, got, "within one cache period of the refresh point")
-	now = now.Add(5 * time.Minute)
+	setNow(clock().Add(5 * time.Minute))
 	_, err = d.ResolveWBAKey(ctx, a, jwk.Kid)
 	require.True(t, IsDiscoveryFailure(err), "a local refusal does not stretch the cache to MaxStale")
 }
