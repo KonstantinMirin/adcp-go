@@ -6,6 +6,8 @@ Optional in AdCP 3.0 and capability-advertised via `request_signing` on `get_adc
 
 Spec: [Signed Requests (Transport Layer)](https://adcontextprotocol.org/docs/building/implementation/security#signed-requests-transport-layer). Rolling out from unsigned to signed, or rotating keys: see [MIGRATION.md](./MIGRATION.md).
 
+> **AdCP 3.3: two signing profiles.** The AdCP RFC 9421 profile (`adcp/request-signing/v1`, keys through brand.json) is **deprecated in AdCP 3.3**. It keeps working through 3.x and is removed in 4.0. The **Web Bot Auth profile** (`web-bot-auth`) is experimental in 3.3 and opt-in here: see [Web Bot Auth](#web-bot-auth-experimental-adcp-33) below and the [agent identity migration guide](../../../docs/agent-identity-3-3-migration.md). `Middleware` logs the deprecation once per process unless `WebBotAuth` is configured.
+
 ## Conformance
 
 The package is validated against the spec's [conformance vectors](https://adcontextprotocol.org/compliance/latest/test-vectors/request-signing/):
@@ -252,6 +254,56 @@ The verifier implements all 14 checks (13 numbered + 9a) of the [verifier checkl
 11. `content-digest` recompute + compare (if covered)
 12. replay dedup on `(keyid, nonce)`
 13. insert into replay cache only after every prior step passed
+
+## Web Bot Auth (experimental, AdCP 3.3)
+
+The [Web Bot Auth profile](https://adcontextprotocol.org/docs/building/by-layer/L1/wba-profile) identifies a signer by its origin. The signer names the origin in a covered `Signature-Agent` member. The verifier fetches the origin's key directory at `/.well-known/http-message-signatures-directory` and looks keys up by `(origin, RFC 7638 thumbprint)`. There is no capabilities call and no keyid-to-agent map. Everything here is opt-in, and the default signer never emits or covers `Signature-Agent`.
+
+Buyer side:
+
+```go
+signer, _ := signing.NewSigner(signing.SignerOptions{
+    PrivateKey:  priv,                         // KeyID is derived: the key's thumbprint
+    AgentOrigin: "https://buyer.example.com", // selects Web Bot Auth
+})
+// Publish the key directory on that origin, re-signed before it expires:
+pub, _ := signing.NewDirectoryPublisher(signing.DirectoryPublisherOptions{
+    AgentOrigin: "https://buyer.example.com", PrivateKeys: []any{priv},
+})
+mux.Handle(signing.DirectoryPath, pub)
+```
+
+`NewSignedHTTPClient` takes `AgentOrigin` too. With a `CapabilityProvider` it also needs a `ProfilesProvider`, and it refuses to send (`ErrWebBotAuthNotAdvertised`) unless the seller lists `web-bot-auth` in `request_signing.profiles`. It never falls back to RFC 9421 on its own. `go run github.com/adcontextprotocol/adcp-go/adcp/v3/cmd/adcp-wba-directory` writes a signed directory for static hosting.
+
+Seller side:
+
+```go
+keys := signing.NewDirectoryResolver(signing.DirectoryResolverOptions{})
+revocations, _ := signing.NewOriginRevocationChecker(signing.OriginRevocationCheckerOptions{Keys: keys})
+mw := signing.Middleware(signing.MiddlewareOptions{
+    Resolver: rfc9421Resolver, // the RFC 9421 profile keeps working
+    WebBotAuth: &signing.WebBotAuthOptions{
+        Keys:       keys,
+        Revocation: revocations,
+        Authorizer: &identity.BindingGate{Bindings: bindings, Records: trustRecords},
+        Authorities: []string{"seller.example.com"}, // refuse cross-seller replays
+    },
+    BoundOrigins: bindings, // no downgrade to RFC 9421 for a bound origin
+})
+```
+
+- **Profile selection.** A request carrying `Signature-Agent` or a `web-bot-auth` tag is verified under Web Bot Auth only, even under `ObserveOnly`. An uncovered `Signature-Agent` member is never attributed.
+- **Verification.** It needs only the key directory and replay state, so `VerifyWebBotAuthRequest` can run in front of the server. Every `web-bot-auth` signature must verify. A relay must cover the earlier signatures' members and components. Nonces are scoped to the identity and must be 64 bytes, as unpadded base64url or padded base64 (the signer emits 64 random bytes as unpadded base64url). `tag`, `created`/`expires` (300 s, 60 s skew), and digest coverage on a body are enforced. `@target-uri` is the target URI as received, percent-encoding included (RFC 9421 §2.2.2), and `@authority` is normalized (§2.2.3). Keys are Ed25519, P-256, or RSA (2048 to 8192 bits, `rsa-pss-sha512`, the draft's Appendix E algorithm).
+- **Key directories.** Directory signatures (WBA Appendix B.1) are RECOMMENDED, so a plain JWK Set is accepted, and signatures that are present must verify. `DirectoryResolverOptions.RequireSignedDirectory` refuses unsigned directories. A directory that fails to resolve (network or TLS error, timeout, any status other than 200, an invalid directory, or a fetch the resolver's own limits refuse) is a **discovery failure** (WBA §6.10). It never evicts the cached directory, whose keys keep verifying for up to `MaxStale` (24 h by default, never past the directory signatures' expiry; one more 5-minute cache period when the refusal is the resolver's own). With no usable cached copy, the request is unverified: `IsDiscoveryFailure(err)`. `WebBotAuthOptions.OnDiscoveryFailure` is the local policy. The default answers 403 with `Accept-Signature`; `DiscoveryFailureAnonymous` serves the request as anonymous, except for operations in `RequiredFor`. A directory that resolves without the key is evidence that the key was removed.
+- **Errors, split by layer.** The signature path answers only with the profile's statuses and headers, never `request_signature_*` codes and never 503: `400` when a field doesn't parse, `403` with `Accept-Signature`, `403` without it for a revoked key, and `429`. Any body is the one generic authentication error (`AUTH_INVALID`). Authorization outcomes after verification use the AdCP error envelope with no `Accept-Signature`:
+  - `PERMISSION_DENIED` (403, no details) for a failed binding or an unbound origin calling a signature-required operation;
+  - `SERVICE_UNAVAILABLE` (503, `Retry-After`) for a spend-committing call while the trust record or the origin's revocation list can't be read, per the outage rules in the `identity` package.
+- **Revocation is authorization.** `WebBotAuthOptions.Revocation` runs `CheckWBARevocation` after verification and records each signer's state in `VerifiedSigner.Revocation`. A revoked key is refused (403, no `Accept-Signature`). An origin with no list (`RevocationNoList`) is identity-established and can't be bound. A list that can't be read or is past grace (`RevocationStale`) fails spend-committing calls closed in `identity.BindingGate` and `identity.GrantGate`; other calls proceed, and the last verified list keeps revoking. A revocation store that can't be read (`RevocationUnavailable`) fails every bound call with `SERVICE_UNAVAILABLE`.
+- **Authority.** A verified origin with no binding is *identity-established* and gets what an anonymous caller gets. Operations in `WebBotAuthOptions.UnboundFor` (default `get_adcp_capabilities` and `get_principal`), the MCP session methods, and bodyless streamable-HTTP `GET`/`DELETE` run with the identity attached. Other operations are served as anonymous requests. Bindings and trust-record evaluation live in the [`identity`](../identity) package, which this package never imports, so the signature path cannot read a trust record.
+- **MCP handlers.** Read the signer with `VerifiedSignerFromToolRequest(req)`. A stateful MCP session binds handlers to its `initialize` request's context, so the middleware also carries every verified signer, under either profile, in the per-request `auth.TokenInfo` (only `Extra` is set, never `UserID`). Install the middleware inside any bearer-token middleware.
+- **Bodies.** A non-empty signed body must be strict JSON. Keys that differ only in case count as duplicates. Anything else gets `400`.
+
+`VerifyWebBotAuthRequest` is the standalone verifier. `VerifiedSigner.Profile`, `PrincipalID`, `Revocation`, and `CoveredComponents` report what verified. The draft's Appendix E.1.1 RSA-PSS vector (thumbprint, signature base, padded-base64 nonce, and signature) verifies too. The draft vectors under `testdata/wba-profile/` (adcontextprotocol/adcp#7894) all pass, and the signer reproduces their signatures byte for byte.
 
 ## JWKS resolution
 

@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"fmt"
 	"io"
@@ -16,6 +17,10 @@ import (
 )
 
 // SignerOptions configures a Signer.
+//
+// Without AgentOrigin the signer uses the AdCP RFC 9421 profile, which AdCP
+// 3.3 deprecates. It keeps working through 3.x and is removed in 4.0. Set
+// AgentOrigin to opt into the experimental Web Bot Auth profile.
 type SignerOptions struct {
 	// KeyID MUST match a `kid` in the agent's published JWKS. The signer
 	// emits this as the `keyid` sig-param; the verifier uses it to select
@@ -40,6 +45,21 @@ type SignerOptions struct {
 
 	// NonceReader supplies randomness for nonces. Defaults to crypto/rand.Reader.
 	NonceReader io.Reader
+
+	// AgentOrigin, when set, opts this signer into the experimental AdCP 3.3
+	// Web Bot Auth profile instead of the RFC 9421 profile: SignRequest sets
+	// and covers Signature-Agent naming this HTTPS origin, uses
+	// tag="web-bot-auth", a nonce, sf-binary signatures, and the key's RFC
+	// 7638 thumbprint as keyid, and always covers Content-Digest on a body
+	// (SignOptions.CoverContentDigest is ignored). Profile is ignored. KeyID
+	// may be empty, in which case it is set to the thumbprint; otherwise it
+	// must equal the thumbprint. Leave empty to keep RFC 9421 signing: the
+	// signer never emits or covers Signature-Agent unless this is set.
+	AgentOrigin string
+
+	// SignatureLabel is the Web Bot Auth signature label. Defaults to
+	// "sig1". Ignored for the RFC 9421 profile, which always uses "sig1".
+	SignatureLabel string
 }
 
 // Signer attaches RFC 9421 signatures to http.Requests per the AdCP profile.
@@ -51,7 +71,7 @@ type Signer struct {
 // NewSigner constructs a signer. Returns an error if the private key type
 // isn't supported or required options are missing.
 func NewSigner(opts SignerOptions) (*Signer, error) {
-	if opts.KeyID == "" {
+	if opts.KeyID == "" && opts.AgentOrigin == "" {
 		return nil, fmt.Errorf("signing: KeyID is required")
 	}
 	if opts.PrivateKey == nil {
@@ -82,10 +102,52 @@ func NewSigner(opts SignerOptions) (*Signer, error) {
 			return nil, fmt.Errorf("signing: unsupported ECDSA curve %q (only P-256)", ec.Curve.Params().Name)
 		}
 		alg = AlgES256
+	case *rsa.PrivateKey:
+		// RSA (rsa-pss-sha512) is a Web Bot Auth key type only; the AdCP
+		// RFC 9421 profile does not admit it.
+		if opts.AgentOrigin == "" {
+			return nil, fmt.Errorf("signing: RSA keys sign only under Web Bot Auth (set AgentOrigin)")
+		}
+		if n := opts.PrivateKey.(*rsa.PrivateKey).N.BitLen(); n < rsaMinModulus || n > rsaMaxModulus {
+			return nil, fmt.Errorf("signing: Web Bot Auth RSA keys are %d to %d bits", rsaMinModulus, rsaMaxModulus)
+		}
+		alg = AlgRSAPSSSHA512
 	default:
 		return nil, fmt.Errorf("signing: unsupported private key type %T", opts.PrivateKey)
 	}
+	if opts.AgentOrigin != "" {
+		origin, err := webBotAuthOrigin(opts.AgentOrigin)
+		if err != nil {
+			return nil, fmt.Errorf("signing: AgentOrigin: %w", err)
+		}
+		opts.AgentOrigin = origin
+		jwk, err := PublicDirectoryKey(opts.PrivateKey)
+		if err != nil {
+			return nil, err
+		}
+		if opts.KeyID == "" {
+			opts.KeyID = jwk.Kid
+		} else if opts.KeyID != jwk.Kid {
+			return nil, fmt.Errorf("signing: Web Bot Auth KeyID must be the public key's RFC 7638 thumbprint %q", jwk.Kid)
+		}
+		if opts.SignatureLabel == "" {
+			opts.SignatureLabel = "sig1"
+		}
+		if !isValidLabel(opts.SignatureLabel) {
+			return nil, fmt.Errorf("signing: invalid SignatureLabel %q", opts.SignatureLabel)
+		}
+	}
 	return &Signer{opts: opts, alg: alg}, nil
+}
+
+// SigningProfile returns the profile tag this signer emits:
+// ProfileTagWebBotAuth when AgentOrigin is set, otherwise the RFC 9421
+// profile's tag.
+func (s *Signer) SigningProfile() string {
+	if s.opts.AgentOrigin != "" {
+		return ProfileTagWebBotAuth
+	}
+	return s.opts.Profile.Tag
 }
 
 // Algorithm returns the RFC 9421 alg value produced by this signer.
@@ -115,6 +177,21 @@ type SignOptions struct {
 func (s *Signer) SignRequest(r *http.Request, opts SignOptions) error {
 	if r == nil {
 		return fmt.Errorf("signing: nil request")
+	}
+	if s.opts.AgentOrigin != "" {
+		// Like SignWebBotAuthRequest, refuses a request that already carries
+		// signature fields (another party's included): use
+		// SignWebBotAuthRelay to add a signature. RoundTripper signs a fresh
+		// clone of the caller's request on every attempt.
+		return SignWebBotAuthRequest(r, s.opts.PrivateKey, WBASignOptions{
+			AgentOrigin:     s.opts.AgentOrigin,
+			Label:           s.opts.SignatureLabel,
+			ValidityWindow:  s.opts.ValidityWindow,
+			Clock:           s.opts.Clock,
+			CreatedOverride: opts.CreatedOverride,
+			NonceOverride:   opts.NonceOverride,
+			NonceReader:     s.opts.NonceReader,
+		})
 	}
 
 	// Buffer body for digest.

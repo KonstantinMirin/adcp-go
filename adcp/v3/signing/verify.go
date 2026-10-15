@@ -67,7 +67,11 @@ type VerifyOptions struct {
 }
 
 // VerifyRequestSignature implements the 13-step AdCP verifier checklist plus
-// the pre-check and sub-step 9a.
+// the pre-check and sub-step 9a. It verifies the AdCP RFC 9421 profile only,
+// which AdCP 3.3 deprecates; it keeps working through 3.x and is removed in
+// 4.0. A verifier that accepts the Web Bot Auth profile routes requests for
+// which UsesWebBotAuth reports true to VerifyWebBotAuthRequest instead, as
+// Middleware does when MiddlewareOptions.WebBotAuth is set.
 //
 // Returns:
 //
@@ -392,6 +396,7 @@ func VerifyRequestSignature(r *http.Request, opts VerifyOptions) (*VerifiedSigne
 		Label:      parsed.label,
 
 		CoveredComponents: slices.Clone(parsed.components),
+		Profile:           profile.Tag,
 	}, nil
 }
 

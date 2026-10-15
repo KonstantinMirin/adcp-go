@@ -74,6 +74,22 @@ type SignedHTTPClientOptions struct {
 	// 30s is a reasonable default for AdCP RPC.
 	Timeout time.Duration
 
+	// AgentOrigin opts the client into the experimental AdCP 3.3 Web Bot
+	// Auth profile (see SignerOptions.AgentOrigin). KeyID may be empty; it
+	// is derived from the key. Leave empty for RFC 9421 signing.
+	AgentOrigin string
+
+	// ProfilesProvider returns the seller's request_signing.profiles for a
+	// request (nil when the seller omits them, which means the RFC 9421
+	// profile only). It applies with CapabilityProvider set, to requests the
+	// capability says to sign: with AgentOrigin, the seller must list
+	// "web-bot-auth" (a nil provider fails too) or RoundTrip returns
+	// ErrWebBotAuthNotAdvertised; without it, a non-nil list must include
+	// "adcp/request-signing/v1" or RoundTrip returns
+	// ErrRequestSigningNotAdvertised. The client never switches profiles on
+	// its own.
+	ProfilesProvider func(*http.Request) []string
+
 	// MaxResponseBytes caps the cumulative bytes read from any one agent
 	// response. Zero selects DefaultMaxResponseBytes (4 MiB); a negative
 	// value (UnlimitedResponseBytes) turns the cap off.
@@ -92,6 +108,16 @@ type SignedHTTPClientOptions struct {
 	// for a long-lived stream of small events.
 	MaxSSEEventBytes int64
 }
+
+// ErrRequestSigningNotAdvertised is returned by an RFC 9421 signing client
+// whose ProfilesProvider reports profiles that exclude
+// "adcp/request-signing/v1".
+var ErrRequestSigningNotAdvertised = errors.New("signing: seller does not advertise the adcp/request-signing/v1 request-signing profile")
+
+// ErrWebBotAuthNotAdvertised is returned by a Web Bot Auth signing client
+// when the seller does not list "web-bot-auth" in request_signing.profiles.
+// The client never falls back to the RFC 9421 profile on its own.
+var ErrWebBotAuthNotAdvertised = errors.New("signing: seller does not advertise the web-bot-auth request-signing profile")
 
 // PathSuffixOperationResolver derives the AdCP operation name from the last
 // segment of the request path (`/adcp/<op>` convention) — the same shape as
@@ -140,7 +166,7 @@ func PathSuffixOperationResolver(r *http.Request) string {
 // not cap responses on its own; wrap it in NewResponseLimitTransport to get
 // the same protection.
 func NewSignedHTTPClient(opts SignedHTTPClientOptions) (*http.Client, error) {
-	if opts.KeyID == "" {
+	if opts.KeyID == "" && opts.AgentOrigin == "" {
 		return nil, errors.New("signing.NewSignedHTTPClient: KeyID is required")
 	}
 	if opts.PrivateKey == nil {
@@ -152,6 +178,7 @@ func NewSignedHTTPClient(opts SignedHTTPClientOptions) (*http.Client, error) {
 		Profile:        opts.Profile,
 		Clock:          opts.Clock,
 		ValidityWindow: opts.ValidityWindow,
+		AgentOrigin:    opts.AgentOrigin,
 	}
 	if opts.NonceReader != nil {
 		signerOpts.NonceReader = opts.NonceReader
@@ -180,6 +207,7 @@ func NewSignedHTTPClient(opts SignedHTTPClientOptions) (*http.Client, error) {
 			capabilityProvider:   opts.CapabilityProvider,
 			operationResolver:    opResolver,
 			fallbackCoverContent: opts.CoverContentDigest,
+			profilesProvider:     opts.ProfilesProvider,
 		}
 	}
 
@@ -214,6 +242,7 @@ type capabilityAwareSigningTransport struct {
 	capabilityProvider   CapabilityProvider
 	operationResolver    func(*http.Request) string
 	fallbackCoverContent bool
+	profilesProvider     func(*http.Request) []string
 }
 
 func (t *capabilityAwareSigningTransport) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -236,6 +265,22 @@ func (t *capabilityAwareSigningTransport) RoundTrip(r *http.Request) (*http.Resp
 	op := t.operationResolver(cloned)
 	if !shouldSignByCapability(capability, op) && !shouldSignProtocolMethodByCapability(capability, protocolMethodFromJSONRPC(body)) {
 		return t.inner.RoundTrip(cloned)
+	}
+
+	if t.signer.SigningProfile() == ProfileTagWebBotAuth {
+		var profiles []string
+		if t.profilesProvider != nil {
+			profiles = t.profilesProvider(cloned)
+		}
+		if !slices.Contains(profiles, ProfileTagWebBotAuth) {
+			return nil, ErrWebBotAuthNotAdvertised
+		}
+	} else if t.profilesProvider != nil {
+		// An RFC 9421 signer refuses a seller whose advertised profiles
+		// exclude it. Omitted profiles (nil) mean the RFC 9421 profile only.
+		if profiles := t.profilesProvider(cloned); profiles != nil && !slices.Contains(profiles, ProfileTagRequestSigning) {
+			return nil, ErrRequestSigningNotAdvertised
+		}
 	}
 
 	cover := t.fallbackCoverContent

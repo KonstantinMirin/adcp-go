@@ -23,6 +23,10 @@ type JWK struct {
 	AdcpUse string   `json:"adcp_use,omitempty"`
 	X       string   `json:"x,omitempty"`
 	Y       string   `json:"y,omitempty"`
+	// N and E are an RSA key's modulus and exponent. Only the Web Bot Auth
+	// profile verifies with RSA keys (rsa-pss-sha512).
+	N string `json:"n,omitempty"`
+	E string `json:"e,omitempty"`
 
 	// PrivateD is only populated for private-key JWKs used by the signer CLI
 	// and test vectors. Public JWKS never include it. Call JWK.Public before
