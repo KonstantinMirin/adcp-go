@@ -468,7 +468,9 @@ func TestMiddlewareUnsignedRequiredFor(t *testing.T) {
 		h, c := build(true, false, nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, r)
-		require.Contains(t, []int{http.StatusBadRequest, http.StatusForbidden}, rec.Code)
+		// 403 with Accept-Signature, whatever bytes the RFC 9421
+		// Signature (unpadded base64url, not RFC 8941) happens to carry.
+		requireGenericAuthError(t, rec, http.StatusForbidden, true)
 		require.Empty(t, rec.Header().Get("WWW-Authenticate"))
 		require.False(t, c.called)
 	})
@@ -522,16 +524,16 @@ func TestMiddlewareRFC9421Coexistence(t *testing.T) {
 	}
 
 	// An RFC 9421 signature carrying an uncovered Signature-Agent is
-	// verified under Web Bot Auth only when it is enabled, and fails there:
-	// the base64url RFC 9421 Signature does not parse as an RFC 8941
-	// Dictionary (400), and it has no web-bot-auth member (403) either way.
+	// verified under Web Bot Auth only when it is enabled, and fails there
+	// with 403 and Accept-Signature: it has no web-bot-auth member, which
+	// is decided before its base64url Signature is parsed.
 	r := sign()
 	r.Header.Set("Signature-Agent", `sig1="https://buyer.example.com"`)
 	c = captured{}
 	h = Middleware(MiddlewareOptions{Resolver: resolver, WebBotAuth: wba, SchemeOverride: "https", Logger: discardLogger()})(captureHandler(&c))
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, r)
-	require.Contains(t, []int{http.StatusBadRequest, http.StatusForbidden}, rec.Code)
+	requireGenericAuthError(t, rec, http.StatusForbidden, true)
 	require.Empty(t, rec.Header().Get("WWW-Authenticate"))
 	require.False(t, c.called)
 

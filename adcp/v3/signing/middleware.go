@@ -155,6 +155,13 @@ type MiddlewareOptions struct {
 	// or unsigned traffic"; a well-formed signature that merely fails
 	// verification (bad crypto, unknown key, expired window, replay, ...) is
 	// the case ObserveOnly is for and passes through.
+	//
+	// ObserveOnly covers the RFC 9421 path and unsigned requests only. A
+	// request verified under Web Bot Auth that fails is always rejected;
+	// with WebBotAuthOptions.Exclusive that includes every signed request,
+	// an RFC 9421 signature too, even on an operation that would pass
+	// unsigned. Only an unsigned request to an operation in RequiredFor is
+	// let through.
 	ObserveOnly bool
 
 	// WebBotAuth, when non-nil, enables the experimental AdCP 3.3 Web Bot
@@ -320,9 +327,13 @@ func transportOnly(r *http.Request, op string) bool {
 // On success, the VerifiedSigner is attached to the request context and next
 // is invoked.
 //
-// On failure, the middleware writes 401 Unauthorized with the
-// `WWW-Authenticate: Signature error="<code>"` header (no realm, per spec) and
-// a text/plain "unauthorized" body. Callers that need a protocol-specific
+// On failure under the RFC 9421 profile, the middleware writes 401
+// Unauthorized with the `WWW-Authenticate: Signature error="<code>"` header
+// (no realm, per spec) and a text/plain "unauthorized" body. A request
+// verified under Web Bot Auth (MiddlewareOptions.WebBotAuth) is answered
+// with that profile's statuses instead: 400, 403 or 429, with
+// Accept-Signature where the profile calls for it, or an AdCP error
+// envelope for an authorization outcome. Callers that need a protocol-specific
 // error body (e.g. JSON-RPC-shaped MCP error) should wrap this middleware and
 // translate the 401 into the outer protocol's error format.
 //
@@ -348,8 +359,13 @@ func Middleware(opts MiddlewareOptions) func(http.Handler) http.Handler {
 		replay = NewMemoryReplayStore(0)
 	}
 	wba := opts.WebBotAuth
-	if (len(opts.RequiredFor) > 0 || len(opts.ProtocolMethodsRequiredFor) > 0) && opts.Revocation == nil && (wba == nil || !wba.Exclusive) {
-		logger.Warn("signing.Middleware: RequiredFor is non-empty but Revocation is nil — verifier will not enforce key revocation")
+	if len(opts.RequiredFor) > 0 || len(opts.ProtocolMethodsRequiredFor) > 0 {
+		if (wba == nil || !wba.Exclusive) && opts.Revocation == nil {
+			logger.Warn("signing.Middleware: RequiredFor is non-empty but Revocation is nil — verifier will not enforce key revocation")
+		}
+		if wba != nil && wba.Exclusive && wba.Revocation == nil {
+			logger.Warn("signing.Middleware: RequiredFor is non-empty but WebBotAuth.Revocation is nil — identity.BindingGate binds no origin, so RequiredFor operations are refused")
+		}
 	}
 	if wba == nil {
 		logger.Info(rfc9421Deprecation)

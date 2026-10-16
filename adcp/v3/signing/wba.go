@@ -483,22 +483,6 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) (*VerifiedS
 	if err != nil {
 		return nil, wbaFail(http.StatusBadRequest, "", "Signature-Input does not parse")
 	}
-	signatures, err := parseSFDictionary(r.Header.Get(signatureHeader))
-	if err != nil {
-		return nil, wbaFail(http.StatusBadRequest, "", "Signature does not parse")
-	}
-	// A missing Signature-Agent (selection by tag alone) leaves the member
-	// absent, which fails the signature with 403 below; a present field
-	// that does not parse is 400.
-	var agents sfDict
-	if raw := r.Header.Get(signatureAgentHeader); raw != "" {
-		if agents, err = parseSFDictionary(raw); err != nil {
-			return nil, wbaFail(http.StatusBadRequest, "", "Signature-Agent does not parse")
-		}
-	}
-	if !sameKeys(inputs.keys(), signatures.keys()) {
-		return nil, wbaFail(http.StatusBadRequest, "", "Signature and Signature-Input labels differ")
-	}
 	var (
 		label  string
 		member sfMember
@@ -515,8 +499,28 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) (*VerifiedS
 			count++
 		}
 	}
+	// A request with no web-bot-auth member (an RFC 9421 signature, say)
+	// carries nothing this profile reads: 403 with Accept-Signature, decided
+	// before Signature is parsed, so the answer does not depend on whether
+	// another profile's Signature value happens to be valid RFC 8941.
 	if count == 0 {
 		return nil, wbaFail(http.StatusForbidden, "", "no web-bot-auth signature")
+	}
+	signatures, err := parseSFDictionary(r.Header.Get(signatureHeader))
+	if err != nil {
+		return nil, wbaFail(http.StatusBadRequest, "", "Signature does not parse")
+	}
+	// A missing Signature-Agent (selection by tag alone) leaves the member
+	// absent, which fails the signature with 403 below; a present field
+	// that does not parse is 400.
+	var agents sfDict
+	if raw := r.Header.Get(signatureAgentHeader); raw != "" {
+		if agents, err = parseSFDictionary(raw); err != nil {
+			return nil, wbaFail(http.StatusBadRequest, "", "Signature-Agent does not parse")
+		}
+	}
+	if !sameKeys(inputs.keys(), signatures.keys()) {
+		return nil, wbaFail(http.StatusBadRequest, "", "Signature and Signature-Input labels differ")
 	}
 	if count > 1 {
 		return nil, wbaFail(http.StatusForbidden, label, "more than one web-bot-auth signature")

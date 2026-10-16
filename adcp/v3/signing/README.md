@@ -292,7 +292,7 @@ mw := signing.Middleware(signing.MiddlewareOptions{
 })
 ```
 
-A seller that advertises only `web-bot-auth` in `request_signing.profiles` sets `WebBotAuthOptions.Exclusive`: every signed request is verified under Web Bot Auth, so an RFC 9421 signature is refused, and `Resolver` and `BoundOrigins` are unused.
+A seller that advertises only `web-bot-auth` in `request_signing.profiles` sets `WebBotAuthOptions.Exclusive`: every signed request is verified under Web Bot Auth, so an RFC 9421 signature is refused with `403` and `Accept-Signature`, and `Resolver` and `BoundOrigins` are unused. `ObserveOnly` then lets through only unsigned requests to `RequiredFor` operations; a failed signature is always rejected.
 
 - **Profile selection.** A request carrying `Signature-Agent` or a `web-bot-auth` tag is verified under Web Bot Auth only, even under `ObserveOnly`. An uncovered `Signature-Agent` member is never attributed.
 - **One signature.** A request carries exactly one `web-bot-auth` signature and exactly one `Signature-Agent` member. More than that is refused with `403` and `Accept-Signature`, even when every signature verifies on its own: an intermediary that signs a request is its signer, and whether it may act for someone else is an authorization question. Signatures under other tags are not read.

@@ -53,7 +53,7 @@ type DirectoryResponse struct {
 //     "@authority";req and content-digest, naming the key's thumbprint as
 //     keyid, inside its validity window with no clock skew (so a created in
 //     the future is refused), and verifying under that key. A signature
-//     naming a key the profile skipped is not read.
+//     naming any other key (one the profile skipped, say) is not read.
 //
 // An unsigned directory, or one with a usable key that did not sign it, is
 // refused.
@@ -71,7 +71,7 @@ func VerifyDirectoryResponse(origin string, resp *DirectoryResponse, now time.Ti
 	default:
 		return nil, errors.New("signing: key directory has the wrong media type")
 	}
-	keys, skipped, err := parseDirectoryKeys(resp.Body)
+	keys, err := parseDirectoryKeys(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -96,13 +96,11 @@ func VerifyDirectoryResponse(origin string, resp *DirectoryResponse, now time.Ti
 	verified := map[string]struct{}{}
 	for _, e := range inputs {
 		m := e.member
-		if keyID, ok := stringParam(m.params, "keyid"); ok {
-			if _, skip := skipped[keyID]; skip {
-				if _, usable := keys[keyID]; !usable {
-					// Signed by a key the profile cannot verify with.
-					continue
-				}
-			}
+		if keyID, _ := stringParam(m.params, "keyid"); keys[keyID].Kty == "" {
+			// Not signed by a key the profile uses (for example a key it
+			// skipped): nothing to verify. Every usable key must still have
+			// verified its own signature below.
+			continue
 		}
 		if tag, ok := stringParam(m.params, "tag"); !m.inner || !ok || tag != DirectoryTag {
 			return nil, errors.New("signing: key directory signature has the wrong profile")
@@ -160,49 +158,44 @@ func directoryExpiry(resp *DirectoryResponse) (time.Time, bool) {
 	return time.Unix(earliest, 0), true
 }
 
-// parseDirectoryKeys returns the directory's usable keys by thumbprint,
-// and the thumbprints of the keys it skipped as unusable.
-func parseDirectoryKeys(body []byte) (map[string]JWK, map[string]struct{}, error) {
+// parseDirectoryKeys returns the directory's usable keys by thumbprint.
+func parseDirectoryKeys(body []byte) (map[string]JWK, error) {
 	var doc struct {
 		Keys []json.RawMessage `json:"keys"`
 	}
 	if err := strictjson.Unmarshal(body, 0, &doc); err != nil {
-		return nil, nil, errors.New("signing: key directory is not strict JSON")
+		return nil, errors.New("signing: key directory is not strict JSON")
 	}
 	if len(doc.Keys) < 1 || len(doc.Keys) > directoryMaxKeys {
-		return nil, nil, errors.New("signing: key directory must hold 1 to 100 keys")
+		return nil, errors.New("signing: key directory must hold 1 to 100 keys")
 	}
 	out := make(map[string]JWK, len(doc.Keys))
-	skipped := map[string]struct{}{}
 	for _, raw := range doc.Keys {
 		var members map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &members); err != nil {
-			return nil, nil, errors.New("signing: key directory entry is not an object")
+			return nil, errors.New("signing: key directory entry is not an object")
 		}
 		// encoding/json matches struct fields case-insensitively, so match
 		// private member names under case folding too.
 		for name := range members {
 			switch strictjson.Fold(name) {
 			case strictjson.Fold("d"), strictjson.Fold("p"), strictjson.Fold("q"), strictjson.Fold("dp"), strictjson.Fold("dq"), strictjson.Fold("qi"), strictjson.Fold("k"):
-				return nil, nil, errors.New("signing: key directory entry carries private key material")
+				return nil, errors.New("signing: key directory entry carries private key material")
 			}
 		}
 		if ops, ok := members["key_ops"]; ok {
 			var list []string
 			if json.Unmarshal(ops, &list) != nil {
-				return nil, nil, errors.New("signing: key directory key_ops is not a string array")
+				return nil, errors.New("signing: key directory key_ops is not a string array")
 			}
 		}
 		var jwk JWK
 		if err := json.Unmarshal(raw, &jwk); err != nil {
-			return nil, nil, errors.New("signing: key directory entry does not parse")
+			return nil, errors.New("signing: key directory entry does not parse")
 		}
 		if _, err := wbaKeyAlgorithm(jwk); err != nil {
 			// A key the profile cannot verify with: skip it, as a JWK Set
 			// may hold keys for other uses.
-			if tp, err := JWKThumbprint(jwk); err == nil {
-				skipped[tp] = struct{}{}
-			}
 			continue
 		}
 		tp, err := JWKThumbprint(jwk)
@@ -210,15 +203,15 @@ func parseDirectoryKeys(body []byte) (map[string]JWK, map[string]struct{}, error
 			continue
 		}
 		if _, dup := out[tp]; dup {
-			return nil, nil, errors.New("signing: key directory repeats a key")
+			return nil, errors.New("signing: key directory repeats a key")
 		}
 		jwk.Kid = tp
 		out[tp] = jwk
 	}
 	if len(out) == 0 {
-		return nil, nil, errors.New("signing: key directory holds no usable key")
+		return nil, errors.New("signing: key directory holds no usable key")
 	}
-	return out, skipped, nil
+	return out, nil
 }
 
 // SignKeyDirectory builds the signed key directory response an origin

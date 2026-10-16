@@ -34,7 +34,10 @@ const (
 	Authoring ValidationMode = iota
 	// Reading keeps unknown onboarding requirement kinds, which are
 	// advisory and never machine-satisfiable, without relaxing any
-	// authority-bearing member.
+	// authority-bearing member. One rule differs by mode: Authoring
+	// refuses a grantee with no registrable domain, while Reading keeps
+	// the record and that grant matches nothing (grantees are compared as
+	// registrable domains).
 	Reading
 )
 

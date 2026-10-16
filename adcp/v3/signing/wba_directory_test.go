@@ -173,6 +173,10 @@ func TestVerifyDirectoryResponseRejectsTampering(t *testing.T) {
 		"an unusable key is skipped": func(r *DirectoryResponse) {
 			*r = *signDirectoryBody(t, origin, []byte(`{"keys":[{"kty":"EC","crv":"P-384","x":"AAAA","y":"AAAA"},{"kty":"OKP","crv":"Ed25519","x":"`+jwkA.X+`","kid":"operator-chosen"}]}`), keyA)
 		},
+		"a signature naming a key the directory does not hold is not read": func(r *DirectoryResponse) {
+			r.Header.Set("Signature-Input", r.Header.Get("Signature-Input")+`, key9=("@authority";req "content-digest");created=1;expires=2;keyid="unknown";tag="`+DirectoryTag+`"`)
+			r.Header.Set("Signature", r.Header.Get("Signature")+", key9=:AAAA:")
+		},
 		"a signature by a skipped key is not read": func(r *DirectoryResponse) {
 			*r = *signDirectoryBody(t, origin, []byte(`{"keys":[`+mustJSON(t, p256)+`,{"kty":"OKP","crv":"Ed25519","x":"`+jwkA.X+`"}]}`), keyA)
 			r.Header.Set("Signature-Input", r.Header.Get("Signature-Input")+`, key9=("@authority";req "content-digest");created=1;expires=2;keyid="`+p256Kid+`";tag="`+DirectoryTag+`"`)
