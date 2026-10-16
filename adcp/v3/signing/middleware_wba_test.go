@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -39,17 +40,15 @@ func (f fakeBoundOrigins) PrincipalForOrigin(_ context.Context, origin string) (
 }
 
 type captured struct {
-	signer  *VerifiedSigner
-	signers []*VerifiedSigner
-	body    string
-	called  bool
+	signer *VerifiedSigner
+	body   string
+	called bool
 }
 
 func captureHandler(c *captured) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c.called = true
 		c.signer = VerifiedSignerFromContext(r.Context())
-		c.signers = VerifiedSignersFromContext(r.Context())
 		var buf bytes.Buffer
 		_, _ = buf.ReadFrom(r.Body)
 		c.body = buf.String()
@@ -308,45 +307,178 @@ func TestMiddlewareWebBotAuthFailuresUseStatusCodes(t *testing.T) {
 	require.Empty(t, seen.ResponseHeader().Get("Accept-Signature"))
 }
 
-func TestMiddlewareWebBotAuthRelaysDoNotInheritAuthority(t *testing.T) {
+// TestMiddlewareWebBotAuthOneSignature: a request carrying a second
+// web-bot-auth signature, from an intermediary or anyone else, is refused
+// with 403 and Accept-Signature even when both signatures verify and either
+// origin is bound. An intermediary that signs is the signer.
+func TestMiddlewareWebBotAuthOneSignature(t *testing.T) {
 	rig := newWBARig(t)
 	relayKey := newEd25519(t)
 	relay := "https://relay.agency.example.com"
 	rig.dirs.publish(t, relay, wbaTestNow.Add(-time.Hour), 24*time.Hour, relayKey)
-	relayRevs := newRevocationServer(t, relay, relayKey)
-	relayRevs.set(t, revocationPayload{Updated: rfc3339(wbaTestNow.Add(-time.Minute)), NextUpdate: rfc3339(wbaTestNow.Add(10 * time.Minute))})
-	fetch := func(ctx context.Context, url, inm, ims string) (*RevocationFetchResult, error) {
-		if strings.HasPrefix(url, relay) {
-			return relayRevs.fetch(ctx, url, inm, ims)
-		}
-		return rig.revs.fetch(ctx, url, inm, ims)
-	}
-	checker, _ := NewOriginRevocationChecker(OriginRevocationCheckerOptions{Keys: rig.resolver, Fetch: fetch, Clock: wbaClock})
-	auth := &fakeAuthorizer{principals: map[string]string{relay: "relay_principal"}}
+	auth := &fakeAuthorizer{principals: map[string]string{relay: "relay_principal", rig.origin: "brand_principal"}}
 	var c captured
-	h := Middleware(MiddlewareOptions{WebBotAuth: &WebBotAuthOptions{Keys: rig.resolver, Revocation: checker, Authorizer: auth, Clock: wbaClock}, Logger: discardLogger()})(captureHandler(&c))
-	sign := func() *http.Request {
-		r := httptest.NewRequest(http.MethodPost, "https://seller.example.com/mcp", strings.NewReader(mcpCall("create_media_buy")))
+	h := Middleware(MiddlewareOptions{WebBotAuth: &WebBotAuthOptions{Keys: rig.resolver, Authorizer: auth, Clock: wbaClock}, Logger: discardLogger()})(captureHandler(&c))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, twoSignatureRequest(t, rig, relayKey, relay, mcpCall("create_media_buy")))
+	requireGenericAuthError(t, rec, http.StatusForbidden, true)
+	require.False(t, c.called)
+	require.Empty(t, auth.calls, "no authorization runs for a request the profile refuses")
+	require.True(t, strings.HasPrefix(rec.Header().Get("Accept-Signature"), "sig1="), rec.Header().Get("Accept-Signature"))
+}
+
+// twoSignatureRequest is a request signed by rig's key under sig1 and by
+// secondKey for secondOrigin under sig2, each signature valid on its own.
+func twoSignatureRequest(t *testing.T, rig *wbaRig, secondKey any, secondOrigin, body string) *http.Request {
+	t.Helper()
+	mk := func() *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "https://seller.example.com/mcp", strings.NewReader(body))
 		r.Header.Set("Content-Type", "application/json")
-		require.NoError(t, SignWebBotAuthRequest(r, rig.key, WBASignOptions{AgentOrigin: rig.origin, Label: "brand", Clock: wbaClock}))
-		require.NoError(t, SignWebBotAuthRelay(r, relayKey, WBASignOptions{AgentOrigin: relay, Label: "relay", Clock: wbaClock}))
 		return r
 	}
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, sign())
-	// The caller is the originating (unbound) brand agent; the bound relay
-	// does not lend it authority, so it is served as anonymous.
-	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	require.Nil(t, c.signer)
+	first, second := mk(), mk()
+	require.NoError(t, SignWebBotAuthRequest(first, rig.key, WBASignOptions{AgentOrigin: rig.origin, Clock: wbaClock}))
+	require.NoError(t, SignWebBotAuthRequest(second, secondKey, WBASignOptions{AgentOrigin: secondOrigin, Label: "sig2", Clock: wbaClock}))
+	for _, h := range []string{"Signature-Agent", "Signature-Input", "Signature"} {
+		first.Header.Set(h, first.Header.Get(h)+", "+second.Header.Get(h))
+	}
+	return first
+}
 
-	auth.principals[rig.origin] = "brand_principal"
+// TestMiddlewareWebBotAuthReplayIs429: a reused signature is answered 429
+// with Accept-Signature carrying a fresh 64-byte nonce (WBA §5.3).
+func TestMiddlewareWebBotAuthReplayIs429(t *testing.T) {
+	rig := newWBARig(t)
+	var c captured
+	h := Middleware(MiddlewareOptions{WebBotAuth: &WebBotAuthOptions{Keys: rig.resolver, Clock: wbaClock}, Replay: rig.replay, Logger: discardLogger()})(captureHandler(&c))
+	r := rig.signedRequest(t, mcpCall("get_principal"))
+	replayed := r.Clone(context.Background())
+	replayed.Body = io.NopCloser(strings.NewReader(mcpCall("get_principal")))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	require.Equal(t, http.StatusOK, rec.Code)
+	c = captured{}
 	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, sign())
-	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	require.Equal(t, "brand_principal", c.signer.PrincipalID)
-	require.Len(t, c.signers, 2)
-	require.Equal(t, relay, c.signers[1].AgentURL)
-	require.Empty(t, c.signers[1].PrincipalID)
+	h.ServeHTTP(rec, replayed)
+	requireGenericAuthError(t, rec, http.StatusTooManyRequests, true)
+	require.False(t, c.called)
+	d, err := parseSFDictionary(rec.Header().Get("Accept-Signature"))
+	require.NoError(t, err)
+	m, ok := d.get("sig1")
+	require.True(t, ok)
+	nonce, ok := stringParam(m.params, "nonce")
+	require.True(t, ok, "a replay offers a fresh nonce")
+	require.True(t, validWBANonce(nonce))
+}
+
+// TestMiddlewareUnsignedRequiredFor: an unsigned request to an operation in
+// required_for gets the answer the profile gives for what the verifier
+// advertises. With both profiles, the RFC 9421 answer (401
+// request_signature_required) plus Accept-Signature for Web Bot Auth; with
+// Web Bot Auth only (Exclusive), 403 with Accept-Signature.
+func TestMiddlewareUnsignedRequiredFor(t *testing.T) {
+	rig := newWBARig(t)
+	unsigned := func(body string) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "https://seller.example.com/mcp", strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		return r
+	}
+	build := func(exclusive, observe bool, onReject func(http.ResponseWriter, *http.Request, *Error)) (http.Handler, *captured) {
+		var c captured
+		return Middleware(MiddlewareOptions{
+			Resolver:          NewStaticJWKSResolver(),
+			WebBotAuth:        &WebBotAuthOptions{Keys: rig.resolver, Clock: wbaClock, Exclusive: exclusive},
+			Replay:            rig.replay,
+			RequiredFor:       []string{"create_media_buy"},
+			OperationResolver: func(r *http.Request) string { return jsonRPCOperation(r, 0) },
+			ObserveOnly:       observe,
+			OnReject:          onReject,
+			Logger:            discardLogger(),
+		})(captureHandler(&c)), &c
+	}
+
+	t.Run("both profiles: 401 request_signature_required plus Accept-Signature", func(t *testing.T) {
+		h, c := build(false, false, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, unsigned(mcpCall("create_media_buy")))
+		require.Equal(t, http.StatusUnauthorized, rec.Code)
+		require.Equal(t, `Signature error="request_signature_required"`, rec.Header().Get("WWW-Authenticate"))
+		require.Equal(t, AcceptSignature(true), rec.Header().Get("Accept-Signature"))
+		require.False(t, c.called)
+	})
+	t.Run("both profiles, custom OnReject: Accept-Signature is still set", func(t *testing.T) {
+		h, _ := build(false, false, func(w http.ResponseWriter, _ *http.Request, e *Error) { w.WriteHeader(http.StatusTeapot) })
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, unsigned(mcpCall("create_media_buy")))
+		require.Equal(t, http.StatusTeapot, rec.Code)
+		require.NotEmpty(t, rec.Header().Get("Accept-Signature"))
+	})
+	t.Run("Web Bot Auth only: 403 with Accept-Signature", func(t *testing.T) {
+		h, c := build(true, false, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, unsigned(mcpCall("create_media_buy")))
+		requireGenericAuthError(t, rec, http.StatusForbidden, true)
+		require.Equal(t, AcceptSignature(true), rec.Header().Get("Accept-Signature"))
+		require.Empty(t, rec.Header().Get("WWW-Authenticate"))
+		require.False(t, c.called)
+	})
+	t.Run("Web Bot Auth only: a bodyless request is asked for the bodyless components", func(t *testing.T) {
+		var c captured
+		h := Middleware(MiddlewareOptions{
+			WebBotAuth: &WebBotAuthOptions{Keys: rig.resolver, Clock: wbaClock, Exclusive: true},
+			Replay:     rig.replay, RequiredFor: []string{"create_media_buy"}, OperationResolver: DefaultOperationResolver, Logger: discardLogger(),
+		})(captureHandler(&c))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "https://seller.example.com/adcp/create_media_buy", nil))
+		requireGenericAuthError(t, rec, http.StatusForbidden, true)
+		require.Equal(t, AcceptSignature(false), rec.Header().Get("Accept-Signature"))
+		require.NotContains(t, rec.Header().Get("Accept-Signature"), "content-digest")
+	})
+	t.Run("Web Bot Auth only: push_notification_config.authentication needs a signature", func(t *testing.T) {
+		h, c := build(true, false, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, unsigned(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_media_buys","arguments":{"push_notification_config":{"url":"https://b.example.com/h","authentication":{"schemes":["Bearer"],"credentials":"x"}}}}}`))
+		requireGenericAuthError(t, rec, http.StatusForbidden, true)
+		require.False(t, c.called)
+	})
+	t.Run("Web Bot Auth only: an operation outside required_for proceeds unsigned", func(t *testing.T) {
+		h, c := build(true, false, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, unsigned(mcpCall("get_products")))
+		require.Equal(t, http.StatusOK, rec.Code)
+		require.True(t, c.called)
+		require.Nil(t, c.signer)
+		require.Equal(t, mcpCall("get_products"), c.body)
+	})
+	t.Run("Web Bot Auth only, ObserveOnly: allowed through", func(t *testing.T) {
+		h, c := build(true, true, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, unsigned(mcpCall("create_media_buy")))
+		require.Equal(t, http.StatusOK, rec.Code)
+		require.True(t, c.called)
+	})
+	t.Run("Web Bot Auth only: an RFC 9421 signature is not accepted", func(t *testing.T) {
+		res, err := GenerateSigningKey(AlgEd25519, "legacy-key")
+		require.NoError(t, err)
+		priv, _, _ := LoadPrivateKey(res.PrivateKeyPEM)
+		legacy, err := NewSigner(SignerOptions{KeyID: "legacy-key", PrivateKey: priv})
+		require.NoError(t, err)
+		r := unsigned(mcpCall("get_products"))
+		require.NoError(t, legacy.SignRequest(r, SignOptions{CoverContentDigest: true}))
+		h, c := build(true, false, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		require.Contains(t, []int{http.StatusBadRequest, http.StatusForbidden}, rec.Code)
+		require.Empty(t, rec.Header().Get("WWW-Authenticate"))
+		require.False(t, c.called)
+	})
+	t.Run("Web Bot Auth only: a Web Bot Auth signature verifies", func(t *testing.T) {
+		h, c := build(true, false, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, rig.signedRequest(t, mcpCall("get_principal")))
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		require.NotNil(t, c.signer)
+	})
 }
 
 func TestMiddlewareRFC9421Coexistence(t *testing.T) {

@@ -111,6 +111,27 @@ func TestGrantEvaluation(t *testing.T) {
 			want: true,
 		},
 		{
+			// L2 Grants in trust.json: grantee is compared as a registrable
+			// domain, so a grant to a host under the operator's domain
+			// names that operator, and the brand's record stays readable.
+			name:    "a grantee host under the signer's operator domain is that operator",
+			records: with(baseRecords, map[string]string{"brand-7k3q.com": `{"grants":[{"grantee":"buy.agency-7k3q.com","scopes":["adcp:media_buying"]}]}`}),
+			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"},
+			want:    true,
+		},
+		{
+			name:    "a grantee host under another domain is not the operator",
+			records: with(baseRecords, map[string]string{"brand-7k3q.com": `{"grants":[{"grantee":"agency-7k3q.com.evil-7k3q.com","scopes":["adcp:media_buying"]}]}`}),
+			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"},
+			reason:  GrantReasonAbsent,
+		},
+		{
+			name:    "a grantee with no registrable domain matches nothing, and the record still reads",
+			records: with(baseRecords, map[string]string{"brand-7k3q.com": `{"grants":[{"grantee":"github.io","scopes":["adcp:media_buying"]},{"grantee":"agency-7k3q.com","scopes":["adcp:media_buying"]}]}`}),
+			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "agency-7k3q.com"},
+			want:    true,
+		},
+		{
 			name:    "account.operator must be on the chain",
 			records: with(baseRecords, map[string]string{"brand-7k3q.com": brandGrantsAgency}),
 			req:     GrantRequest{AgentOrigin: agencyAgent, BrandDomain: "brand-7k3q.com", AccountOperator: "someone-else-7k3q.com", BrandID: "nova", Countries: []string{"US"}},

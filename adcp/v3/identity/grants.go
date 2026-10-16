@@ -122,6 +122,10 @@ type GrantHook func(ctx context.Context, req GrantRequest) (bool, error)
 // GrantEvaluator evaluates demand-side grants from the brand's trust record
 // (DR-0025, specs/agent-identity-3-3.md R6):
 //   - the brand's own record authorizes, never the buyer operator's;
+//   - grantee, the account operator, and the brand's domain are compared
+//     with the signer's operator as registrable domains under the pinned
+//     PSL snapshot (L2 Grants in trust.json), so a grant to buy.agency.com
+//     names agency.com;
 //   - authority is implicit when the account operator, the brand, and the
 //     signer's operator share a registrable domain;
 //   - otherwise a chain must reach the signer's operator with the account
@@ -389,8 +393,13 @@ func scopeCovers(scopes []string, scope string) bool {
 	return false
 }
 
+// grantMatches reports whether g grants grantee (a registrable domain) the
+// requested scope, agent, brand, countries, and time. g.Grantee is compared
+// as its registrable domain under the pinned PSL snapshot (L2 Grants in
+// trust.json), so a grant to buy.agency.com is a grant to agency.com; a
+// grantee with no registrable domain matches nothing.
 func grantMatches(g TrustGrant, grantee string, req GrantRequest, countries map[string]struct{}, now time.Time) bool {
-	if g.Grantee != grantee || !scopeCovers(g.Scopes, req.Scope) {
+	if d, ok := psl.RegistrableDomain(g.Grantee); !ok || d != grantee || !scopeCovers(g.Scopes, req.Scope) {
 		return false
 	}
 	if g.Agents != nil {

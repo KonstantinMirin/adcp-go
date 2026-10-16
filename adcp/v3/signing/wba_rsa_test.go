@@ -82,9 +82,9 @@ func TestWBARSAPSSRoundTrip(t *testing.T) {
 	r.Header.Set("Content-Type", "application/json")
 	require.NoError(t, SignWebBotAuthRequest(r, key, WBASignOptions{AgentOrigin: rig.origin, Clock: wbaClock}))
 	require.Contains(t, r.Header.Get("Signature-Input"), `alg="rsa-pss-sha512"`)
-	signers, err := VerifyWebBotAuthRequest(r, rig.opts())
+	signer, err := VerifyWebBotAuthRequest(r, rig.opts())
 	require.NoError(t, err)
-	require.Equal(t, AlgRSAPSSSHA512, signers[0].Algorithm)
+	require.Equal(t, AlgRSAPSSSHA512, signer.Algorithm)
 
 	small, err := rsa.GenerateKey(rand.Reader, 1024) //nolint:gosec // G403: proves small keys are refused
 	require.NoError(t, err)

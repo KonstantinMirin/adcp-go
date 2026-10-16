@@ -30,11 +30,6 @@ type DirectoryResolverOptions struct {
 	// example with wildcard DNS and a stalling server) cannot hold every
 	// discovery slot. Defaults to 8.
 	MaxPendingPerOperator int
-	// RequireSignedDirectory refuses a directory response that carries no
-	// signatures. By default an unsigned directory (a plain JWK Set) is
-	// accepted, since signing it is RECOMMENDED, not required (WBA
-	// Appendix B.1); signatures that are present must verify.
-	RequireSignedDirectory bool
 	// MaxStale bounds how long a cached directory keeps verifying requests
 	// while its refreshes fail (WBA §6.10: a failed fetch does not evict a
 	// cached entry), counted from the last successful fetch and never past
@@ -73,7 +68,6 @@ type DirectoryResolver struct {
 	fetch          DirectoryFetcher
 	maxOrigins     int
 	maxPerOperator int
-	requireSigned  bool
 	maxStale       time.Duration
 	clock          func() time.Time
 
@@ -111,7 +105,6 @@ func NewDirectoryResolver(opts DirectoryResolverOptions) *DirectoryResolver {
 		fetch:          opts.Fetch,
 		maxOrigins:     opts.MaxOrigins,
 		maxPerOperator: opts.MaxPendingPerOperator,
-		requireSigned:  opts.RequireSignedDirectory,
 		maxStale:       opts.MaxStale,
 		clock:          opts.Clock,
 		cache:          map[string]*directoryEntry{},
@@ -255,7 +248,7 @@ func (d *DirectoryResolver) refresh(ctx context.Context, origin string, call *di
 		// Any status other than 200 is a discovery failure (WBA §5.5).
 		err = errors.New("key directory fetch did not return 200")
 	default:
-		keys, err = verifyDirectoryResponse(origin, resp, d.clock(), d.requireSigned)
+		keys, err = VerifyDirectoryResponse(origin, resp, d.clock())
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -322,7 +315,7 @@ func (d *DirectoryResolver) store(e *directoryEntry) {
 }
 
 // Evidence returns the last directory response that resolved for origin,
-// the record of what the verifier fetched (signed, when the directory is),
+// the signed record of what the verifier fetched,
 // or nil.
 func (d *DirectoryResolver) Evidence(origin string) *DirectoryResponse {
 	origin, err := webBotAuthOrigin(origin)

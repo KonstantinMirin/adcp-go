@@ -36,29 +36,28 @@ type DirectoryResponse struct {
 	Body   []byte
 }
 
-// VerifyDirectoryResponse validates a key directory served at origin and
-// returns its usable keys indexed by RFC 7638 thumbprint. It checks:
+// VerifyDirectoryResponse validates a signed key directory served at
+// origin and returns its usable keys indexed by RFC 7638 thumbprint. It
+// checks:
 //   - status 200, a body of at most 256 KiB, and a JWK Set media type
 //     (application/http-message-signatures-directory+json,
 //     application/jwk-set+json, or application/json);
 //   - strict JSON with 1 to 100 keys and no private key material. Keys the
-//     profile cannot use (other key types, use other than sig, key_ops
-//     without verify) are skipped, at least one must remain, and a kid,
-//     when present, does not affect lookup: a key is found by its
-//     thumbprint, which the request's keyid must equal;
-//   - when the response carries signatures (WBA Appendix B.1, RECOMMENDED):
-//     Content-Digest against the body, and every signature tagged
-//     http-message-signatures-directory, covering "@authority";req and
-//     content-digest, inside its validity window with no clock skew, and
-//     verifying under the key it names, each key at most once.
+//     profile cannot use (key types other than Ed25519 and RSA, use other
+//     than sig, key_ops without verify) are skipped, at least one must
+//     remain, and a kid, when present, does not affect lookup: a key is
+//     found by its thumbprint, which the request's keyid must equal;
+//   - the response signatures (WBA Appendix B.1), which the profile
+//     requires: Content-Digest against the body, and one signature per
+//     usable key, each tagged http-message-signatures-directory, covering
+//     "@authority";req and content-digest, naming the key's thumbprint as
+//     keyid, inside its validity window with no clock skew (so a created in
+//     the future is refused), and verifying under that key. A signature
+//     naming a key the profile skipped is not read.
 //
-// An unsigned directory (a plain JWK Set) is accepted; DirectoryResolver
-// can be configured to require signatures.
+// An unsigned directory, or one with a usable key that did not sign it, is
+// refused.
 func VerifyDirectoryResponse(origin string, resp *DirectoryResponse, now time.Time) (map[string]JWK, error) {
-	return verifyDirectoryResponse(origin, resp, now, false)
-}
-
-func verifyDirectoryResponse(origin string, resp *DirectoryResponse, now time.Time, requireSigned bool) (map[string]JWK, error) {
 	origin, err := webBotAuthOrigin(origin)
 	if err != nil {
 		return nil, fmt.Errorf("signing: directory origin: %w", err)
@@ -72,16 +71,13 @@ func verifyDirectoryResponse(origin string, resp *DirectoryResponse, now time.Ti
 	default:
 		return nil, errors.New("signing: key directory has the wrong media type")
 	}
-	keys, err := parseDirectoryKeys(resp.Body)
+	keys, skipped, err := parseDirectoryKeys(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 	rawInput, rawSig := resp.Header.Get(signatureInputHeader), resp.Header.Get(signatureHeader)
 	if rawInput == "" && rawSig == "" {
-		if requireSigned {
-			return nil, errors.New("signing: key directory is not signed")
-		}
-		return keys, nil
+		return nil, errors.New("signing: key directory is not signed")
 	}
 	if !wbaDigestMatches(resp.Header.Get(contentDigestHeader), resp.Body) {
 		return nil, errors.New("signing: key directory digest mismatch")
@@ -100,6 +96,14 @@ func verifyDirectoryResponse(origin string, resp *DirectoryResponse, now time.Ti
 	verified := map[string]struct{}{}
 	for _, e := range inputs {
 		m := e.member
+		if keyID, ok := stringParam(m.params, "keyid"); ok {
+			if _, skip := skipped[keyID]; skip {
+				if _, usable := keys[keyID]; !usable {
+					// Signed by a key the profile cannot verify with.
+					continue
+				}
+			}
+		}
 		if tag, ok := stringParam(m.params, "tag"); !m.inner || !ok || tag != DirectoryTag {
 			return nil, errors.New("signing: key directory signature has the wrong profile")
 		}
@@ -130,6 +134,9 @@ func verifyDirectoryResponse(origin string, resp *DirectoryResponse, now time.Ti
 		}
 		verified[keyID] = struct{}{}
 	}
+	if len(verified) != len(keys) {
+		return nil, errors.New("signing: key directory has a key that did not sign it")
+	}
 	return keys, nil
 }
 
@@ -153,43 +160,49 @@ func directoryExpiry(resp *DirectoryResponse) (time.Time, bool) {
 	return time.Unix(earliest, 0), true
 }
 
-func parseDirectoryKeys(body []byte) (map[string]JWK, error) {
+// parseDirectoryKeys returns the directory's usable keys by thumbprint,
+// and the thumbprints of the keys it skipped as unusable.
+func parseDirectoryKeys(body []byte) (map[string]JWK, map[string]struct{}, error) {
 	var doc struct {
 		Keys []json.RawMessage `json:"keys"`
 	}
 	if err := strictjson.Unmarshal(body, 0, &doc); err != nil {
-		return nil, errors.New("signing: key directory is not strict JSON")
+		return nil, nil, errors.New("signing: key directory is not strict JSON")
 	}
 	if len(doc.Keys) < 1 || len(doc.Keys) > directoryMaxKeys {
-		return nil, errors.New("signing: key directory must hold 1 to 100 keys")
+		return nil, nil, errors.New("signing: key directory must hold 1 to 100 keys")
 	}
 	out := make(map[string]JWK, len(doc.Keys))
+	skipped := map[string]struct{}{}
 	for _, raw := range doc.Keys {
 		var members map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &members); err != nil {
-			return nil, errors.New("signing: key directory entry is not an object")
+			return nil, nil, errors.New("signing: key directory entry is not an object")
 		}
 		// encoding/json matches struct fields case-insensitively, so match
 		// private member names under case folding too.
 		for name := range members {
 			switch strictjson.Fold(name) {
 			case strictjson.Fold("d"), strictjson.Fold("p"), strictjson.Fold("q"), strictjson.Fold("dp"), strictjson.Fold("dq"), strictjson.Fold("qi"), strictjson.Fold("k"):
-				return nil, errors.New("signing: key directory entry carries private key material")
+				return nil, nil, errors.New("signing: key directory entry carries private key material")
 			}
 		}
 		if ops, ok := members["key_ops"]; ok {
 			var list []string
 			if json.Unmarshal(ops, &list) != nil {
-				return nil, errors.New("signing: key directory key_ops is not a string array")
+				return nil, nil, errors.New("signing: key directory key_ops is not a string array")
 			}
 		}
 		var jwk JWK
 		if err := json.Unmarshal(raw, &jwk); err != nil {
-			return nil, errors.New("signing: key directory entry does not parse")
+			return nil, nil, errors.New("signing: key directory entry does not parse")
 		}
 		if _, err := wbaKeyAlgorithm(jwk); err != nil {
-			// A key the profile cannot verify with: skip it, as a plain JWK
-			// Set may hold keys for other uses.
+			// A key the profile cannot verify with: skip it, as a JWK Set
+			// may hold keys for other uses.
+			if tp, err := JWKThumbprint(jwk); err == nil {
+				skipped[tp] = struct{}{}
+			}
 			continue
 		}
 		tp, err := JWKThumbprint(jwk)
@@ -197,20 +210,20 @@ func parseDirectoryKeys(body []byte) (map[string]JWK, error) {
 			continue
 		}
 		if _, dup := out[tp]; dup {
-			return nil, errors.New("signing: key directory repeats a key")
+			return nil, nil, errors.New("signing: key directory repeats a key")
 		}
 		jwk.Kid = tp
 		out[tp] = jwk
 	}
 	if len(out) == 0 {
-		return nil, errors.New("signing: key directory holds no usable key")
+		return nil, nil, errors.New("signing: key directory holds no usable key")
 	}
-	return out, nil
+	return out, skipped, nil
 }
 
 // SignKeyDirectory builds the signed key directory response an origin
 // serves at DirectoryPath (WBA §5.5 and Appendix B.1). Each private key
-// (ed25519.PrivateKey or P-256 *ecdsa.PrivateKey) is published as its
+// (ed25519.PrivateKey, or *rsa.PrivateKey of 2048 to 8192 bits) is published as its
 // PublicDirectoryKey and signs the response once, covering "@authority";req
 // and content-digest. created is the signatures' created time (time.Now
 // minus DirectorySkewAllowance when zero) and lifetime their validity from

@@ -43,8 +43,9 @@ type TrustRecordOptions struct {
 	Mode ValidationMode
 	// Owner, when set, is the registrable domain (or a host under it) the
 	// record speaks for: the host serving it. Every agent origin must then
-	// be HTTPS under that registrable domain, and every grantee an exact
-	// registrable domain.
+	// be HTTPS under that registrable domain. A grantee is compared as its
+	// registrable domain (L2 Grants in trust.json), so a host under one is
+	// accepted; in Authoring mode a grantee must have one.
 	Owner string
 }
 
@@ -83,7 +84,7 @@ func ValidateTrustRecord(data []byte, opts TrustRecordOptions) (*TrustRecord, er
 	if err := json.Unmarshal(data, &rec); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidTrustRecord, err)
 	}
-	if err := rec.checkRules(opts.Owner); err != nil {
+	if err := rec.checkRules(opts.Owner, opts.Mode); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidTrustRecord, err)
 	}
 	return &rec, nil
@@ -103,7 +104,7 @@ func MarshalTrustRecord(rec *TrustRecord, owner string) ([]byte, error) {
 }
 
 // checkRules applies the rules beyond the schema.
-func (r *TrustRecord) checkRules(owner string) error {
+func (r *TrustRecord) checkRules(owner string, mode ValidationMode) error {
 	if r.AuthoritativeLocation != "" {
 		return nil
 	}
@@ -140,9 +141,13 @@ func (r *TrustRecord) checkRules(owner string) error {
 		}
 	}
 	for i, g := range r.Grants {
-		if operator != "" {
-			if d, ok := psl.RegistrableDomain(g.Grantee); !ok || d != g.Grantee {
-				return fmt.Errorf("grants[%d].grantee must be an exact registrable domain", i)
+		// A grantee is compared as its registrable domain, so a host under
+		// one names the same operator. A reader keeps a record whose
+		// grantee has no registrable domain (that grant never matches);
+		// an author is told.
+		if operator != "" && mode == Authoring {
+			if _, ok := psl.RegistrableDomain(g.Grantee); !ok {
+				return fmt.Errorf("grants[%d].grantee has no registrable domain", i)
 			}
 		}
 		for j, a := range g.Agents {

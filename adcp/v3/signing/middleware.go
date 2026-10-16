@@ -158,16 +158,26 @@ type MiddlewareOptions struct {
 	ObserveOnly bool
 
 	// WebBotAuth, when non-nil, enables the experimental AdCP 3.3 Web Bot
-	// Auth profile on this middleware alongside the RFC 9421 profile. A
-	// request carrying Signature-Agent or a web-bot-auth tag is then
-	// verified under Web Bot Auth only and never falls back to the RFC 9421
-	// profile, including under ObserveOnly. Failures are answered with the
-	// profile's statuses (400, 403 with Accept-Signature, 403 without it for
-	// a revoked key, 429), not request_signature_* codes. A non-empty Web Bot Auth signed body must be
-	// strict JSON (no duplicate or case-folded duplicate keys) or it is
-	// rejected with 400. When nil, Web Bot Auth requests take the RFC 9421
-	// path as before, and the middleware logs at INFO that the RFC 9421
-	// profile is deprecated in 3.3.
+	// Auth profile on this middleware alongside the RFC 9421 profile (or
+	// instead of it, with WebBotAuthOptions.Exclusive). A request carrying
+	// Signature-Agent or a web-bot-auth tag is then verified under Web Bot
+	// Auth only and never falls back to the RFC 9421 profile, including
+	// under ObserveOnly. Failures are answered with the profile's statuses
+	// (400; 403 with Accept-Signature; 403 without it for a revoked key; 429
+	// with Accept-Signature for a reused signature or nonce), not
+	// request_signature_* codes. A non-empty Web Bot Auth signed body must
+	// be strict JSON (no duplicate or case-folded duplicate keys) or it is
+	// rejected with 400.
+	//
+	// An unsigned request to an operation in RequiredFor or
+	// ProtocolMethodsRequiredFor is answered as the profile page says for a
+	// verifier that also advertises the RFC 9421 profile: 401 with
+	// request_signature_required, plus Accept-Signature for Web Bot Auth.
+	// With Exclusive it is 403 with Accept-Signature.
+	//
+	// When nil, Web Bot Auth requests take the RFC 9421 path as before, and
+	// the middleware logs at INFO that the RFC 9421 profile is deprecated
+	// in 3.3.
 	WebBotAuth *WebBotAuthOptions
 
 	// BoundOrigins enforces "no downgrade": once an origin is bound to a
@@ -180,6 +190,19 @@ type MiddlewareOptions struct {
 // WebBotAuthOptions configures the Web Bot Auth profile on Middleware.
 // EXPERIMENTAL (AdCP 3.3).
 type WebBotAuthOptions struct {
+	// Exclusive makes Web Bot Auth the only request-signing profile this
+	// middleware accepts, for a verifier whose request_signing.profiles
+	// advertises only "web-bot-auth". Every signed request is verified
+	// under Web Bot Auth, so an RFC 9421 signature without a web-bot-auth
+	// member is refused with 403 and Accept-Signature, and
+	// MiddlewareOptions.Resolver, BoundOrigins, and the RFC 9421 profile
+	// are unused. An unsigned request to an operation in RequiredFor or
+	// ProtocolMethodsRequiredFor, or one whose body carries
+	// push_notification_config.authentication, is refused with 403 and
+	// Accept-Signature, not 401 request_signature_required. Leave it false
+	// when the verifier also advertises "adcp/request-signing/v1".
+	Exclusive bool
+
 	// Keys resolves (origin, thumbprint). Required; NewDirectoryResolver is
 	// the production resolver.
 	Keys WBAKeyResolver
@@ -267,25 +290,6 @@ type OriginBindingLookup interface {
 	PrincipalForOrigin(ctx context.Context, origin string) (principalID string, bound bool, err error)
 }
 
-// verifiedSignersKey attaches every verified Web Bot Auth signer.
-type verifiedSignersKey struct{}
-
-// VerifiedSignersFromContext returns every signer the middleware verified
-// on the request: under Web Bot Auth, the originating signer first and then
-// each relay. The first entry is also returned by
-// VerifiedSignerFromContext. Relays never acquire the originator's
-// authority. Like VerifiedSignerFromContext, it is unreliable inside MCP
-// tool handlers of stateful sessions.
-func VerifiedSignersFromContext(ctx context.Context) []*VerifiedSigner {
-	if v, ok := ctx.Value(verifiedSignersKey{}).([]*VerifiedSigner); ok {
-		return v
-	}
-	if s := VerifiedSignerFromContext(ctx); s != nil {
-		return []*VerifiedSigner{s}
-	}
-	return nil
-}
-
 // rfc9421Deprecation is logged by each Middleware built without WebBotAuth.
 const rfc9421Deprecation = "signing.Middleware: the AdCP RFC 9421 request-signing profile is deprecated in AdCP 3.3; " +
 	"it remains supported through 3.x and is removed in 4.0. Set MiddlewareOptions.WebBotAuth to also accept the Web Bot Auth profile."
@@ -343,10 +347,10 @@ func Middleware(opts MiddlewareOptions) func(http.Handler) http.Handler {
 	if replay == nil {
 		replay = NewMemoryReplayStore(0)
 	}
-	if (len(opts.RequiredFor) > 0 || len(opts.ProtocolMethodsRequiredFor) > 0) && opts.Revocation == nil {
+	wba := opts.WebBotAuth
+	if (len(opts.RequiredFor) > 0 || len(opts.ProtocolMethodsRequiredFor) > 0) && opts.Revocation == nil && (wba == nil || !wba.Exclusive) {
 		logger.Warn("signing.Middleware: RequiredFor is non-empty but Revocation is nil — verifier will not enforce key revocation")
 	}
-	wba := opts.WebBotAuth
 	if wba == nil {
 		logger.Info(rfc9421Deprecation)
 	}
@@ -372,7 +376,11 @@ func Middleware(opts MiddlewareOptions) func(http.Handler) http.Handler {
 					scheme = "http"
 				}
 			}
-			if wba != nil && UsesWebBotAuth(r.Header) {
+			if wba != nil && wba.Exclusive && unsignedRequest(r.Header) {
+				serveUnsignedWebBotAuthOnly(w, r, next, wba, opName, opts, logger)
+				return
+			}
+			if wba != nil && (wba.Exclusive || UsesWebBotAuth(r.Header)) {
 				serveWebBotAuth(w, r, next, wba, unboundFor, replay, scheme, opName, opts, logger)
 				return
 			}
@@ -423,6 +431,11 @@ func Middleware(opts MiddlewareOptions) func(http.Handler) http.Handler {
 					next.ServeHTTP(w, r)
 					return
 				}
+				if wba != nil && e.Code == CodeRequired {
+					// The verifier advertises both profiles: the RFC 9421
+					// answer, plus Accept-Signature for Web Bot Auth.
+					w.Header().Set(acceptSignatureHeader, AcceptSignature(requestHasBody(r, opts.MaxBodyBytes)))
+				}
 				if opts.OnReject != nil {
 					opts.OnReject(w, r, e)
 					return
@@ -453,11 +466,50 @@ func Middleware(opts MiddlewareOptions) func(http.Handler) http.Handler {
 	}
 }
 
+// unsignedRequest reports a request that carries none of the signature
+// fields.
+func unsignedRequest(h http.Header) bool {
+	return len(h.Values(signatureHeader)) == 0 && len(h.Values(signatureInputHeader)) == 0 && len(h.Values(signatureAgentHeader)) == 0
+}
+
+// serveUnsignedWebBotAuthOnly handles an unsigned request on a verifier
+// that accepts only Web Bot Auth. An operation that requires a signature
+// (or a body carrying push_notification_config.authentication) is refused
+// with 403 and Accept-Signature; anything else proceeds unsigned.
+func serveUnsignedWebBotAuthOnly(w http.ResponseWriter, r *http.Request, next http.Handler, wba *WebBotAuthOptions,
+	opName string, opts MiddlewareOptions, logger *slog.Logger) {
+	op := opName
+	if op == "" {
+		op = jsonRPCOperation(r, opts.MaxBodyBytes)
+	}
+	required := requiresSignature(r, op, opts)
+	if !required {
+		limit := opts.MaxBodyBytes
+		if limit <= 0 {
+			limit = defaultMaxBodyBytes
+		}
+		body, err := readAndReplaceBody(r, limit)
+		required = err != nil || bodyCarriesPushNotificationAuth(body)
+	}
+	if !required {
+		next.ServeHTTP(w, r)
+		return
+	}
+	if opts.ObserveOnly {
+		logger.Info("unsigned request to an operation that requires a signature (ObserveOnly: request allowed through)", "op", op, "profile", ProfileTagWebBotAuth)
+		next.ServeHTTP(w, r)
+		return
+	}
+	e := wbaFail(http.StatusForbidden, "", "unsigned request to an operation that requires a signature")
+	e.noBody = !requestHasBody(r, opts.MaxBodyBytes)
+	rejectWBA(w, r, e, op, wba, logger)
+}
+
 // serveWebBotAuth verifies a request selected for the Web Bot Auth profile,
 // applies the binding gate, and dispatches or rejects it.
 func serveWebBotAuth(w http.ResponseWriter, r *http.Request, next http.Handler, wba *WebBotAuthOptions,
 	unboundFor map[string]struct{}, replay ReplayStore, scheme, opName string, opts MiddlewareOptions, logger *slog.Logger) {
-	signers, err := VerifyWebBotAuthRequest(r, WBAVerifyOptions{
+	caller, err := VerifyWebBotAuthRequest(r, WBAVerifyOptions{
 		Keys:         wba.Keys,
 		Replay:       replay,
 		Scheme:       scheme,
@@ -489,15 +541,13 @@ func serveWebBotAuth(w http.ResponseWriter, r *http.Request, next http.Handler, 
 	// then the binding. A revoked key is answered like a signature failure
 	// (403, generic body) but without Accept-Signature; every other outcome
 	// is the AdCP error envelope with existing codes, never 403 with
-	// Accept-Signature. The originating signer is the AdCP caller; relays
-	// are verified independently and acquire none of its authority.
+	// Accept-Signature.
 	if wba.Revocation != nil {
-		if err := CheckWBARevocation(r.Context(), wba.Revocation, signers); err != nil {
+		if err := CheckWBARevocation(r.Context(), wba.Revocation, caller); err != nil {
 			rejectWBA(w, r, err, op, wba, logger)
 			return
 		}
 	}
-	caller := signers[0]
 	principal := ""
 	if wba.Authorizer != nil {
 		principal, err = wba.Authorizer.AuthorizeWBA(r.Context(), caller, op)
@@ -528,7 +578,6 @@ func serveWebBotAuth(w http.ResponseWriter, r *http.Request, next http.Handler, 
 	}
 	caller.PrincipalID = principal
 	ctx := context.WithValue(r.Context(), contextKey{}, caller)
-	ctx = context.WithValue(ctx, verifiedSignersKey{}, signers)
 	serveWithToolRequestSigner(w, r.WithContext(ctx), next, caller)
 }
 
@@ -571,9 +620,10 @@ func rejectWBA(w http.ResponseWriter, r *http.Request, err error, op string, wba
 }
 
 // writeWBAReject writes the profile's failure response, split by layer. A
-// signature-path failure is its WBA status and headers (400, 403 with
-// Accept-Signature, 403 without it for a revoked key, 429) with the generic
-// authentication error as its body (DR-0023). An authorization outcome
+// signature-path failure is its WBA status and headers (400; 403 with
+// Accept-Signature; 403 without it for a revoked key; 429 with
+// Accept-Signature for a replay, or with Retry-After for replay-store
+// capacity) with the generic authentication error as its body. An authorization outcome
 // (identity established) is the standard AdCP error envelope with its code
 // and no Accept-Signature: PERMISSION_DENIED as 403, SERVICE_UNAVAILABLE as
 // 503 with Retry-After. Neither body carries signature-specific detail.

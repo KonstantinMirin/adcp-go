@@ -8,8 +8,9 @@
 //	    [--lifetime 24h] --out-body directory.json --out-headers directory.headers
 //	adcp-wba-directory --thumbprint key.pem
 //
-// Keys are PEM-encoded PKCS#8 Ed25519 or P-256 private keys, such as those
-// adcp-signing-keygen writes. Each key is published under its RFC 7638
+// Keys are PEM-encoded PKCS#8 Ed25519 private keys, such as those
+// adcp-signing-keygen -alg ed25519 writes. The Web Bot Auth profile signs
+// only with ed25519 and rsa-pss-sha512, so a P-256 key is refused. Each key is published under its RFC 7638
 // thumbprint and signs the response once (WBA Appendix B.1). Serve
 // --out-body byte for byte with the headers in --out-headers, one
 // "Name: value" per line, and run the command again before the signatures
