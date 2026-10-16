@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sync"
@@ -135,6 +136,9 @@ type TrustRecordEvaluatorOptions struct {
 	OutageContinuation time.Duration
 	// Clock defaults to time.Now.
 	Clock func() time.Time
+	// Logger receives warnings about records that read but may not mean
+	// what their author intended. Defaults to slog.Default().
+	Logger *slog.Logger
 }
 
 // TrustRecordEvaluator evaluates operator trust records at binding, grant
@@ -157,6 +161,7 @@ type TrustRecordEvaluator struct {
 	maxPerHost int
 	clock      func() time.Time
 	outage     time.Duration
+	logger     *slog.Logger
 
 	mu       sync.Mutex
 	cache    map[string]*cachedRecord
@@ -213,6 +218,7 @@ func NewTrustRecordEvaluator(opts TrustRecordEvaluatorOptions) (*TrustRecordEval
 		maxRecords:      opts.MaxRecords,
 		maxPerHost:      opts.MaxFetchesPerHost,
 		clock:           opts.Clock,
+		logger:          opts.Logger,
 		cache:           map[string]*cachedRecord{},
 		lru:             list.New(),
 		failures:        map[string]trustFailure{},
@@ -226,6 +232,9 @@ func NewTrustRecordEvaluator(opts TrustRecordEvaluatorOptions) (*TrustRecordEval
 	}
 	if e.interval == 0 {
 		e.interval = trustDefaultInterval
+	}
+	if e.logger == nil {
+		e.logger = slog.Default()
 	}
 	if e.interval < 0 || e.interval > trustMaxInterval {
 		return nil, errors.New("identity: PollingInterval must be in (0, 30m]")
@@ -435,6 +444,7 @@ func (e *TrustRecordEvaluator) resolve(ctx context.Context, domain, recordURL st
 		if err != nil {
 			return nil, trustErr("trust record is invalid", err)
 		}
+		e.warnHostGrantees(domain, rec)
 		if rec.AuthoritativeLocation == "" {
 			return &EvaluatedTrustRecord{OperatorDomain: domain, SourceURL: source, Record: rec, ExpiresAt: expires}, nil
 		}
@@ -712,4 +722,20 @@ func (e *TrustRecordEvaluator) Bind(ctx context.Context, signer *signing.Verifie
 		return nil, err
 	}
 	return rec, nil
+}
+
+// warnHostGrantees logs each grant whose grantee is a host under a
+// registrable domain rather than the registrable domain itself, with no
+// agents[] narrowing. Grantees are compared as registrable domains, so such
+// a grant reaches every agent of that operator, not only the host named
+// (for a multi-tenant vendor, every tenant). Whether the spec should
+// narrow it implicitly is an open question; until it is settled the grant
+// is read as written and the operator is told.
+func (e *TrustRecordEvaluator) warnHostGrantees(domain string, rec *TrustRecord) {
+	for i, g := range rec.Grants {
+		if d, ok := psl.RegistrableDomain(g.Grantee); ok && d != g.Grantee && g.Agents == nil {
+			e.logger.Warn("identity: trust record grants a host without agents[]; the grant covers the whole registrable domain",
+				"operator", domain, "grant", i, "registrable_domain", d)
+		}
+	}
 }

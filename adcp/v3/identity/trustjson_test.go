@@ -107,18 +107,22 @@ func TestValidateTrustRecordModesAndOwner(t *testing.T) {
 		"agent under another operator":      {owned, "other.com"},
 		"owner has no registrable domain":   {owned, "co.uk"},
 		"grantee has no registrable domain": {`{"grants":[{"grantee":"github.io","scopes":["adcp:media_buying"]}]}`, "example.com"},
+		"grantee is a host":                 {`{"grants":[{"grantee":"buy.agency.com","scopes":["adcp:media_buying"]}]}`, "example.com"},
 		"agent on a platform suffix":        {`{"agents":[{"url":"https://tenant.github.io/mcp","roles":["adcp:buying"]}]}`, "github.io"},
 	} {
 		_, err := ValidateTrustRecord([]byte(tc.doc), TrustRecordOptions{Owner: tc.owner})
 		require.Error(t, err, name)
 	}
-	// A grantee is compared as its registrable domain (L2 Grants in
-	// trust.json), so a host under one is accepted, as is, when reading,
-	// a grantee with no registrable domain (that grant matches nothing).
+	// An author must write a registrable domain (the error says to narrow
+	// with agents[]). A reader keeps a record whose grantee is a host
+	// (compared as its registrable domain, L2 Grants in trust.json) or has
+	// no registrable domain (that grant matches nothing).
 	_, err = ValidateTrustRecord([]byte(`{"grants":[{"grantee":"buy.agency.com","scopes":["adcp:media_buying"]}]}`), TrustRecordOptions{Owner: "example.com"})
-	require.NoError(t, err, "grantee is a host under a registrable domain")
-	_, err = ValidateTrustRecord([]byte(`{"grants":[{"grantee":"github.io","scopes":["adcp:media_buying"]}]}`), TrustRecordOptions{Mode: Reading, Owner: "example.com"})
-	require.NoError(t, err, "a reader keeps the record")
+	require.ErrorContains(t, err, "agents[]")
+	for _, grantee := range []string{"buy.agency.com", "github.io"} {
+		_, err = ValidateTrustRecord([]byte(`{"grants":[{"grantee":"`+grantee+`","scopes":["adcp:media_buying"]}]}`), TrustRecordOptions{Mode: Reading, Owner: "example.com"})
+		require.NoError(t, err, "a reader keeps the record: %s", grantee)
+	}
 	big := `{"grants":[],"ext":{"v":{"pad":"` + strings.Repeat("x", TrustRecordMaxBytes) + `"}}}`
 	_, err = ValidateTrustRecord([]byte(big), TrustRecordOptions{})
 	require.Error(t, err)

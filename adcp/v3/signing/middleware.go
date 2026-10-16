@@ -489,25 +489,18 @@ func unsignedRequest(h http.Header) bool {
 }
 
 // serveUnsignedWebBotAuthOnly handles an unsigned request on a verifier
-// that accepts only Web Bot Auth. An operation that requires a signature
-// (or a body carrying push_notification_config.authentication) is refused
-// with 403 and Accept-Signature; anything else proceeds unsigned.
+// that accepts only Web Bot Auth. A request that needs a signature
+// (requiresSignature: a required operation or method, a body carrying
+// push_notification_config.authentication, or a body that is not strict
+// JSON) is refused with 403 and Accept-Signature; anything else proceeds
+// unsigned.
 func serveUnsignedWebBotAuthOnly(w http.ResponseWriter, r *http.Request, next http.Handler, wba *WebBotAuthOptions,
 	opName string, opts MiddlewareOptions, logger *slog.Logger) {
 	op := opName
 	if op == "" {
 		op = jsonRPCOperation(r, opts.MaxBodyBytes)
 	}
-	required := requiresSignature(r, op, opts)
-	if !required {
-		limit := opts.MaxBodyBytes
-		if limit <= 0 {
-			limit = defaultMaxBodyBytes
-		}
-		body, err := readAndReplaceBody(r, limit)
-		required = err != nil || bodyCarriesPushNotificationAuth(body)
-	}
-	if !required {
+	if !requiresSignature(r, op, opts) {
 		next.ServeHTTP(w, r)
 		return
 	}
@@ -597,13 +590,17 @@ func serveWebBotAuth(w http.ResponseWriter, r *http.Request, next http.Handler, 
 	serveWithToolRequestSigner(w, r.WithContext(ctx), next, caller)
 }
 
-// requiresSignature reports whether op (or the request's JSON-RPC method)
-// is in the middleware's RequiredFor or ProtocolMethodsRequiredFor.
+// requiresSignature reports whether a request served without a verified
+// signer needs one: op (or the request's exact JSON-RPC method) is in
+// RequiredFor or ProtocolMethodsRequiredFor, the body carries
+// push_notification_config.authentication (the anti-downgrade rule), or the
+// body cannot be read or is not strict JSON, so no check on it can be
+// trusted to see what the handler will dispatch.
 func requiresSignature(r *http.Request, op string, opts MiddlewareOptions) bool {
 	if slices.Contains(opts.RequiredFor, op) {
 		return true
 	}
-	if len(opts.ProtocolMethodsRequiredFor) == 0 || r.Body == nil {
+	if r.Body == nil || r.Body == http.NoBody {
 		return false
 	}
 	limit := opts.MaxBodyBytes
@@ -611,7 +608,11 @@ func requiresSignature(r *http.Request, op string, opts MiddlewareOptions) bool 
 		limit = defaultMaxBodyBytes
 	}
 	body, err := readAndReplaceBody(r, limit)
-	return err == nil && slices.Contains(opts.ProtocolMethodsRequiredFor, protocolMethodFromJSONRPC(body))
+	if err != nil || ambiguousBody(body) {
+		return true
+	}
+	return slices.Contains(opts.ProtocolMethodsRequiredFor, protocolMethodFromJSONRPC(body)) ||
+		bodyCarriesPushNotificationAuth(body)
 }
 
 func rejectWBA(w http.ResponseWriter, r *http.Request, err error, op string, wba *WebBotAuthOptions, logger *slog.Logger) {

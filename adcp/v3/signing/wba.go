@@ -718,8 +718,11 @@ func authorityAllowed(authority, scheme string, allowed []string) bool {
 }
 
 // wbaReplayIdentity scopes a nonce to an identity in a ReplayStore shared
-// with RFC 9421 keyids; the prefix keeps the two namespaces apart.
-func wbaReplayIdentity(origin string) string { return "web-bot-auth " + origin }
+// with RFC 9421 keyids. The separator is the ASCII unit separator (0x1F), a
+// control character no HTTP field value can carry (net/http refuses it), so
+// no RFC 9421 keyid can name a Web Bot Auth identity and exhaust its
+// replay-cache capacity.
+func wbaReplayIdentity(origin string) string { return "web-bot-auth\x1f" + origin }
 
 func withLabel(err error, label string) error {
 	if we := AsWBAError(err); we != nil && we.Label == "" {

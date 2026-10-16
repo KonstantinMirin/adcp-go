@@ -664,3 +664,91 @@ func TestMiddlewareCarriesSignerToToolRequests(t *testing.T) {
 	require.Equal(t, "Basic abc", authz, "the original Authorization header is restored")
 	require.Nil(t, VerifiedSignerFromToolRequest(nil))
 }
+
+// TestUnsignedAmbiguousBodiesNeedASignature: a body the middleware cannot
+// read the way the handler will (not strict JSON: duplicate or case-variant
+// member names) is treated as needing a signature, so it cannot carry a
+// required operation, a required protocol method, or
+// push_notification_config.authentication past the checks unsigned.
+func TestUnsignedAmbiguousBodiesNeedASignature(t *testing.T) {
+	rig := newWBARig(t)
+	unsigned := func(body string) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "https://seller.example.com/mcp", strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		return r
+	}
+	duplicateID := `{"jsonrpc":"2.0","id":1,"id":2,"method":"tools/call","params":{"name":"create_media_buy","arguments":{}}}`
+	caseVariantMethod := `{"jsonrpc":"2.0","id":1,"method":"tools/call","Method":"initialize","params":{"name":"get_products"}}`
+	casePushAuth := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_media_buys","arguments":{"Push_Notification_Config":{"url":"https://b.example.com/h","Authentication":{"schemes":["Bearer"],"credentials":"x"}}}}}`
+
+	exclusive := func(t *testing.T, opts WebBotAuthOptions, methods []string) (http.Handler, *captured) {
+		var c captured
+		opts.Keys, opts.Clock, opts.Exclusive = rig.resolver, wbaClock, true
+		return Middleware(MiddlewareOptions{
+			WebBotAuth: &opts, Replay: rig.replay, Logger: discardLogger(),
+			RequiredFor: []string{"create_media_buy"}, ProtocolMethodsRequiredFor: methods,
+		})(captureHandler(&c)), &c
+	}
+	t.Run("Exclusive, no OperationResolver: duplicate keys do not hide a required operation", func(t *testing.T) {
+		h, c := exclusive(t, WebBotAuthOptions{}, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, unsigned(duplicateID))
+		requireGenericAuthError(t, rec, http.StatusForbidden, true)
+		require.False(t, c.called)
+	})
+	t.Run("Exclusive: a case-variant method does not hide a required protocol method", func(t *testing.T) {
+		h, c := exclusive(t, WebBotAuthOptions{}, []string{"tools/call"})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, unsigned(caseVariantMethod))
+		requireGenericAuthError(t, rec, http.StatusForbidden, true)
+		require.False(t, c.called)
+	})
+	t.Run("Exclusive: case-variant push_notification_config.authentication needs a signature", func(t *testing.T) {
+		h, c := exclusive(t, WebBotAuthOptions{}, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, unsigned(casePushAuth))
+		requireGenericAuthError(t, rec, http.StatusForbidden, true)
+		require.False(t, c.called)
+	})
+	t.Run("discovery failure served as anonymous: an ambiguous body is refused", func(t *testing.T) {
+		broken := newWBARig(t)
+		broken.dirs.fail(broken.origin, errors.New("directory answers 500"))
+		var c captured
+		h := Middleware(MiddlewareOptions{
+			WebBotAuth: &WebBotAuthOptions{Keys: broken.resolver, Clock: wbaClock, OnDiscoveryFailure: DiscoveryFailureAnonymous},
+			Replay:     broken.replay, Logger: discardLogger(), RequiredFor: []string{"create_media_buy"},
+		})(captureHandler(&c))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, broken.signedRequest(t, duplicateID))
+		requireGenericAuthError(t, rec, http.StatusForbidden, true)
+		require.False(t, c.called)
+		// A strict body naming no required operation is still served as
+		// anonymous.
+		c = captured{}
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, broken.signedRequest(t, mcpCall("get_products")))
+		require.Equal(t, http.StatusOK, rec.Code)
+		require.True(t, c.called)
+		require.Nil(t, c.signer)
+	})
+	t.Run("RFC 9421 path: unsigned ambiguous or case-variant bodies get request_signature_required", func(t *testing.T) {
+		for name, body := range map[string]string{"duplicate id": duplicateID, "case-variant method": caseVariantMethod, "case-variant push auth": casePushAuth} {
+			var c captured
+			h := Middleware(MiddlewareOptions{Resolver: NewStaticJWKSResolver(), Replay: rig.replay, Logger: discardLogger()})(captureHandler(&c))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, unsigned(body))
+			require.Equal(t, http.StatusUnauthorized, rec.Code, name)
+			require.Equal(t, `Signature error="request_signature_required"`, rec.Header().Get("WWW-Authenticate"), name)
+			require.False(t, c.called, name)
+		}
+		// A strict body without push authentication still passes unsigned.
+		var c captured
+		h := Middleware(MiddlewareOptions{Resolver: NewStaticJWKSResolver(), Replay: rig.replay, Logger: discardLogger()})(captureHandler(&c))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, unsigned(mcpCall("get_products")))
+		require.Equal(t, http.StatusOK, rec.Code)
+	})
+	require.Empty(t, protocolMethodFromJSONRPC([]byte(`{"jsonrpc":"2.0","Method":"tools/call"}`)), "method is read by exact name")
+	require.Equal(t, "tools/call", protocolMethodFromJSONRPC([]byte(`{"jsonrpc":"2.0","method":"tools/call"}`)))
+	require.True(t, bodyCarriesPushNotificationAuth([]byte(casePushAuth)))
+}

@@ -756,3 +756,30 @@ func TestGrantOutageRules(t *testing.T) {
 		require.Empty(t, details)
 	})
 }
+
+// TestHostGranteeReachesTheWholeOperator pins today's reading of a grant to
+// a host: the grantee is compared as its registrable domain (L2 Grants in
+// trust.json), so a grant to one tenant host of a multi-tenant vendor
+// reaches every tenant the vendor lists. Whether the spec should narrow it
+// implicitly is pending; until then the evaluator reads it as written and
+// logs a warning, and MarshalTrustRecord refuses to author it.
+func TestHostGranteeReachesTheWholeOperator(t *testing.T) {
+	server := newTrustServer()
+	server.set(trustURL("vendor-7k3q.com"), 200, `{"agents":[{"url":"https://t1.vendor-7k3q.com/mcp","roles":["adcp:buying"]},{"url":"https://t2.vendor-7k3q.com/mcp","roles":["adcp:buying"]}]}`)
+	server.set(trustURL("brand-7k3q.com"), 200, `{"grants":[{"grantee":"t1.vendor-7k3q.com","scopes":["adcp:media_buying"]}]}`)
+	var logs bytes.Buffer
+	eval, err := NewTrustRecordEvaluator(TrustRecordEvaluatorOptions{Fetch: server.fetch, Clock: func() time.Time { return testNow },
+		PollingInterval: time.Minute, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	require.NoError(t, err)
+	g := &GrantEvaluator{Records: eval}
+	for _, tenant := range []string{"https://t1.vendor-7k3q.com", "https://t2.vendor-7k3q.com"} {
+		res, err := g.Check(context.Background(), GrantRequest{AgentOrigin: tenant, BrandDomain: "brand-7k3q.com", AccountOperator: "vendor-7k3q.com"})
+		require.NoError(t, err)
+		require.True(t, res.Authorized, tenant)
+	}
+	require.Contains(t, logs.String(), "grants a host without agents[]")
+	require.Contains(t, logs.String(), "operator=brand-7k3q.com")
+
+	_, err = MarshalTrustRecord(&TrustRecord{Grants: []TrustGrant{{Grantee: "t1.vendor-7k3q.com", Scopes: []string{ScopeMediaBuying}}}}, "brand-7k3q.com")
+	require.ErrorContains(t, err, "agents[]", "an author is told to narrow with agents[]")
+}

@@ -592,3 +592,26 @@ func TestDirectoryResolverFailureErrorsArePerRequest(t *testing.T) {
 		require.True(t, strings.HasPrefix(res.header, res.label+"="), "%s got %q", res.label, res.header)
 	}
 }
+
+// TestDirectoryResolverExpiryFromVerifiedSignatures: only signatures the
+// verifier checked bound the cache. An unread signature with an expires in
+// the past does not make the directory expire at once.
+func TestDirectoryResolverExpiryFromVerifiedSignatures(t *testing.T) {
+	origin := "https://buyer.example.com"
+	key := newEd25519(t)
+	jwk, _ := PublicDirectoryKey(key)
+	resp := signDirectoryBody(t, origin, []byte(`{"keys":[{"kty":"OKP","crv":"Ed25519","x":"`+jwk.X+`"}]}`), key)
+	resp.Header.Set("Signature-Input", resp.Header.Get("Signature-Input")+`, key9=("@authority";req "content-digest");created=1;expires=2;keyid="unknown";tag="`+DirectoryTag+`"`)
+	resp.Header.Set("Signature", resp.Header.Get("Signature")+", key9=:AAAA:")
+	var fetches atomic.Int32
+	d := NewDirectoryResolver(DirectoryResolverOptions{Clock: wbaClock, Fetch: func(context.Context, string) (*DirectoryResponse, error) {
+		fetches.Add(1)
+		return resp, nil
+	}})
+	for range 2 {
+		got, err := d.ResolveWBAKey(context.Background(), origin, jwk.Kid)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+	}
+	require.Equal(t, int32(1), fetches.Load(), "cached for the cache period, not expired by the unread signature")
+}

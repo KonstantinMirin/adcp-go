@@ -58,42 +58,51 @@ type DirectoryResponse struct {
 // An unsigned directory, or one with a usable key that did not sign it, is
 // refused.
 func VerifyDirectoryResponse(origin string, resp *DirectoryResponse, now time.Time) (map[string]JWK, error) {
+	keys, _, err := verifyDirectoryResponse(origin, resp, now)
+	return keys, err
+}
+
+// verifyDirectoryResponse is VerifyDirectoryResponse, also returning the
+// earliest expires among the signatures it verified (signatures it did not
+// read do not shorten the cache).
+func verifyDirectoryResponse(origin string, resp *DirectoryResponse, now time.Time) (map[string]JWK, time.Time, error) {
 	origin, err := webBotAuthOrigin(origin)
 	if err != nil {
-		return nil, fmt.Errorf("signing: directory origin: %w", err)
+		return nil, time.Time{}, fmt.Errorf("signing: directory origin: %w", err)
 	}
 	if resp == nil || resp.Status != http.StatusOK || len(resp.Body) > directoryMaxBytes {
-		return nil, errors.New("signing: invalid key directory response")
+		return nil, time.Time{}, errors.New("signing: invalid key directory response")
 	}
 	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get(contentTypeHeader))
 	switch mediaType {
 	case DirectoryMediaType, "application/jwk-set+json", "application/json":
 	default:
-		return nil, errors.New("signing: key directory has the wrong media type")
+		return nil, time.Time{}, errors.New("signing: key directory has the wrong media type")
 	}
 	keys, err := parseDirectoryKeys(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	rawInput, rawSig := resp.Header.Get(signatureInputHeader), resp.Header.Get(signatureHeader)
 	if rawInput == "" && rawSig == "" {
-		return nil, errors.New("signing: key directory is not signed")
+		return nil, time.Time{}, errors.New("signing: key directory is not signed")
 	}
 	if !wbaDigestMatches(resp.Header.Get(contentDigestHeader), resp.Body) {
-		return nil, errors.New("signing: key directory digest mismatch")
+		return nil, time.Time{}, errors.New("signing: key directory digest mismatch")
 	}
 	inputs, err := parseSFDictionary(rawInput)
 	if err != nil || len(inputs) == 0 {
-		return nil, errors.New("signing: key directory Signature-Input does not parse")
+		return nil, time.Time{}, errors.New("signing: key directory Signature-Input does not parse")
 	}
 	signatures, err := parseSFDictionary(rawSig)
 	if err != nil {
-		return nil, errors.New("signing: key directory Signature does not parse")
+		return nil, time.Time{}, errors.New("signing: key directory Signature does not parse")
 	}
 	if !sameKeys(inputs.keys(), signatures.keys()) {
-		return nil, errors.New("signing: key directory Signature and Signature-Input labels differ")
+		return nil, time.Time{}, errors.New("signing: key directory Signature and Signature-Input labels differ")
 	}
 	verified := map[string]struct{}{}
+	var earliest int64
 	for _, e := range inputs {
 		m := e.member
 		if keyID, _ := stringParam(m.params, "keyid"); keys[keyID].Kty == "" {
@@ -103,10 +112,10 @@ func VerifyDirectoryResponse(origin string, resp *DirectoryResponse, now time.Ti
 			continue
 		}
 		if tag, ok := stringParam(m.params, "tag"); !m.inner || !ok || tag != DirectoryTag {
-			return nil, errors.New("signing: key directory signature has the wrong profile")
+			return nil, time.Time{}, errors.New("signing: key directory signature has the wrong profile")
 		}
 		if err := wbaWindow(m, now.Unix(), true, e.key); err != nil {
-			return nil, fmt.Errorf("signing: key directory signature: %w", err)
+			return nil, time.Time{}, fmt.Errorf("signing: key directory signature: %w", err)
 		}
 		covered := map[string]struct{}{}
 		for _, c := range m.list {
@@ -115,47 +124,30 @@ func VerifyDirectoryResponse(origin string, resp *DirectoryResponse, now time.Ti
 		_, a := covered[`"@authority";req`]
 		_, d := covered[`"content-digest"`]
 		if !a || !d {
-			return nil, errors.New("signing: key directory signature does not bind authority and digest")
+			return nil, time.Time{}, errors.New("signing: key directory signature does not bind authority and digest")
 		}
 		keyID, _ := stringParam(m.params, "keyid")
 		jwk, ok := keys[keyID]
 		if _, dup := verified[keyID]; !ok || dup {
-			return nil, errors.New("signing: key directory signature key is absent or repeated")
+			return nil, time.Time{}, errors.New("signing: key directory signature key is absent or repeated")
 		}
 		base, err := wbaSignatureBase(http.MethodGet, origin+DirectoryPath, resp.Header, m, true)
 		if err != nil {
-			return nil, fmt.Errorf("signing: key directory signature base: %w", err)
+			return nil, time.Time{}, fmt.Errorf("signing: key directory signature base: %w", err)
 		}
 		sig, _ := signatures.get(e.key)
 		if _, err := wbaVerifyCrypto(m, sig, jwk, base); err != nil {
-			return nil, fmt.Errorf("signing: key directory signature: %w", err)
+			return nil, time.Time{}, fmt.Errorf("signing: key directory signature: %w", err)
 		}
 		verified[keyID] = struct{}{}
-	}
-	if len(verified) != len(keys) {
-		return nil, errors.New("signing: key directory has a key that did not sign it")
-	}
-	return keys, nil
-}
-
-// directoryExpiry returns the earliest expires of a verified directory's
-// signatures.
-func directoryExpiry(resp *DirectoryResponse) (time.Time, bool) {
-	inputs, err := parseSFDictionary(resp.Header.Get(signatureInputHeader))
-	if err != nil || len(inputs) == 0 {
-		return time.Time{}, false
-	}
-	var earliest int64
-	for i, e := range inputs {
-		exp, ok := intParam(e.member.params, "expires")
-		if !ok {
-			return time.Time{}, false
-		}
-		if i == 0 || exp < earliest {
+		if exp, _ := intParam(m.params, "expires"); earliest == 0 || exp < earliest {
 			earliest = exp
 		}
 	}
-	return time.Unix(earliest, 0), true
+	if len(verified) != len(keys) {
+		return nil, time.Time{}, errors.New("signing: key directory has a key that did not sign it")
+	}
+	return keys, time.Unix(earliest, 0), nil
 }
 
 // parseDirectoryKeys returns the directory's usable keys by thumbprint.

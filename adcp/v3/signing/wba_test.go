@@ -433,6 +433,24 @@ func TestWBAReplayIsPerOriginAcrossKeyRotation(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestWBAReplayNamespace: a Web Bot Auth replay identity carries a byte no
+// RFC 9421 keyid can (keyids arrive in an HTTP field), so the two profiles
+// never share a replay-cache entry or its capacity.
+func TestWBAReplayNamespace(t *testing.T) {
+	id := wbaReplayIdentity("https://buyer.example.com")
+	require.True(t, strings.ContainsFunc(id, func(r rune) bool { return r < 0x20 || r > 0x7e }))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer srv.Close()
+	req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+	req.Header.Set("Signature-Input", `sig1=("@method");keyid="`+id+`"`)
+	resp, err := srv.Client().Do(req)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	require.Error(t, err, "net/http refuses the control character in a field value")
+}
+
 func TestWBAReplayCapacityIs429(t *testing.T) {
 	rig := newWBARig(t)
 	rig.replay.MarkKeyIDAtCap(wbaReplayIdentity(rig.origin))

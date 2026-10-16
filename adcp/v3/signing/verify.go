@@ -13,6 +13,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/adcontextprotocol/adcp-go/adcp/v3/internal/strictjson"
 )
 
 // VerifyOptions configures a single call to VerifyRequestSignature.
@@ -150,6 +152,9 @@ func VerifyRequestSignature(r *http.Request, opts VerifyOptions) (*VerifiedSigne
 		body, err := readAndReplaceBody(r, limit)
 		if err != nil {
 			return nil, err
+		}
+		if ambiguousBody(body) {
+			return nil, newError(CodeRequired, "unsigned body is not strict JSON")
 		}
 		if _, req := protocolMethodsRequiredFor[protocolMethodFromJSONRPC(body)]; req {
 			return nil, newError(CodeRequired, "protocol method requires signature")
@@ -462,26 +467,50 @@ func bodyCarriesPushNotificationAuth(body []byte) bool {
 }
 
 // protocolMethodFromJSONRPC returns the exact JSON-RPC method name carried by
-// body. It treats malformed and non-JSON-RPC bodies as no protocol method; the
-// caller's ordinary schema validation remains responsible for rejecting them.
+// body, read by exact, case-sensitive member name as the MCP SDK dispatches
+// it (encoding/json would also match "Method"). It treats malformed and
+// non-JSON-RPC bodies as no protocol method; an unsigned body that is not
+// strict JSON is refused separately (ambiguousBody), so a duplicate or
+// case-variant "method" cannot name a different method here than the one
+// dispatched.
 func protocolMethodFromJSONRPC(body []byte) string {
-	var envelope struct {
-		JSONRPC string `json:"jsonrpc"`
-		Method  string `json:"method"`
-	}
-	if err := json.Unmarshal(body, &envelope); err != nil || envelope.JSONRPC != "2.0" {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(body, &envelope); err != nil {
 		return ""
 	}
-	return envelope.Method
+	var version, method string
+	if json.Unmarshal(envelope["jsonrpc"], &version) != nil || version != "2.0" || json.Unmarshal(envelope["method"], &method) != nil {
+		return ""
+	}
+	return method
+}
+
+// ambiguousBody reports a non-empty body that is not strict JSON: not one
+// JSON value, or one with duplicate member names (including names that
+// differ only in case), or nested deeper than 32. Readers disagree about
+// such a body (encoding/json matches member names case-insensitively, the
+// MCP SDK exactly), so no check on it can be trusted to see what the
+// handler sees: an unsigned request carrying one is treated as needing a
+// signature.
+func ambiguousBody(body []byte) bool {
+	return len(bytes.TrimSpace(body)) > 0 && strictjson.Validate(body, 0) != nil
 }
 
 func hasPushNotificationAuth(v any) bool {
 	switch t := v.(type) {
 	case map[string]any:
-		if pnc, ok := t["push_notification_config"]; ok {
+		// Member names match case-insensitively, as encoding/json decodes
+		// them into handler structs: "Push_Notification_Config" and
+		// "Authentication" count.
+		for name, pnc := range t {
+			if strictjson.Fold(name) != strictjson.Fold("push_notification_config") {
+				continue
+			}
 			if m, ok := pnc.(map[string]any); ok {
-				if _, hasAuth := m["authentication"]; hasAuth {
-					return true
+				for key := range m {
+					if strictjson.Fold(key) == strictjson.Fold("authentication") {
+						return true
+					}
 				}
 			}
 		}

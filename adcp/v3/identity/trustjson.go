@@ -35,9 +35,9 @@ const (
 	// Reading keeps unknown onboarding requirement kinds, which are
 	// advisory and never machine-satisfiable, without relaxing any
 	// authority-bearing member. One rule differs by mode: Authoring
-	// refuses a grantee with no registrable domain, while Reading keeps
-	// the record and that grant matches nothing (grantees are compared as
-	// registrable domains).
+	// requires every grantee to be a registrable domain, while Reading
+	// keeps a record whose grantee is a host (compared as its registrable
+	// domain) or has no registrable domain (that grant matches nothing).
 	Reading
 )
 
@@ -46,9 +46,10 @@ type TrustRecordOptions struct {
 	Mode ValidationMode
 	// Owner, when set, is the registrable domain (or a host under it) the
 	// record speaks for: the host serving it. Every agent origin must then
-	// be HTTPS under that registrable domain. A grantee is compared as its
-	// registrable domain (L2 Grants in trust.json), so a host under one is
-	// accepted; in Authoring mode a grantee must have one.
+	// be HTTPS under that registrable domain. In Authoring mode every
+	// grantee must be a registrable domain (narrow with agents[]); a reader
+	// accepts a host under one and compares it as its registrable domain
+	// (L2 Grants in trust.json).
 	Owner string
 }
 
@@ -145,12 +146,15 @@ func (r *TrustRecord) checkRules(owner string, mode ValidationMode) error {
 	}
 	for i, g := range r.Grants {
 		// A grantee is compared as its registrable domain, so a host under
-		// one names the same operator. A reader keeps a record whose
-		// grantee has no registrable domain (that grant never matches);
-		// an author is told.
+		// one names that whole operator. An author must write the
+		// registrable domain and narrow with agents[], so a grant to one
+		// tenant host is never silently a grant to every tenant. A reader
+		// keeps the record: a host grantee covers its registrable domain
+		// (TrustRecordEvaluator logs a warning when it has no agents[]),
+		// and a grantee with no registrable domain matches nothing.
 		if operator != "" && mode == Authoring {
-			if _, ok := psl.RegistrableDomain(g.Grantee); !ok {
-				return fmt.Errorf("grants[%d].grantee has no registrable domain", i)
+			if d, ok := psl.RegistrableDomain(g.Grantee); !ok || d != g.Grantee {
+				return fmt.Errorf("grants[%d].grantee must be a registrable domain; narrow the grant to specific agents with agents[]", i)
 			}
 		}
 		for j, a := range g.Agents {

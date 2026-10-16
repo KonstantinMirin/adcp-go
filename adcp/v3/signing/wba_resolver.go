@@ -242,13 +242,14 @@ func (d *DirectoryResolver) refresh(ctx context.Context, origin string, call *di
 	defer cancel()
 	resp, err := d.fetch(ctx, origin+DirectoryPath)
 	var keys map[string]JWK
+	var sigExpiry time.Time
 	switch {
 	case err != nil:
 	case resp == nil || resp.Status != http.StatusOK:
 		// Any status other than 200 is a discovery failure (WBA §5.5).
 		err = errors.New("key directory fetch did not return 200")
 	default:
-		keys, err = VerifyDirectoryResponse(origin, resp, d.clock())
+		keys, sigExpiry, err = verifyDirectoryResponse(origin, resp, d.clock())
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -279,9 +280,7 @@ func (d *DirectoryResolver) refresh(ctx context.Context, origin string, call *di
 	delete(d.failures, origin)
 	refreshAt := now.Add(directoryCacheTTL)
 	expires := now.Add(d.maxStale)
-	if exp, ok := directoryExpiry(resp); ok {
-		expires = minTime(expires, exp)
-	}
+	expires = minTime(expires, sigExpiry)
 	refreshAt = minTime(refreshAt, expires)
 	e := &directoryEntry{origin: origin, resp: resp, keys: keys, refreshAt: refreshAt, expires: expires}
 	if old := d.cache[origin]; old != nil {
