@@ -93,7 +93,6 @@ type MediaBuyCapabilities struct {
 	AcceptancePolicyDiscovery    any                                   `json:"acceptance_policy_discovery,omitempty"`
 	SupportedPricingModels       []string                              `json:"supported_pricing_models,omitempty"`
 	BuyingModes                  []string                              `json:"buying_modes,omitempty"`
-	AnonymousDiscovery           *bool                                 `json:"anonymous_discovery,omitempty"`
 	MeasurementTermsAcceptance   *bool                                 `json:"measurement_terms_acceptance,omitempty"`
 	AvailabilityHorizon          *bool                                 `json:"availability_horizon,omitempty"`
 	LifecycleTools               []string                              `json:"lifecycle_tools,omitempty"`
@@ -117,7 +116,7 @@ type MediaBuyCapabilities struct {
 	VendorMetricOptimization     *MediaBuyVendorMetricOptimizationCaps `json:"vendor_metric_optimization,omitempty"`
 	ConversionTracking           *ConversionTrackingCaps               `json:"conversion_tracking,omitempty"`
 	FrequencyCapping             *FrequencyCappingCaps                 `json:"frequency_capping,omitempty"`
-	AggregateFrequencyCapping    *MediaBuyFrequencyCapCapability        `json:"aggregate_frequency_capping,omitempty"`
+	AggregateFrequencyCapping    any                                   `json:"aggregate_frequency_capping,omitempty"`
 	BudgetCapping                any                                   `json:"budget_capping,omitempty"`
 	ContentStandards             *ContentStandardsCaps                 `json:"content_standards,omitempty"`
 	Portfolio                    *PortfolioCaps                        `json:"portfolio,omitempty"`
@@ -299,7 +298,6 @@ type PortfolioCaps struct {
 type SignalsCapabilities struct {
 	DataProviderDomains []string        `json:"data_provider_domains,omitempty"`
 	DiscoveryModes      []string        `json:"discovery_modes,omitempty"`
-	AnonymousDiscovery  *bool           `json:"anonymous_discovery,omitempty"`
 	Features            map[string]bool `json:"features,omitempty"`
 }
 
@@ -1265,12 +1263,32 @@ type AssetSlot struct {
 	AcceptedMediaTypes []string `json:"accepted_media_types,omitempty"`
 }
 
+// CreativeResult is the per-creative item of a sync-creatives success response.
+// It mirrors static/schemas/source/creative/sync-creatives-response.json
+// (oneOf[0].properties.creatives.items) of the pinned AdCP bundle.
+// The two deeply-nested 3.2 additions (localization and
+// macro_resolution_results) are present but kept shallow here: localization
+// is carried as `any` and macro_resolution_results uses the generated
+// MacroResolutionResult type, rather than hand-expanding their object graphs.
 type CreativeResult struct {
-	CreativeID      string   `json:"creative_id"`
-	Action          string   `json:"action"`
-	Status          string   `json:"status,omitempty"`
-	RejectionReason string   `json:"rejection_reason,omitempty"`
-	Errors          []string `json:"errors,omitempty"`
+	CreativeID             string                  `json:"creative_id"`
+	RevisionID             string                  `json:"revision_id,omitempty"`
+	Account                *Account                `json:"account,omitempty"`
+	Action                 string                  `json:"action"`
+	Status                 string                  `json:"status,omitempty"`
+	PlatformID             string                  `json:"platform_id,omitempty"`
+	Changes                []string                `json:"changes,omitempty"`
+	Errors                 []string                `json:"errors,omitempty"`
+	Warnings               []string                `json:"warnings,omitempty"`
+	PreviewURL             string                  `json:"preview_url,omitempty"`
+	ExpiresAt              string                  `json:"expires_at,omitempty"`
+	AssignedTo             []string                `json:"assigned_to,omitempty"`
+	AssignmentErrors       map[string]string       `json:"assignment_errors,omitempty"`
+	Localization           any                     `json:"localization,omitempty"`
+	MacroResolutionResults []MacroResolutionResult `json:"macro_resolution_results,omitempty"`
+	// Deprecated: not part of the AdCP schema. Failure detail belongs in
+	// errors[] as core/error.json objects; see #546.
+	RejectionReason string `json:"rejection_reason,omitempty"`
 }
 
 type CreativeListItem struct {
@@ -1574,137 +1592,3 @@ type VendorPricingOption struct {
 	AppliesToOutputCapabilityIDs []string       `json:"applies_to_output_capability_ids,omitempty"`
 	Ext                          any            `json:"ext,omitempty"`
 }
-
-// --- Reliable Reporting consumer status ---
-
-// ReportingConsumerStatusPeriod is the expected half-open reporting period.
-type ReportingConsumerStatusPeriod struct {
-	Start          string `json:"start"`
-	End            string `json:"end"`
-	SourceTimezone string `json:"source_timezone"`
-}
-
-// ReportingConsumerStatus is one immutable consumer statement about whether
-// required reporting for an expected configuration period was consumed.
-type ReportingConsumerStatus struct {
-	ReportingStatusID             string                        `json:"reporting_status_id"`
-	SupersedesReportingStatusID   string                        `json:"supersedes_reporting_status_id,omitempty"`
-	DeliveryConfigID              string                        `json:"delivery_config_id"`
-	DeliveryConfigVersion         int                           `json:"delivery_config_version"`
-	ReportDefinitionID            string                        `json:"report_definition_id"`
-	Period                        ReportingConsumerStatusPeriod  `json:"period"`
-	ReportingObligationID         string                        `json:"reporting_obligation_id,omitempty"`
-	ReportingRevisionID           string                        `json:"reporting_revision_id,omitempty"`
-	ObservedRevisionContentSHA256 string                        `json:"observed_revision_content_sha256,omitempty"`
-	ConsumerStatus                string                        `json:"consumer_status"`
-	StatusAsOf                    string                        `json:"status_as_of"`
-	MismatchCode                  string                        `json:"mismatch_code,omitempty"`
-	FailureCode                   string                        `json:"failure_code,omitempty"`
-	ConsumerCommitRef             string                        `json:"consumer_commit_ref,omitempty"`
-	SellerLedgerSnapshotID        string                        `json:"seller_ledger_snapshot_id,omitempty"`
-	SellerLedgerAsOf              string                        `json:"seller_ledger_as_of,omitempty"`
-	RecordedAt                    string                        `json:"recorded_at,omitempty"`
-}
-
-// ReportingStatusResult is one entry in the sync_reporting_status response.
-type ReportingStatusResult struct {
-	Result            string                  `json:"result"`
-	ConsumerStatus    *ReportingConsumerStatus `json:"consumer_status,omitempty"`
-	ReportingStatusID string                  `json:"reporting_status_id,omitempty"`
-	Errors            []AdcpError             `json:"errors,omitempty"`
-}
-
-// ReportingStatusRecordedResult builds a "recorded" result.
-func ReportingStatusRecordedResult(status ReportingConsumerStatus) ReportingStatusResult {
-	return ReportingStatusResult{Result: "recorded", ConsumerStatus: &status}
-}
-
-// ReportingStatusUnchangedResult builds an "unchanged" result (idempotent replay).
-func ReportingStatusUnchangedResult(status ReportingConsumerStatus) ReportingStatusResult {
-	return ReportingStatusResult{Result: "unchanged", ConsumerStatus: &status}
-}
-
-// ReportingStatusFailedResult builds a "failed" result.
-func ReportingStatusFailedResult(statusID string, errors ...AdcpError) ReportingStatusResult {
-	return ReportingStatusResult{Result: "failed", ReportingStatusID: statusID, Errors: errors}
-}
-
-// --- Reliable Reporting receipts (buyer reconciler) ---
-
-// ReportingReceipt is a consumer acceptance/rejection of a reporting
-// revision materialization.
-type ReportingReceipt struct {
-	ReportingReceiptID              string   `json:"reporting_receipt_id"`
-	ReportingObligationID           string   `json:"reporting_obligation_id"`
-	ReportingRevisionID             string   `json:"reporting_revision_id"`
-	ReportingMaterializationID      string   `json:"reporting_materialization_id,omitempty"`
-	SupersedesReportingReceiptID    string   `json:"supersedes_reporting_receipt_id,omitempty"`
-	Status                          string   `json:"status"`
-	VerificationProfile             string   `json:"verification_profile,omitempty"`
-	ObservedRowCount                *int     `json:"observed_row_count,omitempty"`
-	ObservedCanonicalContentDigest  string   `json:"observed_canonical_content_digest,omitempty"`
-	ObservedManifestSHA256          string   `json:"observed_manifest_sha256,omitempty"`
-	ObservedNativeVersionRef        string   `json:"observed_native_version_ref,omitempty"`
-	ConsumerCommitRef               string   `json:"consumer_commit_ref,omitempty"`
-	RejectionCodes                  []string `json:"rejection_codes,omitempty"`
-	ObservedAt                      string   `json:"observed_at"`
-	ReceivedAt                      string   `json:"received_at,omitempty"`
-}
-
-// ReportingAdjustmentReceipt is a consumer acceptance/rejection of a
-// post-official adjustment.
-type ReportingAdjustmentReceipt struct {
-	ReportingReceiptID           string   `json:"reporting_receipt_id"`
-	ReportingAdjustmentID        string   `json:"reporting_adjustment_id"`
-	AdjustsReportingRevisionID   string   `json:"adjusts_reporting_revision_id"`
-	SupersedesReportingReceiptID string   `json:"supersedes_reporting_receipt_id,omitempty"`
-	Status                       string   `json:"status"`
-	ObservedAdjustmentSHA256     string   `json:"observed_adjustment_sha256"`
-	RejectionCodes               []string `json:"rejection_codes,omitempty"`
-	ObservedAt                   string   `json:"observed_at"`
-	ReceivedAt                   string   `json:"received_at,omitempty"`
-}
-
-// ReportingReceiptResult is one entry in sync_reporting_receipts response.
-type ReportingReceiptResult struct {
-	Result             string                      `json:"result"`
-	Receipt            *ReportingReceipt           `json:"receipt,omitempty"`
-	AdjustmentReceipt  *ReportingAdjustmentReceipt `json:"adjustment_receipt,omitempty"`
-	ReportingReceiptID string                      `json:"reporting_receipt_id,omitempty"`
-	Errors             []AdcpError                 `json:"errors,omitempty"`
-}
-
-// ReportingReceiptRecordedResult builds a "recorded" receipt result.
-func ReportingReceiptRecordedResult(receipt ReportingReceipt) ReportingReceiptResult {
-	return ReportingReceiptResult{Result: "recorded", Receipt: &receipt}
-}
-
-// ReportingReceiptUnchangedResult builds an "unchanged" receipt result.
-func ReportingReceiptUnchangedResult(receipt ReportingReceipt) ReportingReceiptResult {
-	return ReportingReceiptResult{Result: "unchanged", Receipt: &receipt}
-}
-
-// ReportingAdjustmentReceiptRecordedResult builds a "recorded" adjustment receipt result.
-func ReportingAdjustmentReceiptRecordedResult(receipt ReportingAdjustmentReceipt) ReportingReceiptResult {
-	return ReportingReceiptResult{Result: "recorded", AdjustmentReceipt: &receipt}
-}
-
-// ReportingAdjustmentReceiptUnchangedResult builds an "unchanged" adjustment receipt result.
-func ReportingAdjustmentReceiptUnchangedResult(receipt ReportingAdjustmentReceipt) ReportingReceiptResult {
-	return ReportingReceiptResult{Result: "unchanged", AdjustmentReceipt: &receipt}
-}
-
-// ReportingReceiptFailedResult builds a "failed" receipt result.
-func ReportingReceiptFailedResult(receiptID string, errors ...AdcpError) ReportingReceiptResult {
-	return ReportingReceiptResult{Result: "failed", ReportingReceiptID: receiptID, Errors: errors}
-}
-
-// ValidateInputWarning is a non-blocking validate_input observation. The schema
-// gives warnings "the same item shape as violations" and requires `rule` and
-// `field`, but declares only `rule`, `expected` and `predicted` under
-// properties, so a generated struct would drop `field`. It takes the violation
-// shape the schema names, which carries `field` and `retry_with`. Decoding is
-// therefore stricter than the warnings schema alone: a non-string `field` or a
-// non-object `retry_with`, which that schema leaves untyped or undeclared, is
-// rejected as it is for a violation.
-type ValidateInputWarning ValidateInputViolation
