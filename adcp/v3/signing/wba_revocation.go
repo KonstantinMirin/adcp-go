@@ -16,6 +16,8 @@ import (
 	"sync"
 	"time"
 
+	jose "github.com/go-jose/go-jose/v4"
+
 	"github.com/adcontextprotocol/adcp-go/adcp/v3/internal/psl"
 	"github.com/adcontextprotocol/adcp-go/adcp/v3/internal/safefetch"
 	"github.com/adcontextprotocol/adcp-go/adcp/v3/internal/strictjson"
@@ -228,14 +230,57 @@ func ParseRevocationList(payload []byte, issuer string) (*RevocationList, error)
 	return l, nil
 }
 
+// revocationJWSAlgorithms are the JWS algorithms a revocation list may be
+// signed with: one per key type a Web Bot Auth key directory holds.
+var revocationJWSAlgorithms = []jose.SignatureAlgorithm{jose.EdDSA, jose.ES256, jose.PS512}
+
+// revocationMaxProtectedHeader caps the encoded protected header of a
+// revocation list JWS. A real header (alg, typ, kid) is under 200 bytes.
+// go-jose decodes every header member into Go values, twice, before the
+// signature is checked, so an unbounded header lets anyone who serves a
+// revocation list make a verifier allocate many times the 1 MiB body.
+const revocationMaxProtectedHeader = 8 << 10
+
 // verifyRevocationJWS verifies a revocation list JWS in compact, flattened
 // JSON, or single-signature general JSON serialization and returns its
-// payload. The protected header must carry alg EdDSA or ES256, typ
+// payload. The protected header must carry alg EdDSA, ES256 or PS512, typ
 // adcp-gov-revocation+jws, a kid, and no crit; the kid is resolved by
 // resolve and the key's algorithm must match alg.
+//
+// go-jose parses the protected header, applies the algorithm allowlist and
+// builds the RFC 7515 signing input. AdCP's envelope rules run first, and
+// the JWS reaches go-jose in compact form:
+//   - a JSON serialization must be strict JSON (strictjson), as every
+//     document carrying authority is, with exactly one signature, and may
+//     not mix the flattened members (protected, signature) with the
+//     general one (signatures), which RFC 7515 §7.2.2 forbids; go-jose
+//     would ignore the flattened members. An unprotected header is
+//     ignored, as before: nothing is read from it;
+//   - the encoded protected header is at most 8 KiB
+//     (revocationMaxProtectedHeader), checked before anything decodes it;
+//   - every segment must be canonical unpadded base64url, and a compact
+//     segment non-empty. go-jose decodes leniently (it strips whitespace,
+//     and ignores unused low bits) and rebuilds the signing input from
+//     the decoded bytes, so a non-canonical segment would verify as a
+//     different string than the one sent;
+//   - the decoded protected header must be strict JSON (case-folded
+//     duplicate names, nesting); go-jose rejects only exact duplicates;
+//   - alg, typ and kid come from the protected header;
+//   - a non-empty crit is refused, as the profile defines no extension;
+//   - "b64": false is refused: go-jose would sign over the raw payload
+//     (RFC 7797) even when crit does not list b64, where the profile always
+//     signs over the base64url payload.
+//
+// go-jose also refuses a protected header whose jwk, x5c or nonce member
+// does not parse; the profile reads none of them.
+//
+// The signature itself is checked by verifyWithJWK, the same key policy
+// and verification Web Bot Auth HTTP signatures use: go-jose's own
+// verifier accepts any RSASSA-PSS salt length, where RFC 7518 §3.5 fixes it
+// at the hash size, and its JWK decoder caps RSA moduli at 4096 bits.
 func verifyRevocationJWS(body []byte, resolve func(kid string) (*JWK, error)) ([]byte, error) {
 	body = bytes.TrimSpace(body)
-	var protected, payload, signature string
+	var protectedB64, payloadB64, signatureB64 string
 	if len(body) > 0 && body[0] == '{' {
 		var doc struct {
 			Payload    *string `json:"payload"`
@@ -249,15 +294,15 @@ func verifyRevocationJWS(body []byte, resolve func(kid string) (*JWK, error)) ([
 		if err := strictjson.Unmarshal(body, 0, &doc); err != nil || doc.Payload == nil {
 			return nil, errors.New("signing: revocation list is not a JWS")
 		}
-		payload = *doc.Payload
+		payloadB64 = *doc.Payload
 		switch {
 		case doc.Signatures != nil && doc.Protected == nil && doc.Signature == nil:
 			if len(doc.Signatures) != 1 || doc.Signatures[0].Protected == nil || doc.Signatures[0].Signature == nil {
 				return nil, errors.New("signing: revocation list JWS must carry exactly one signature")
 			}
-			protected, signature = *doc.Signatures[0].Protected, *doc.Signatures[0].Signature
+			protectedB64, signatureB64 = *doc.Signatures[0].Protected, *doc.Signatures[0].Signature
 		case doc.Signatures == nil && doc.Protected != nil && doc.Signature != nil:
-			protected, signature = *doc.Protected, *doc.Signature
+			protectedB64, signatureB64 = *doc.Protected, *doc.Signature
 		default:
 			return nil, errors.New("signing: revocation list JWS serialization is ambiguous")
 		}
@@ -266,44 +311,54 @@ func verifyRevocationJWS(body []byte, resolve func(kid string) (*JWK, error)) ([
 		if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
 			return nil, errors.New("signing: revocation list compact JWS is malformed")
 		}
-		protected, payload, signature = parts[0], parts[1], parts[2]
+		protectedB64, payloadB64, signatureB64 = parts[0], parts[1], parts[2]
 	}
-	headerBytes, err := base64.RawURLEncoding.DecodeString(protected)
+	if len(protectedB64) > revocationMaxProtectedHeader {
+		return nil, errors.New("signing: JWS protected header is too large")
+	}
+	for _, segment := range []string{protectedB64, payloadB64, signatureB64} {
+		if !canonicalB64URL(segment) {
+			return nil, errors.New("signing: revocation list JWS segment is not canonical base64url")
+		}
+	}
+	headerJSON, err := base64.RawURLEncoding.DecodeString(protectedB64)
+	if err != nil || strictjson.Validate(headerJSON, 0) != nil {
+		return nil, errors.New("signing: JWS protected header is not strict JSON")
+	}
+	jws, err := jose.ParseSignedCompact(protectedB64+"."+payloadB64+"."+signatureB64, revocationJWSAlgorithms)
 	if err != nil {
-		return nil, errors.New("signing: JWS protected header is not base64url")
+		return nil, errors.New("signing: revocation list is not a JWS")
 	}
-	var header map[string]json.RawMessage
-	if err := strictjson.Unmarshal(headerBytes, 0, &header); err != nil {
-		return nil, errors.New("signing: JWS protected header is not a JSON object")
+	if len(jws.Signatures) != 1 {
+		return nil, errors.New("signing: revocation list JWS must carry exactly one signature")
 	}
-	var alg, typ, kid string
-	_ = json.Unmarshal(header["alg"], &alg)
-	_ = json.Unmarshal(header["typ"], &typ)
-	_ = json.Unmarshal(header["kid"], &kid)
+	protected := jws.Signatures[0].Protected
 	var want Algorithm
-	switch alg {
-	case string(jwkAlgEdDSA):
+	switch jose.SignatureAlgorithm(protected.Algorithm) {
+	case jose.EdDSA:
 		want = AlgEd25519
-	case string(jwkAlgES256):
+	case jose.ES256:
 		want = AlgES256
-	case jwkAlgPS512:
+	case jose.PS512:
 		want = AlgRSAPSSSHA512
 	default:
 		return nil, errors.New("signing: JWS alg not allowed")
 	}
-	if typ != RevocationListTyp {
+	if typ, _ := protected.ExtraHeaders[jose.HeaderType].(string); typ != RevocationListTyp {
 		return nil, errors.New("signing: JWS typ is not " + RevocationListTyp)
 	}
-	if crit, ok := header["crit"]; ok {
-		var list []string
-		if json.Unmarshal(crit, &list) != nil || len(list) > 0 {
+	if crit, ok := protected.ExtraHeaders["crit"]; ok {
+		if list, isList := crit.([]any); !isList || len(list) > 0 {
 			return nil, errors.New("signing: JWS crit is not supported")
 		}
 	}
-	if kid == "" {
+	if b64, ok := protected.ExtraHeaders["b64"]; ok && b64 == false {
+		return nil, errors.New("signing: JWS b64 is not supported")
+	}
+	if protected.KeyID == "" {
 		return nil, errors.New("signing: JWS protected header must carry a kid")
 	}
-	jwk, err := resolve(kid)
+	jwk, err := resolve(protected.KeyID)
 	if err != nil {
 		return nil, err
 	}
@@ -314,18 +369,25 @@ func verifyRevocationJWS(body []byte, resolve func(kid string) (*JWK, error)) ([
 	if err != nil || keyAlg != want {
 		return nil, errors.New("signing: JWS key does not match alg")
 	}
-	sig, err := base64.RawURLEncoding.DecodeString(signature)
+	payload, err := jws.Verify(directoryKeyVerifier{alg: want, jwk: *jwk})
 	if err != nil {
-		return nil, errors.New("signing: JWS signature is not base64url")
-	}
-	if !verifyWithJWK(want, *jwk, []byte(protected+"."+payload), sig) {
 		return nil, errors.New("signing: revocation list signature did not verify")
 	}
-	out, err := base64.RawURLEncoding.DecodeString(payload)
-	if err != nil {
-		return nil, errors.New("signing: JWS payload is not base64url")
+	return payload, nil
+}
+
+// directoryKeyVerifier is a jose.OpaqueVerifier that checks a JWS signature
+// with verifyWithJWK.
+type directoryKeyVerifier struct {
+	alg Algorithm
+	jwk JWK
+}
+
+func (v directoryKeyVerifier) VerifyPayload(signingInput, signature []byte, _ jose.SignatureAlgorithm) error {
+	if !verifyWithJWK(v.alg, v.jwk, signingInput, signature) {
+		return errors.New("signing: signature did not verify")
 	}
-	return out, nil
+	return nil
 }
 
 // RevocationFetchResult is one revocation list fetch.
