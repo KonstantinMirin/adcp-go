@@ -1,65 +1,69 @@
 package signing
 
 import (
-	"bytes"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rsa"
-	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
+
+	jose "github.com/go-jose/go-jose/v4"
 )
 
 // JWKThumbprint returns the RFC 7638 SHA-256 thumbprint of jwk's public key,
 // base64url-encoded without padding (RFC 8037 Appendix A.3 for Ed25519).
 // Only the required members take part: crv, kty, x for OKP; crv, kty, x, y
 // for EC; e, kty, n for RSA. Under the Web Bot Auth profile a key's kid is its thumbprint.
+//
+// go-jose computes the thumbprint from the decoded key, so jwk must be a key
+// go-jose can represent: Ed25519, an EC key on P-256, P-384 or P-521, or RSA.
+// The members enter the hash in their RFC 7518 form (unpadded base64url,
+// full-length EC coordinates, minimal RSA integers), so a JWK spelled
+// non-canonically (padded, or an RSA integer with leading zero bytes) has
+// the thumbprint of its canonical spelling. Web Bot Auth refuses such
+// spellings before thumbprinting (wbaKeyAlgorithm), so one key has one kid.
 func JWKThumbprint(jwk JWK) (string, error) {
-	// The required members, in lexicographic order, with no whitespace
-	// (RFC 7638 §3.3). Struct fields marshal in declaration order.
-	var members any
+	var pub any
 	switch jwk.Kty {
-	case "OKP":
-		if jwk.Crv == "" || jwk.X == "" {
-			return "", errors.New("signing: incomplete OKP JWK")
+	case "OKP", "EC":
+		if jwk.Crv == "" || jwk.X == "" || (jwk.Kty == "EC" && jwk.Y == "") {
+			return "", fmt.Errorf("signing: incomplete %s JWK", jwk.Kty)
 		}
-		members = struct {
-			Crv string `json:"crv"`
-			Kty string `json:"kty"`
-			X   string `json:"x"`
-		}{jwk.Crv, jwk.Kty, jwk.X}
-	case "EC":
-		if jwk.Crv == "" || jwk.X == "" || jwk.Y == "" {
-			return "", errors.New("signing: incomplete EC JWK")
+		key, err := jwk.joseKey("")
+		if err != nil {
+			return "", fmt.Errorf("signing: unsupported %s JWK", jwk.Kty)
 		}
-		members = struct {
-			Crv string `json:"crv"`
-			Kty string `json:"kty"`
-			X   string `json:"x"`
-			Y   string `json:"y"`
-		}{jwk.Crv, jwk.Kty, jwk.X, jwk.Y}
+		pub = key.Key
 	case "RSA":
+		// go-jose's JWK decoder refuses moduli over jose.MaxRSAModulusBits
+		// (4096, a process-wide setting), and Web Bot Auth admits RSA keys
+		// up to 8192 bits, so n and e are decoded here. The thumbprint
+		// itself is still go-jose's.
 		if jwk.N == "" || jwk.E == "" {
 			return "", errors.New("signing: incomplete RSA JWK")
 		}
-		members = struct {
-			E   string `json:"e"`
-			Kty string `json:"kty"`
-			N   string `json:"n"`
-		}{jwk.E, jwk.Kty, jwk.N}
+		n, err := b64UrlDecode(jwk.N)
+		mod := new(big.Int).SetBytes(n)
+		if err != nil || mod.Sign() <= 0 {
+			return "", errors.New("signing: invalid RSA modulus")
+		}
+		e, err := b64UrlDecode(jwk.E)
+		exp := new(big.Int).SetBytes(e)
+		if err != nil || exp.Sign() <= 0 || !exp.IsInt64() || exp.Int64() > math.MaxInt {
+			return "", errors.New("signing: invalid RSA exponent")
+		}
+		pub = &rsa.PublicKey{N: mod, E: int(exp.Int64())}
 	default:
 		return "", fmt.Errorf("signing: unsupported JWK kty %q", jwk.Kty)
 	}
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(members); err != nil {
-		return "", err
+	sum, err := (&jose.JSONWebKey{Key: pub}).Thumbprint(crypto.SHA256)
+	if err != nil {
+		return "", fmt.Errorf("signing: unsupported %s JWK", jwk.Kty)
 	}
-	sum := sha256.Sum256(bytes.TrimSuffix(buf.Bytes(), []byte("\n")))
-	return b64UrlEncodeRaw(sum[:]), nil
+	return b64UrlEncodeRaw(sum), nil
 }
 
 // PublicDirectoryKey returns the public JWK a Web Bot Auth key directory
@@ -68,27 +72,30 @@ func JWKThumbprint(jwk JWK) (string, error) {
 // kid set to the RFC 7638 thumbprint, use "sig", and no AdCP purpose member,
 // since purpose belongs to the origin under the profile.
 func PublicDirectoryKey(privateKey any) (JWK, error) {
-	var jwk JWK
+	var pub any
 	switch k := privateKey.(type) {
 	case ed25519.PrivateKey:
-		pub, ok := k.Public().(ed25519.PublicKey)
-		if !ok || len(pub) != ed25519.PublicKeySize {
+		p, ok := k.Public().(ed25519.PublicKey)
+		if !ok || len(p) != ed25519.PublicKeySize {
 			return JWK{}, errors.New("signing: invalid Ed25519 key")
 		}
-		jwk = JWK{Kty: "OKP", Crv: "Ed25519", X: b64UrlEncodeRaw(pub)}
+		pub = p
 	case *ecdsa.PrivateKey:
 		if k == nil || k.Curve == nil || k.Curve.Params().Name != "P-256" {
 			return JWK{}, errors.New("signing: Web Bot Auth supports Ed25519 and P-256 keys")
 		}
-		x, y := pad32(k.X), pad32(k.Y)
-		jwk = JWK{Kty: "EC", Crv: "P-256", X: b64UrlEncodeRaw(x), Y: b64UrlEncodeRaw(y)}
+		pub = &k.PublicKey
 	case *rsa.PrivateKey:
 		if k == nil || k.N.BitLen() < rsaMinModulus || k.N.BitLen() > rsaMaxModulus {
 			return JWK{}, errors.New("signing: Web Bot Auth RSA keys are 2048 to 8192 bits")
 		}
-		jwk = JWK{Kty: "RSA", N: b64UrlEncodeRaw(k.N.Bytes()), E: b64UrlEncodeRaw(big.NewInt(int64(k.E)).Bytes())}
+		pub = &k.PublicKey
 	default:
 		return JWK{}, fmt.Errorf("signing: unsupported private key type %T", privateKey)
+	}
+	jwk, err := jwkFromPublicKey(pub)
+	if err != nil {
+		return JWK{}, errors.New("signing: cannot encode the public key")
 	}
 	kid, err := JWKThumbprint(jwk)
 	if err != nil {
@@ -97,11 +104,4 @@ func PublicDirectoryKey(privateKey any) (JWK, error) {
 	jwk.Kid = kid
 	jwk.Use = "sig"
 	return jwk, nil
-}
-
-func pad32(n *big.Int) []byte {
-	out := make([]byte, 32)
-	b := n.Bytes()
-	copy(out[32-len(b):], b)
-	return out
 }

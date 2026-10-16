@@ -5,6 +5,7 @@ go 1.26.2
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/adcontextprotocol/adcp-go/urlcanon v0.1.0
+	github.com/go-jose/go-jose/v4 v4.1.6
 	github.com/google/jsonschema-go v0.4.2
 	github.com/gowebpki/jcs v1.0.1
 	github.com/modelcontextprotocol/go-sdk v1.5.0
