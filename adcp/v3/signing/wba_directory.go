@@ -36,75 +36,86 @@ type DirectoryResponse struct {
 	Body   []byte
 }
 
-// VerifyDirectoryResponse validates a key directory served at origin and
-// returns its usable keys indexed by RFC 7638 thumbprint. It checks:
+// VerifyDirectoryResponse validates a signed key directory served at
+// origin and returns its usable keys indexed by RFC 7638 thumbprint. It
+// checks:
 //   - status 200, a body of at most 256 KiB, and a JWK Set media type
 //     (application/http-message-signatures-directory+json,
 //     application/jwk-set+json, or application/json);
 //   - strict JSON with 1 to 100 keys and no private key material. Keys the
-//     profile cannot use (other key types, use other than sig, key_ops
-//     without verify) are skipped, at least one must remain, and a kid,
-//     when present, does not affect lookup: a key is found by its
-//     thumbprint, which the request's keyid must equal;
-//   - when the response carries signatures (WBA Appendix B.1, RECOMMENDED):
-//     Content-Digest against the body, and every signature tagged
-//     http-message-signatures-directory, covering "@authority";req and
-//     content-digest, inside its validity window with no clock skew, and
-//     verifying under the key it names, each key at most once.
+//     profile cannot use (key types other than Ed25519 and RSA, use other
+//     than sig, key_ops without verify) are skipped, at least one must
+//     remain, and a kid, when present, does not affect lookup: a key is
+//     found by its thumbprint, which the request's keyid must equal;
+//   - the response signatures (WBA Appendix B.1), which the profile
+//     requires: Content-Digest against the body, and one signature per
+//     usable key, each tagged http-message-signatures-directory, covering
+//     "@authority";req and content-digest, naming the key's thumbprint as
+//     keyid, inside its validity window with no clock skew (so a created in
+//     the future is refused), and verifying under that key. A signature
+//     naming any other key (one the profile skipped, say) is not read.
 //
-// An unsigned directory (a plain JWK Set) is accepted; DirectoryResolver
-// can be configured to require signatures.
+// An unsigned directory, or one with a usable key that did not sign it, is
+// refused.
 func VerifyDirectoryResponse(origin string, resp *DirectoryResponse, now time.Time) (map[string]JWK, error) {
-	return verifyDirectoryResponse(origin, resp, now, false)
+	keys, _, err := verifyDirectoryResponse(origin, resp, now)
+	return keys, err
 }
 
-func verifyDirectoryResponse(origin string, resp *DirectoryResponse, now time.Time, requireSigned bool) (map[string]JWK, error) {
+// verifyDirectoryResponse is VerifyDirectoryResponse, also returning the
+// earliest expires among the signatures it verified (signatures it did not
+// read do not shorten the cache).
+func verifyDirectoryResponse(origin string, resp *DirectoryResponse, now time.Time) (map[string]JWK, time.Time, error) {
 	origin, err := webBotAuthOrigin(origin)
 	if err != nil {
-		return nil, fmt.Errorf("signing: directory origin: %w", err)
+		return nil, time.Time{}, fmt.Errorf("signing: directory origin: %w", err)
 	}
 	if resp == nil || resp.Status != http.StatusOK || len(resp.Body) > directoryMaxBytes {
-		return nil, errors.New("signing: invalid key directory response")
+		return nil, time.Time{}, errors.New("signing: invalid key directory response")
 	}
 	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get(contentTypeHeader))
 	switch mediaType {
 	case DirectoryMediaType, "application/jwk-set+json", "application/json":
 	default:
-		return nil, errors.New("signing: key directory has the wrong media type")
+		return nil, time.Time{}, errors.New("signing: key directory has the wrong media type")
 	}
 	keys, err := parseDirectoryKeys(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	rawInput, rawSig := resp.Header.Get(signatureInputHeader), resp.Header.Get(signatureHeader)
 	if rawInput == "" && rawSig == "" {
-		if requireSigned {
-			return nil, errors.New("signing: key directory is not signed")
-		}
-		return keys, nil
+		return nil, time.Time{}, errors.New("signing: key directory is not signed")
 	}
 	if !wbaDigestMatches(resp.Header.Get(contentDigestHeader), resp.Body) {
-		return nil, errors.New("signing: key directory digest mismatch")
+		return nil, time.Time{}, errors.New("signing: key directory digest mismatch")
 	}
 	inputs, err := parseSFDictionary(rawInput)
 	if err != nil || len(inputs) == 0 {
-		return nil, errors.New("signing: key directory Signature-Input does not parse")
+		return nil, time.Time{}, errors.New("signing: key directory Signature-Input does not parse")
 	}
 	signatures, err := parseSFDictionary(rawSig)
 	if err != nil {
-		return nil, errors.New("signing: key directory Signature does not parse")
+		return nil, time.Time{}, errors.New("signing: key directory Signature does not parse")
 	}
 	if !sameKeys(inputs.keys(), signatures.keys()) {
-		return nil, errors.New("signing: key directory Signature and Signature-Input labels differ")
+		return nil, time.Time{}, errors.New("signing: key directory Signature and Signature-Input labels differ")
 	}
 	verified := map[string]struct{}{}
+	var earliest int64
 	for _, e := range inputs {
 		m := e.member
+		if keyID, _ := stringParam(m.params, "keyid"); keys[keyID].Kty == "" {
+			// Not signed by a key the profile uses (for example a key it
+			// skipped): nothing to verify. Every usable key must still have
+			// verified its own signature below.
+			continue
+		}
 		if tag, ok := stringParam(m.params, "tag"); !m.inner || !ok || tag != DirectoryTag {
-			return nil, errors.New("signing: key directory signature has the wrong profile")
+			return nil, time.Time{}, errors.New("signing: key directory signature has the wrong profile")
 		}
 		if err := wbaWindow(m, now.Unix(), true, e.key); err != nil {
-			return nil, fmt.Errorf("signing: key directory signature: %w", err)
+			return nil, time.Time{}, fmt.Errorf("signing: key directory signature: %w", err)
 		}
 		covered := map[string]struct{}{}
 		for _, c := range m.list {
@@ -113,46 +124,33 @@ func verifyDirectoryResponse(origin string, resp *DirectoryResponse, now time.Ti
 		_, a := covered[`"@authority";req`]
 		_, d := covered[`"content-digest"`]
 		if !a || !d {
-			return nil, errors.New("signing: key directory signature does not bind authority and digest")
+			return nil, time.Time{}, errors.New("signing: key directory signature does not bind authority and digest")
 		}
 		keyID, _ := stringParam(m.params, "keyid")
 		jwk, ok := keys[keyID]
 		if _, dup := verified[keyID]; !ok || dup {
-			return nil, errors.New("signing: key directory signature key is absent or repeated")
+			return nil, time.Time{}, errors.New("signing: key directory signature key is absent or repeated")
 		}
 		base, err := wbaSignatureBase(http.MethodGet, origin+DirectoryPath, resp.Header, m, true)
 		if err != nil {
-			return nil, fmt.Errorf("signing: key directory signature base: %w", err)
+			return nil, time.Time{}, fmt.Errorf("signing: key directory signature base: %w", err)
 		}
 		sig, _ := signatures.get(e.key)
 		if _, err := wbaVerifyCrypto(m, sig, jwk, base); err != nil {
-			return nil, fmt.Errorf("signing: key directory signature: %w", err)
+			return nil, time.Time{}, fmt.Errorf("signing: key directory signature: %w", err)
 		}
 		verified[keyID] = struct{}{}
-	}
-	return keys, nil
-}
-
-// directoryExpiry returns the earliest expires of a verified directory's
-// signatures.
-func directoryExpiry(resp *DirectoryResponse) (time.Time, bool) {
-	inputs, err := parseSFDictionary(resp.Header.Get(signatureInputHeader))
-	if err != nil || len(inputs) == 0 {
-		return time.Time{}, false
-	}
-	var earliest int64
-	for i, e := range inputs {
-		exp, ok := intParam(e.member.params, "expires")
-		if !ok {
-			return time.Time{}, false
-		}
-		if i == 0 || exp < earliest {
+		if exp, _ := intParam(m.params, "expires"); earliest == 0 || exp < earliest {
 			earliest = exp
 		}
 	}
-	return time.Unix(earliest, 0), true
+	if len(verified) != len(keys) {
+		return nil, time.Time{}, errors.New("signing: key directory has a key that did not sign it")
+	}
+	return keys, time.Unix(earliest, 0), nil
 }
 
+// parseDirectoryKeys returns the directory's usable keys by thumbprint.
 func parseDirectoryKeys(body []byte) (map[string]JWK, error) {
 	var doc struct {
 		Keys []json.RawMessage `json:"keys"`
@@ -188,8 +186,8 @@ func parseDirectoryKeys(body []byte) (map[string]JWK, error) {
 			return nil, errors.New("signing: key directory entry does not parse")
 		}
 		if _, err := wbaKeyAlgorithm(jwk); err != nil {
-			// A key the profile cannot verify with: skip it, as a plain JWK
-			// Set may hold keys for other uses.
+			// A key the profile cannot verify with: skip it, as a JWK Set
+			// may hold keys for other uses.
 			continue
 		}
 		tp, err := JWKThumbprint(jwk)
@@ -210,7 +208,7 @@ func parseDirectoryKeys(body []byte) (map[string]JWK, error) {
 
 // SignKeyDirectory builds the signed key directory response an origin
 // serves at DirectoryPath (WBA §5.5 and Appendix B.1). Each private key
-// (ed25519.PrivateKey or P-256 *ecdsa.PrivateKey) is published as its
+// (ed25519.PrivateKey, or *rsa.PrivateKey of 2048 to 8192 bits) is published as its
 // PublicDirectoryKey and signs the response once, covering "@authority";req
 // and content-digest. created is the signatures' created time (time.Now
 // minus DirectorySkewAllowance when zero) and lifetime their validity from

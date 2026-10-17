@@ -64,16 +64,18 @@ func TestJWKThumbprintRFC7638Example(t *testing.T) {
 }
 
 // TestJWKThumbprintMatchesMemberStrings pins the go-jose thumbprint to the
-// member-string computation for every key type a Web Bot Auth directory
-// holds, including an RSA modulus beyond go-jose's 4096-bit decoder cap.
+// member-string computation for Ed25519, P-256 and RSA keys, including an RSA modulus beyond go-jose's 4096-bit decoder cap.
 func TestJWKThumbprintMatchesMemberStrings(t *testing.T) {
 	var jwks []JWK
-	for _, key := range []any{newEd25519(t), newP256(t)} {
-		for range 8 {
-			jwk, err := PublicDirectoryKey(key)
-			require.NoError(t, err)
-			jwks = append(jwks, jwk)
-		}
+	for range 8 {
+		jwk, err := PublicDirectoryKey(newEd25519(t))
+		require.NoError(t, err)
+		jwks = append(jwks, jwk)
+		// P-256 is no Web Bot Auth key type, but JWKThumbprint still
+		// computes its thumbprint.
+		ec, err := jwkFromPublicKey(&newP256(t).PublicKey)
+		require.NoError(t, err)
+		jwks = append(jwks, ec)
 	}
 	for _, bits := range []int{2048, 4096, 8192} {
 		// An odd modulus of exactly bits bits: the thumbprint needs no
@@ -114,7 +116,7 @@ func TestJWKPublicKeyAcceptsPaddedMembers(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, want, got)
 
-	ec, err := PublicDirectoryKey(newP256(t))
+	ec, err := jwkFromPublicKey(&newP256(t).PublicKey)
 	require.NoError(t, err)
 	ec.X, ec.Y = ec.X+"=", ec.Y+"="
 	_, err = ec.PublicKey()

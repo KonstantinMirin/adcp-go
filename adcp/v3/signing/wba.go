@@ -60,11 +60,14 @@ const (
 )
 
 // validWBANonce reports whether nonce encodes exactly 64 bytes, canonically,
-// as unpadded base64url or padded standard base64: the nonces the Web Bot
-// Auth architecture draft (§4.2.2) describes and Cloudflare's web-bot-auth
-// library accepts.
+// in base64url (RFC 4648 §5, unpadded or padded) or padded standard base64.
+// The profile's nonce is 64 random bytes, base64url-encoded, and this
+// package's signer emits unpadded base64url. Padded standard base64 is
+// accepted too: the Web Bot Auth architecture draft's own Appendix A nonces
+// and Cloudflare's web-bot-auth library use it. A nonce of any other length
+// is refused.
 func validWBANonce(nonce string) bool {
-	for _, enc := range []*base64.Encoding{base64.RawURLEncoding, base64.StdEncoding} {
+	for _, enc := range []*base64.Encoding{base64.RawURLEncoding, base64.URLEncoding, base64.StdEncoding} {
 		b, err := enc.DecodeString(nonce)
 		if err == nil && len(b) == wbaNonceBytes && enc.EncodeToString(b) == nonce {
 			return true
@@ -74,10 +77,13 @@ func validWBANonce(nonce string) bool {
 }
 
 // WBAError is a Web Bot Auth failure. On the signature path it is the HTTP
-// status the profile defines (DR-0023, WBA §5.3 and §5.4): 400 when the
-// signature fields do not parse, 403 when a signature, a profile check, or
-// key discovery fails (with Accept-Signature, except for a revoked key), and
-// 429 for capacity. Any body is the generic authentication error.
+// status the profile defines (WBA §5.3 and §5.4): 400 when the signature
+// fields do not parse; 429 with Accept-Signature, carrying a fresh nonce,
+// when the signature or its nonce was used before (Replayed); and 403 with
+// Accept-Signature when a signature, a profile check, or key discovery
+// fails, or without it for a revoked key. A replay store at its per-identity
+// capacity is 429 with Retry-After and no Accept-Signature. Any body is the
+// generic authentication error.
 //
 // DiscoveryFailure marks a signature that could not be verified because the
 // signer's key directory could not be resolved (WBA §6.10: a network or TLS
@@ -103,11 +109,14 @@ type WBAError struct {
 	Code             string
 	DiscoveryFailure bool
 	Revoked          bool
-	Wrapped          error
+	// Replayed marks a reused signature or nonce: 429 with Accept-Signature
+	// carrying a fresh nonce.
+	Replayed bool
+	Wrapped  error
 
-	// labels are the request's web-bot-auth labels in order, used to build
-	// Accept-Signature.
-	labels []string
+	// noBody drops content-type and content-digest from Accept-Signature
+	// for a request without a body.
+	noBody bool
 }
 
 func (e *WBAError) Error() string {
@@ -127,6 +136,10 @@ func AsWBAError(err error) *WBAError {
 
 func wbaFail(status int, label, reason string) *WBAError {
 	return &WBAError{Status: status, Label: label, Reason: reason}
+}
+
+func wbaReplayed(label string) *WBAError {
+	return &WBAError{Status: http.StatusTooManyRequests, Label: label, Reason: "replayed nonce", Replayed: true}
 }
 
 func wbaDeny(reason string) *WBAError {
@@ -186,57 +199,71 @@ func IsSpendCommittingOperation(op string) bool {
 	return strings.HasPrefix(op, "acquire_")
 }
 
-// ResponseHeader returns the headers to send with the failure: for a 403
-// signature failure other than a revoked key, Accept-Signature (RFC 9421
-// §5.1) naming the components and parameters the profile requires, with a
-// fresh nonce the signer may use on its next attempt.
+// ResponseHeader returns the headers to send with the failure. A 403
+// signature failure other than a revoked key carries Accept-Signature (RFC
+// 9421 §5.1) naming the label, components, and parameters the profile
+// requires. A replay (429) carries it too, with a fresh nonce the signer
+// uses on its next attempt (WBA §5.3). A 429 for replay-store capacity
+// carries Retry-After instead.
 func (e *WBAError) ResponseHeader() http.Header {
 	h := http.Header{}
-	if e.Status != http.StatusForbidden || e.Authorization || e.Revoked {
+	if e.Authorization || e.Revoked {
 		return h
 	}
-	labels := e.labels
-	if len(labels) == 0 {
-		label := e.Label
-		if label == "" || !isValidLabel(label) {
-			label = "sig1"
-		}
-		labels = []string{label}
+	switch {
+	case e.Status == http.StatusForbidden:
+		h.Set(acceptSignatureHeader, acceptSignatureValue(e.acceptLabel(), !e.noBody, ""))
+	case e.Status == http.StatusTooManyRequests && e.Replayed:
+		h.Set(acceptSignatureHeader, acceptSignatureValue(e.acceptLabel(), !e.noBody, newWBANonce()))
+	case e.Status == http.StatusTooManyRequests:
+		h.Set("Retry-After", "60")
 	}
-	h.Set(acceptSignatureHeader, acceptSignatureValue(labels, newWBANonce))
 	return h
 }
 
-// acceptSignatureValue lists, per label, the components and parameters the
-// profile requires (RFC 9421 §5.1). A later label must also cover each
-// earlier label's signature-agent, signature-input, and signature members.
-func acceptSignatureValue(labels []string, nonce func() string) string {
-	keyed := func(field, label string) sfItem {
-		return sfItem{value: sfStringItem(field), params: []sfParam{{key: "key", value: sfStringItem(label)}}}
+func (e *WBAError) acceptLabel() string {
+	if e.Label == "" || !isValidLabel(e.Label) {
+		return "sig1"
 	}
-	var out sfDict
-	for i, label := range labels {
-		components := []sfItem{
-			{value: sfStringItem(componentMethod)},
-			{value: sfStringItem(componentTargetURI)},
-			{value: sfStringItem(componentAuthority)},
-			{value: sfStringItem(componentContentType)},
-			{value: sfStringItem(componentContentDigst)},
-			keyed("signature-agent", label),
-		}
-		for _, prev := range labels[:i] {
-			components = append(components, keyed("signature-agent", prev), keyed("signature-input", prev), keyed("signature", prev))
-		}
-		out = append(out, sfDictEntry{key: label, member: sfMember{inner: true, list: components, params: []sfParam{
-			{key: "created", value: sfTrue()},
-			{key: "expires", value: sfTrue()},
-			{key: "keyid", value: sfTrue()},
-			{key: "nonce", value: sfStringItem(nonce())},
-			{key: "tag", value: sfStringItem(ProfileTagWebBotAuth)},
-		}}})
-	}
-	return out.serialize()
+	return e.Label
 }
+
+// acceptSignatureValue is the Accept-Signature member the profile requires
+// (RFC 9421 §5.1): the components every request covers, plus content-type
+// and content-digest for a request with a body, and the parameters
+// created, expires, nonce, keyid, alg, and tag="web-bot-auth". A non-empty
+// nonce is offered as the value to sign with next; otherwise nonce is only
+// listed.
+func acceptSignatureValue(label string, body bool, nonce string) string {
+	components := []sfItem{
+		{value: sfStringItem(componentMethod)},
+		{value: sfStringItem(componentTargetURI)},
+		{value: sfStringItem(componentAuthority)},
+	}
+	if body {
+		components = append(components, sfItem{value: sfStringItem(componentContentType)}, sfItem{value: sfStringItem(componentContentDigst)})
+	}
+	components = append(components, sfItem{value: sfStringItem("signature-agent"), params: []sfParam{{key: "key", value: sfStringItem(label)}}})
+	nonceParam := sfTrue()
+	if nonce != "" {
+		nonceParam = sfStringItem(nonce)
+	}
+	return sfDict{{key: label, member: sfMember{inner: true, list: components, params: []sfParam{
+		{key: "created", value: sfTrue()},
+		{key: "expires", value: sfTrue()},
+		{key: "nonce", value: nonceParam},
+		{key: "keyid", value: sfTrue()},
+		{key: "alg", value: sfTrue()},
+		{key: "tag", value: sfStringItem(ProfileTagWebBotAuth)},
+	}}}}.serialize()
+}
+
+// AcceptSignature returns the Accept-Signature value (RFC 9421 §5.1) the
+// Web Bot Auth profile asks a signer for, under label "sig1": the
+// components and parameters it requires, with content-type and
+// content-digest when the request has a body. A verifier sends it with an
+// unsigned request it refuses (Middleware does).
+func AcceptSignature(body bool) string { return acceptSignatureValue("sig1", body, "") }
 
 func newWBANonce() string {
 	var b [wbaNonceBytes]byte
@@ -341,16 +368,15 @@ type WBARevocationChecker interface {
 	CheckWBAKey(ctx context.Context, origin, keyID string) (RevocationState, error)
 }
 
-// CheckWBARevocation runs checker for every verified signer and records each
-// result in VerifiedSigner.Revocation. A revoked key, the originator's or a
-// relay's, returns a *WBAError with Revoked set (403, no Accept-Signature).
-func CheckWBARevocation(ctx context.Context, checker WBARevocationChecker, signers []*VerifiedSigner) error {
-	for _, s := range signers {
-		state, err := checker.CheckWBAKey(ctx, s.AgentURL, s.KeyID)
-		s.Revocation = state
-		if state == RevocationRevoked {
-			return &WBAError{Status: http.StatusForbidden, Label: s.Label, Reason: "signing key revoked", Revoked: true, Wrapped: err}
-		}
+// CheckWBARevocation runs checker for the verified signer and records the
+// result in VerifiedSigner.Revocation. A revoked key returns a *WBAError
+// with Revoked set: 403 with the generic authentication error and no
+// Accept-Signature, because the signer must stop using that key.
+func CheckWBARevocation(ctx context.Context, checker WBARevocationChecker, signer *VerifiedSigner) error {
+	state, err := checker.CheckWBAKey(ctx, signer.AgentURL, signer.KeyID)
+	signer.Revocation = state
+	if state == RevocationRevoked {
+		return &WBAError{Status: http.StatusForbidden, Label: signer.Label, Reason: "signing key revoked", Revoked: true, Wrapped: err}
 	}
 	return nil
 }
@@ -389,34 +415,57 @@ type WBAVerifyOptions struct {
 // errWBANotConfigured reports a verifier missing a required dependency.
 var errWBANotConfigured = errors.New("signing: Web Bot Auth verification requires Keys and Replay")
 
-// VerifyWebBotAuthRequest verifies every web-bot-auth signature on r and
-// returns the verified signers in Signature-Input order. The first is the
-// originating signer, the AdCP caller; any later one is a relay that covers
-// the signatures before it. Each VerifiedSigner's AgentURL is the signer's
-// canonical origin and its KeyID is the key's thumbprint.
+// VerifyWebBotAuthRequest verifies the request's one web-bot-auth signature
+// and returns the verified signer. Its AgentURL is the signer's canonical
+// origin and its KeyID is the key's thumbprint.
 //
-// A failure is a *WBAError carrying the status to answer. A signature whose
-// key directory cannot be resolved matches ErrDiscoveryFailure: the request
-// is unverified, and what to do with it is local policy (WBA §6.10). The
-// function verifies identity only, from the key directory and replay state:
-// it reads no revocation list and no trust record, and grants no authority.
-// Run CheckWBARevocation, then bindings and grants, after it.
+// The profile takes exactly one web-bot-auth signature and exactly one
+// Signature-Agent member per request. A request that carries more of
+// either is refused with 403 and Accept-Signature, even when each signature
+// verifies on its own: an intermediary that signs a request is its signer,
+// and whether it may act for another party is an authorization question,
+// not a second signature. Signature-Input members with another tag are
+// not read.
+//
+// A failure is a *WBAError carrying the status to answer: 400 when the
+// signature fields do not parse, 429 with Accept-Signature and a fresh nonce
+// for a reused signature or nonce, and 403 with Accept-Signature for every
+// other signature failure. A signature whose key directory cannot be
+// resolved matches ErrDiscoveryFailure: the request is unverified, and what
+// to do with it is local policy (WBA §6.10). The function verifies identity
+// only, from the key directory and replay state: it reads no revocation
+// list and no trust record, and grants no authority. Run CheckWBARevocation,
+// then bindings and grants, after it.
 //
 // A non-empty signed body must be strict JSON (AdCP bodies are JSON-RPC
 // or JSON): one value, no duplicate keys, including keys that differ only
 // in case, so every reader sees the same members. Anything else is 400.
-func VerifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*VerifiedSigner, error) {
-	signers, labels, err := verifyWebBotAuthRequest(r, opts)
-	if we := AsWBAError(err); we != nil && we.labels == nil {
-		we.labels = labels
+func VerifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) (*VerifiedSigner, error) {
+	signer, err := verifyWebBotAuthRequest(r, opts)
+	if we := AsWBAError(err); we != nil && !we.Authorization {
+		// Accept-Signature lists content-type and content-digest only for a
+		// request with a body, as the profile requires them only there.
+		we.noBody = !requestHasBody(r, opts.MaxBodyBytes)
 	}
-	return signers, err
+	return signer, err
 }
 
-func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*VerifiedSigner, []string, error) {
-	var labels []string
+// requestHasBody reports whether r carries a non-empty body, buffering it
+// for later readers. A body that cannot be read counts as present.
+func requestHasBody(r *http.Request, limit int64) bool {
+	if r.Body == nil || r.Body == http.NoBody {
+		return false
+	}
+	if limit <= 0 {
+		limit = defaultMaxBodyBytes
+	}
+	b, err := readAndReplaceBody(r, limit)
+	return err != nil || len(b) > 0
+}
+
+func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) (*VerifiedSigner, error) {
 	if opts.Keys == nil || opts.Replay == nil {
-		return nil, nil, errWBANotConfigured
+		return nil, errWBANotConfigured
 	}
 	clock := opts.Clock
 	if clock == nil {
@@ -428,46 +477,56 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*Verifie
 		scheme = "https"
 	}
 	if err := wbaHeaderPrecheck(r.Header); err != nil {
-		return nil, labels, err
+		return nil, err
 	}
 	inputs, err := parseSFDictionary(r.Header.Get(signatureInputHeader))
 	if err != nil {
-		return nil, labels, wbaFail(http.StatusBadRequest, "", "Signature-Input does not parse")
+		return nil, wbaFail(http.StatusBadRequest, "", "Signature-Input does not parse")
 	}
-	signatures, err := parseSFDictionary(r.Header.Get(signatureHeader))
-	if err != nil {
-		return nil, labels, wbaFail(http.StatusBadRequest, "", "Signature does not parse")
-	}
-	// A missing Signature-Agent (selection by tag alone) leaves every
-	// member absent, which fails each signature with 403 below; a present
-	// field that does not parse is 400.
-	var agents sfDict
-	if raw := r.Header.Get(signatureAgentHeader); raw != "" {
-		if agents, err = parseSFDictionary(raw); err != nil {
-			return nil, labels, wbaFail(http.StatusBadRequest, "", "Signature-Agent does not parse")
-		}
-	}
-	type wbaInput struct {
+	var (
 		label  string
 		member sfMember
-	}
-	var wba []wbaInput
+		count  int
+	)
 	for _, e := range inputs {
 		if !e.member.inner {
 			continue
 		}
 		if tag, ok := stringParam(e.member.params, "tag"); ok && tag == ProfileTagWebBotAuth {
-			wba = append(wba, wbaInput{e.key, e.member})
+			if count == 0 {
+				label, member = e.key, e.member
+			}
+			count++
 		}
 	}
-	for _, in := range wba {
-		labels = append(labels, in.label)
+	// A request with no web-bot-auth member (an RFC 9421 signature, say)
+	// carries nothing this profile reads: 403 with Accept-Signature, decided
+	// before Signature is parsed, so the answer does not depend on whether
+	// another profile's Signature value happens to be valid RFC 8941.
+	if count == 0 {
+		return nil, wbaFail(http.StatusForbidden, "", "no web-bot-auth signature")
 	}
-	if len(wba) == 0 {
-		return nil, labels, wbaFail(http.StatusForbidden, "", "Signature-Agent requires the Web Bot Auth profile")
+	signatures, err := parseSFDictionary(r.Header.Get(signatureHeader))
+	if err != nil {
+		return nil, wbaFail(http.StatusBadRequest, "", "Signature does not parse")
+	}
+	// A missing Signature-Agent (selection by tag alone) leaves the member
+	// absent, which fails the signature with 403 below; a present field
+	// that does not parse is 400.
+	var agents sfDict
+	if raw := r.Header.Get(signatureAgentHeader); raw != "" {
+		if agents, err = parseSFDictionary(raw); err != nil {
+			return nil, wbaFail(http.StatusBadRequest, "", "Signature-Agent does not parse")
+		}
 	}
 	if !sameKeys(inputs.keys(), signatures.keys()) {
-		return nil, labels, wbaFail(http.StatusBadRequest, "", "Signature and Signature-Input labels differ")
+		return nil, wbaFail(http.StatusBadRequest, "", "Signature and Signature-Input labels differ")
+	}
+	if count > 1 {
+		return nil, wbaFail(http.StatusForbidden, label, "more than one web-bot-auth signature")
+	}
+	if len(agents) > 1 {
+		return nil, wbaFail(http.StatusForbidden, label, "more than one Signature-Agent member")
 	}
 
 	limit := opts.MaxBodyBytes
@@ -476,169 +535,134 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) ([]*Verifie
 	}
 	body, err := readAndReplaceBody(r, limit)
 	if err != nil {
-		return nil, labels, wbaFail(http.StatusForbidden, wba[0].label, "request body unreadable or too large")
+		return nil, wbaFail(http.StatusForbidden, label, "request body unreadable or too large")
 	}
 	requestURL, ok := receivedTargetURI(r, scheme)
 	if !ok {
-		return nil, labels, wbaFail(http.StatusForbidden, wba[0].label, "absolute-form request-target does not match the connection's scheme and Host")
+		return nil, wbaFail(http.StatusForbidden, label, "absolute-form request-target does not match the connection's scheme and Host")
 	}
 	if len(opts.Authorities) > 0 {
 		u, err := url.Parse(requestURL)
 		if err != nil || !authorityAllowed(canonicalAuthority(u.Host, strings.ToLower(u.Scheme)), strings.ToLower(u.Scheme), opts.Authorities) {
-			return nil, labels, wbaFail(http.StatusForbidden, wba[0].label, "request authority is not served by this verifier")
+			return nil, wbaFail(http.StatusForbidden, label, "request authority is not served by this verifier")
 		}
 	}
 
-	type claim struct {
-		signer *VerifiedSigner
-		nonce  string
-		ttl    time.Duration
+	if err := wbaWindow(member, now, false, label); err != nil {
+		return nil, err
 	}
-	var verified []claim
-	var earlier []string
-	for _, in := range wba {
-		label, member := in.label, in.member
-		if err := wbaWindow(member, now, false, label); err != nil {
-			return nil, labels, err
-		}
-		nonce, ok := stringParam(member.params, "nonce")
-		if !ok || !validWBANonce(nonce) {
-			return nil, labels, wbaFail(http.StatusForbidden, label, "missing nonce, or not 64 bytes in canonical base64")
-		}
-		agent, ok := agents.get(label)
-		if !ok || agent.inner || agent.item.value.kind != sfString {
-			return nil, labels, wbaFail(http.StatusForbidden, label, "missing supported Signature-Agent member")
-		}
-		if typ, present := sfParamValue(agent.item.params, "type"); present && (typ.kind != sfToken && typ.kind != sfString || typ.s != "directory") {
-			return nil, labels, wbaFail(http.StatusForbidden, label, "unsupported Signature-Agent member type")
-		}
-		origin, err := webBotAuthOrigin(agent.item.value.s)
-		if err != nil {
-			return nil, labels, &WBAError{Status: http.StatusForbidden, Label: label, Reason: "invalid signer origin", Wrapped: err}
-		}
+	nonce, ok := stringParam(member.params, "nonce")
+	if !ok || !validWBANonce(nonce) {
+		return nil, wbaFail(http.StatusForbidden, label, "missing nonce, or not 64 bytes in canonical base64")
+	}
+	// alg is required and names one of the profile's two algorithms; it
+	// must also match the directory key (wbaVerifyCrypto).
+	if alg, ok := stringParam(member.params, "alg"); !ok || (Algorithm(alg) != AlgEd25519 && Algorithm(alg) != AlgRSAPSSSHA512) {
+		return nil, wbaFail(http.StatusForbidden, label, "alg must be ed25519 or rsa-pss-sha512")
+	}
+	agent, ok := agents.get(label)
+	if !ok || agent.inner || agent.item.value.kind != sfString {
+		return nil, wbaFail(http.StatusForbidden, label, "missing supported Signature-Agent member")
+	}
+	if typ, present := sfParamValue(agent.item.params, "type"); present && (typ.kind != sfToken && typ.kind != sfString || typ.s != "directory") {
+		return nil, wbaFail(http.StatusForbidden, label, "unsupported Signature-Agent member type")
+	}
+	origin, err := webBotAuthOrigin(agent.item.value.s)
+	if err != nil {
+		return nil, &WBAError{Status: http.StatusForbidden, Label: label, Reason: "invalid signer origin", Wrapped: err}
+	}
 
-		covered := make(map[string]struct{}, len(member.list))
-		names := make([]string, 0, len(member.list))
-		for _, c := range member.list {
-			id := c.serialize()
-			covered[id] = struct{}{}
-			names = append(names, id)
+	covered := make(map[string]struct{}, len(member.list))
+	names := make([]string, 0, len(member.list))
+	for _, c := range member.list {
+		id := c.serialize()
+		covered[id] = struct{}{}
+		names = append(names, id)
+	}
+	required := []string{`"@method"`, `"@target-uri"`, `"@authority"`, `"signature-agent";key=` + sfStringItem(label).serialize()}
+	if len(body) > 0 {
+		required = append(required, `"content-type"`, `"content-digest"`)
+	}
+	if len(covered) != len(member.list) {
+		return nil, wbaFail(http.StatusForbidden, label, "repeated covered component")
+	}
+	for _, id := range required {
+		if _, ok := covered[id]; !ok {
+			return nil, wbaFail(http.StatusForbidden, label, "missing covered component")
 		}
-		required := []string{`"@method"`, `"@target-uri"`, `"@authority"`, `"signature-agent";key=` + sfStringItem(label).serialize()}
-		if len(body) > 0 {
-			required = append(required, `"content-type"`, `"content-digest"`)
-		}
-		for _, prev := range earlier {
-			key := sfStringItem(prev).serialize()
-			required = append(required, `"signature-agent";key=`+key, `"signature-input";key=`+key, `"signature";key=`+key)
-			// RFC 9421 §2.2.8 (via WBA §5.2.2): a signer that covers an
-			// earlier signature also covers every component it covered.
-			prevMember, _ := inputs.get(prev)
-			for _, c := range prevMember.list {
-				required = append(required, c.serialize())
-			}
-		}
-		if len(covered) != len(member.list) {
-			return nil, labels, wbaFail(http.StatusForbidden, label, "repeated covered component")
-		}
-		for _, id := range required {
-			if _, ok := covered[id]; !ok {
-				return nil, labels, wbaFail(http.StatusForbidden, label, "missing covered component")
-			}
-		}
+	}
 
-		keyID, _ := stringParam(member.params, "keyid")
-		jwk, err := opts.Keys.ResolveWBAKey(r.Context(), origin, keyID)
-		if err != nil {
-			if we := AsWBAError(err); we != nil {
-				if we.Label == "" {
-					we.Label = label
-				}
-				return nil, labels, we
+	keyID, _ := stringParam(member.params, "keyid")
+	jwk, err := opts.Keys.ResolveWBAKey(r.Context(), origin, keyID)
+	if err != nil {
+		if we := AsWBAError(err); we != nil {
+			if we.Label == "" {
+				we.Label = label
 			}
-			return nil, labels, &WBAError{Status: http.StatusForbidden, Label: label, Reason: "signer key resolution failed", Wrapped: err}
+			return nil, we
 		}
-		if jwk == nil {
-			return nil, labels, wbaFail(http.StatusForbidden, label, "key absent from the named origin's directory")
-		}
-		if tp, err := JWKThumbprint(*jwk); err != nil || tp != keyID {
-			return nil, labels, wbaFail(http.StatusForbidden, label, "directory key thumbprint does not match keyid")
-		}
-		base, err := wbaSignatureBase(r.Method, requestURL, r.Header, member, false)
-		if err != nil {
-			return nil, labels, withLabel(err, label)
-		}
-		sigMember, _ := signatures.get(label)
-		alg, err := wbaVerifyCrypto(member, sigMember, *jwk, base)
-		if err != nil {
-			return nil, labels, withLabel(err, label)
-		}
-		if len(body) > 0 && !wbaDigestMatches(r.Header.Get(contentDigestHeader), body) {
-			return nil, labels, wbaFail(http.StatusForbidden, label, "request digest mismatch")
-		}
-		expires, _ := intParam(member.params, "expires")
-		// One extra second keeps the entry alive through the last second
-		// of the window.
-		ttl := time.Duration(expires-now+skewSeconds+1) * time.Second
-		if ttl < time.Second {
-			ttl = time.Second
-		}
-		verified = append(verified, claim{
-			signer: &VerifiedSigner{
-				KeyID:             keyID,
-				AgentURL:          origin,
-				VerifiedAt:        time.Unix(now, 0).UTC(),
-				Algorithm:         alg,
-				Label:             label,
-				CoveredComponents: names,
-				Profile:           ProfileTagWebBotAuth,
-			},
-			nonce: nonce,
-			ttl:   ttl,
-		})
-		earlier = append(earlier, label)
+		return nil, &WBAError{Status: http.StatusForbidden, Label: label, Reason: "signer key resolution failed", Wrapped: err}
 	}
-	// Record nonces only once every signature verified, so a request that
-	// fails on a later signature leaves no replay state behind. Check every
-	// signer before recording any, so a replayed relay signature does not
-	// consume the originator's nonce.
-	for _, c := range verified {
-		id := wbaReplayIdentity(c.signer.AgentURL)
-		if opts.Replay.Seen(id, c.nonce) {
-			return nil, labels, wbaFail(http.StatusForbidden, c.signer.Label, "replayed nonce")
-		}
-		if opts.Replay.HitCap(id) {
-			return nil, labels, wbaFail(http.StatusTooManyRequests, c.signer.Label, "replay store capacity exceeded")
-		}
+	if jwk == nil {
+		return nil, wbaFail(http.StatusForbidden, label, "key absent from the named origin's directory")
 	}
-	// Claim relays before the originator, so a relay that loses a race does
-	// not burn the originator's nonce.
-	for i := len(verified) - 1; i >= 0; i-- {
-		c := verified[i]
-		id := wbaReplayIdentity(c.signer.AgentURL)
-		if claimer, ok := opts.Replay.(ReplayClaimer); ok {
-			switch claimer.Claim(id, c.nonce, c.ttl) {
-			case ReplayReplayed:
-				return nil, labels, wbaFail(http.StatusForbidden, c.signer.Label, "replayed nonce")
-			case ReplayCapacity:
-				return nil, labels, wbaFail(http.StatusTooManyRequests, c.signer.Label, "replay store capacity exceeded")
-			}
-			continue
+	if tp, err := JWKThumbprint(*jwk); err != nil || tp != keyID {
+		return nil, wbaFail(http.StatusForbidden, label, "directory key thumbprint does not match keyid")
+	}
+	base, err := wbaSignatureBase(r.Method, requestURL, r.Header, member, false)
+	if err != nil {
+		return nil, withLabel(err, label)
+	}
+	sigMember, _ := signatures.get(label)
+	alg, err := wbaVerifyCrypto(member, sigMember, *jwk, base)
+	if err != nil {
+		return nil, withLabel(err, label)
+	}
+	if len(body) > 0 && !wbaDigestMatches(r.Header.Get(contentDigestHeader), body) {
+		return nil, wbaFail(http.StatusForbidden, label, "request digest mismatch")
+	}
+
+	// Replay: the identity, not the key, scopes the nonce. A reused
+	// signature or nonce is 429 with Accept-Signature carrying a fresh
+	// nonce (WBA §5.3).
+	expires, _ := intParam(member.params, "expires")
+	// One extra second keeps the entry alive through the last second of
+	// the window.
+	ttl := time.Duration(expires-now+skewSeconds+1) * time.Second
+	if ttl < time.Second {
+		ttl = time.Second
+	}
+	id := wbaReplayIdentity(origin)
+	if opts.Replay.Seen(id, nonce) {
+		return nil, wbaReplayed(label)
+	}
+	if opts.Replay.HitCap(id) {
+		return nil, wbaFail(http.StatusTooManyRequests, label, "replay store capacity exceeded")
+	}
+	if claimer, ok := opts.Replay.(ReplayClaimer); ok {
+		switch claimer.Claim(id, nonce, ttl) {
+		case ReplayReplayed:
+			return nil, wbaReplayed(label)
+		case ReplayCapacity:
+			return nil, wbaFail(http.StatusTooManyRequests, label, "replay store capacity exceeded")
 		}
-		if !opts.Replay.Insert(id, c.nonce, c.ttl) {
-			return nil, labels, wbaFail(http.StatusTooManyRequests, c.signer.Label, "replay store capacity exceeded")
-		}
+	} else if !opts.Replay.Insert(id, nonce, ttl) {
+		return nil, wbaFail(http.StatusTooManyRequests, label, "replay store capacity exceeded")
 	}
 	if len(bytes.TrimSpace(body)) > 0 {
 		if err := strictjson.Validate(body, 0); err != nil {
-			return nil, labels, wbaFail(http.StatusBadRequest, "", "malformed signed JSON body")
+			return nil, wbaFail(http.StatusBadRequest, "", "malformed signed JSON body")
 		}
 	}
-	out := make([]*VerifiedSigner, len(verified))
-	for i, c := range verified {
-		out[i] = c.signer
-	}
-	return out, labels, nil
+	return &VerifiedSigner{
+		KeyID:             keyID,
+		AgentURL:          origin,
+		VerifiedAt:        time.Unix(now, 0).UTC(),
+		Algorithm:         alg,
+		Label:             label,
+		CoveredComponents: names,
+		Profile:           ProfileTagWebBotAuth,
+	}, nil
 }
 
 // receivedTargetURI returns the request's target URI as received (RFC 9421
@@ -694,8 +718,11 @@ func authorityAllowed(authority, scheme string, allowed []string) bool {
 }
 
 // wbaReplayIdentity scopes a nonce to an identity in a ReplayStore shared
-// with RFC 9421 keyids; the prefix keeps the two namespaces apart.
-func wbaReplayIdentity(origin string) string { return "web-bot-auth " + origin }
+// with RFC 9421 keyids. The separator is the ASCII unit separator (0x1F), a
+// control character no HTTP field value can carry (net/http refuses it), so
+// no RFC 9421 keyid can name a Web Bot Auth identity and exhaust its
+// replay-cache capacity.
+func wbaReplayIdentity(origin string) string { return "web-bot-auth\x1f" + origin }
 
 func withLabel(err error, label string) error {
 	if we := AsWBAError(err); we != nil && we.Label == "" {
@@ -843,18 +870,17 @@ func wbaSignatureBase(method, rawURL string, h http.Header, member sfMember, dir
 }
 
 // wbaKeyAlgorithm derives the signature algorithm from a directory key and
-// checks the key may verify: Ed25519, P-256, or RSA (2048 to 8192 bits,
-// rsa-pss-sha512), use "sig" when present, no
+// checks the key may verify: Ed25519 (ed25519) or RSA (2048 to 8192 bits,
+// rsa-pss-sha512), the profile's two algorithms; use "sig" when present, no
 // private member, a matching alg when present, and key_ops containing
-// "verify" when present.
+// "verify" when present. Any other key, P-256 included, is not a Web Bot
+// Auth key: ES256 stays on the AdCP RFC 9421 profile.
 func wbaKeyAlgorithm(jwk JWK) (Algorithm, error) {
 	var alg Algorithm
 	var jwsAlg string
 	switch {
 	case jwk.Kty == "OKP" && jwk.Crv == "Ed25519":
 		alg, jwsAlg = AlgEd25519, string(jwkAlgEdDSA)
-	case jwk.Kty == "EC" && jwk.Crv == "P-256":
-		alg, jwsAlg = AlgES256, string(jwkAlgES256)
 	case jwk.Kty == "RSA" && jwk.Crv == "":
 		if _, err := rsaPublicKey(jwk); err != nil {
 			return "", wbaFail(http.StatusForbidden, "", "unsupported RSA directory key")

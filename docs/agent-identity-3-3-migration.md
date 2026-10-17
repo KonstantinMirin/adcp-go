@@ -4,7 +4,7 @@ This note covers the experimental AdCP 3.3 agent-identity support in `github.com
 
 Everything here is **opt-in and experimental**.
 - **Wire pin.** It is unchanged: `adcp/v3/schemas/VERSION` stays at 3.2.x, and nothing advertises 3.3.
-- **Pinned drafts.** The Web Bot Auth wire rules and vectors are pinned to adcontextprotocol/adcp#7894 at `656bd080`. The identity schemas are pinned to the draft commits in [`adcp/v3/identity/testdata/schemas/UPSTREAM.json`](../adcp/v3/identity/testdata/schemas/UPSTREAM.json).
+- **Pinned drafts.** The Web Bot Auth wire rules and vectors are pinned to adcontextprotocol/adcp#7894 at `e24eeb09`, the profile as it left draft (provenance and checksums in [`adcp/v3/signing/testdata/wba-profile/UPSTREAM.json`](../adcp/v3/signing/testdata/wba-profile/UPSTREAM.json)). The identity schemas are pinned to the draft commits in [`adcp/v3/identity/testdata/schemas/UPSTREAM.json`](../adcp/v3/identity/testdata/schemas/UPSTREAM.json).
 - **Change.** Both may still change before 3.3 ships.
 - **Default behavior.** Existing APIs behave exactly as before unless you set the new options.
 
@@ -30,7 +30,7 @@ Everything here is **opt-in and experimental**.
 2. Sign with the Web Bot Auth profile:
 
    ```go
-   priv, _, _ := signing.LoadPrivateKey(pemBytes) // Ed25519 or P-256 (PrivateKey may also be an *rsa.PrivateKey of 2048 to 8192 bits)
+   priv, _, _ := signing.LoadPrivateKey(pemBytes) // Ed25519 (PrivateKey may also be an *rsa.PrivateKey of 2048 to 8192 bits; P-256 is refused)
    client, _ := signing.NewSignedHTTPClient(signing.SignedHTTPClientOptions{
        PrivateKey:         priv,
        AgentOrigin:        "https://buyer.example.com",
@@ -39,9 +39,9 @@ Everything here is **opt-in and experimental**.
    })
    ```
 
-   `AgentOrigin` sets and covers `Signature-Agent`. The signature carries `tag="web-bot-auth"`, a 64-byte random nonce (unpadded base64url, which Cloudflare's web-bot-auth library also accepts), the key's thumbprint as `keyid`, and an algorithm derived from the key. `@target-uri` is the URI the request is sent to, unchanged. The digest is always covered on a body. With a `CapabilityProvider`, the client sends only when the seller lists `web-bot-auth`. Otherwise it returns `ErrWebBotAuthNotAdvertised` and never downgrades on its own. `identity.AdvertisedRequestSigningProfiles` reads the list from a capabilities response.
+   `AgentOrigin` sets and covers `Signature-Agent`. The signature carries `tag="web-bot-auth"`, a 64-byte random nonce (unpadded base64url), the key's thumbprint as `keyid`, and `alg`: `ed25519`, or `rsa-pss-sha512` for an RSA key. Those are the profile's only algorithms, so a P-256 key cannot sign under Web Bot Auth; keep it for RFC 9421. A request carries exactly one Web Bot Auth signature, so an intermediary that forwards a request for someone else signs it as itself, and the brand's `brand.json` or `trust.json` says whether it may. `@target-uri` is the URI the request is sent to, unchanged. The digest is always covered on a body. With a `CapabilityProvider`, the client sends only when the seller lists `web-bot-auth`. Otherwise it returns `ErrWebBotAuthNotAdvertised` and never downgrades on its own. `identity.AdvertisedRequestSigningProfiles` reads the list from a capabilities response.
 
-3. Serve the key directory on that origin. Signing it is RECOMMENDED (WBA Appendix B.1); verifiers using this SDK also accept a plain JWK Set:
+3. Serve the key directory on that origin, signed once per key (WBA Appendix B.1). The profile requires the signatures, and verifiers using this SDK refuse a plain JWK Set:
 
    ```go
    pub, _ := signing.NewDirectoryPublisher(signing.DirectoryPublisherOptions{
@@ -83,18 +83,21 @@ mw := signing.Middleware(signing.MiddlewareOptions{
 - **Body.** A non-empty signed body must be strict JSON: no duplicate keys, including keys that differ only in case. Anything else is `400`.
 - **Authorities.** Set `Authorities` so that a signature captured at another seller cannot be replayed to this endpoint under that seller's `Host`.
 - **Layers.** Verification (`signing.VerifyWebBotAuthRequest`) needs only the key directory and replay state, so it can run in front of the server. Revocation, bindings, and grants are the authorization layer after it. The middleware runs both.
+- **One signature.** A request carries exactly one `web-bot-auth` signature and one `Signature-Agent` member. More is refused with `403` and `Accept-Signature`, even when each signature verifies.
+- **Required parameters.** `created`, `expires`, `keyid`, `alg`, `nonce`, and `tag`. `alg` is `ed25519` or `rsa-pss-sha512` and must match the directory key.
+- **Unsigned requests** that need a signature (an operation in `RequiredFor` or a method in `ProtocolMethodsRequiredFor`, read by exact member name, a body carrying `push_notification_config.authentication` under any letter case, or a body that is not strict JSON) get `401` with `request_signature_required` plus `Accept-Signature` for Web Bot Auth, since the middleware also accepts the RFC 9421 profile. A seller that advertises only `web-bot-auth` sets `WebBotAuthOptions.Exclusive`: those requests get `403` with `Accept-Signature`, and every signed request is verified under Web Bot Auth.
 - **Interop.**
-  - Nonces must be 64 bytes, as unpadded base64url or padded base64 (Cloudflare's rule).
+  - Nonces must be 64 bytes. The profile's encoding is base64url; padded standard base64, which Cloudflare's library and the WBA architecture draft's own vectors use, is also accepted.
   - `@target-uri` is the target URI as received, percent-encoding included (RFC 9421 §2.2.2), so `/a%7Eb/mcp/` is signed and verified as sent. `@authority` is normalized (§2.2.3). The canonical origin is used only for the `Signature-Agent` identity.
   - RSA keys verify with `rsa-pss-sha512` (2048 to 8192 bits), as in the draft's Appendix E vectors.
   - Cross-implementation fixtures from the TypeScript SDK, generated against Cloudflare's `web-bot-auth@0.2.0` and `http-message-sig@0.3.0`, are vendored under `adcp/v3/signing/testdata/wba-interop/` (provenance in `UPSTREAM.json`). The Go verifier accepts both the Cloudflare-signed and the TypeScript-signed requests and their signed directories, percent-encoded path included, and builds the same signature base. With the fixtures' `created` and nonce, the Go signer reproduces the TypeScript signatures byte for byte.
-- **Key directories.** A plain, unsigned JWK Set is accepted by default; signatures that are present must verify. `DirectoryResolverOptions.RequireSignedDirectory` refuses unsigned directories.
+- **Key directories.** Directories must be signed, one signature per usable key (WBA Appendix B.1). An unsigned directory, or one with a key that did not sign it, is a discovery failure.
   - **Discovery failures** (WBA §6.10) cover a directory that doesn't resolve: network or TLS error, timeout, any status other than `200` (including 404, 410, 429, 5xx), an invalid directory, or a fetch refused by the resolver's own limits.
   - A discovery failure never evicts a cached directory. Its keys keep verifying for up to `MaxStale` (24 h by default, never past the directory signatures' expiry). When the refusal comes from the resolver's own limits, they keep verifying for one more 5-minute cache period only.
   - With no usable cached copy, the request is unverified, and what happens is local policy (`WebBotAuthOptions.OnDiscoveryFailure`). The default is `403` with `Accept-Signature`. `DiscoveryFailureAnonymous` serves the request as anonymous, except operations in `RequiredFor`.
   - A directory that resolves without the key is evidence that the key was removed.
 - **Errors are split by layer.**
-  - **The signature path** answers only with WBA statuses and headers, never `503`: `400` when headers don't parse, `403` with `Accept-Signature`, `403` without it for a revoked key, and `429`. Any body is the generic authentication error (`{"errors":[{"code":"AUTH_INVALID",...}]}`, the same for every cause).
+  - **The signature path** answers only with WBA statuses and headers, never `503`: `400` when headers don't parse; `429` with `Accept-Signature` carrying a fresh nonce for a reused signature or nonce; `403` with `Accept-Signature` for every other signature failure; `403` without it for a revoked key. A replay store at its per-identity capacity answers `429` with `Retry-After` and no `Accept-Signature`. Any body is the generic authentication error (`{"errors":[{"code":"AUTH_INVALID",...}]}`, the same for every cause).
   - **Authorization outcomes** after verification use the standard AdCP error envelope (`{"errors":[{"code","message","recovery"}]}`) with existing codes:
     - a failed binding, an unlisted origin, or a signature-required operation from an unbound origin gets `PERMISSION_DENIED` (403) with no details;
     - a spend-committing call while the trust record or the origin's revocation list can't be read gets `SERVICE_UNAVAILABLE` (503, `Retry-After`, retryable);
@@ -130,6 +133,7 @@ mw := signing.Middleware(signing.MiddlewareOptions{
   - The hook reads the per-request signer (Web Bot Auth or RFC 9421) and checks every entry before the handler runs.
   - An identity-established Web Bot Auth signer (no `PrincipalID`) never provisions accounts.
   - A missing grant is `PERMISSION_DENIED` with `{scope: "agent", reason: "grant_absent"}`. When no identity is established, or the signer's own operator doesn't list it, it is `PERMISSION_DENIED` with no details.
+  - `grantee`, `account.operator`, and the brand's domain are compared with the signer's operator as registrable domains under the pinned PSL snapshot, so a grant to `buy.agency.com` reaches every agent `agency.com` lists. For a multi-tenant vendor, that is every tenant. `MarshalTrustRecord` therefore requires a registrable-domain grantee: narrow a grant with `agents[]`. When reading, a host grantee is still compared as its registrable domain, and the evaluator logs a warning when the grant has no `agents[]` (`TrustRecordEvaluatorOptions.Logger`). Whether the spec should narrow such a grant implicitly is pending. A grantee with no registrable domain matches nothing, and the record that carries it stays readable.
   - A chain takes one of three shapes:
     - the brand grants the signer's operator, which is `account.operator`;
     - a self-operated brand (it is `account.operator`) grants the signer's operator directly, for example the platform hosting its agent;

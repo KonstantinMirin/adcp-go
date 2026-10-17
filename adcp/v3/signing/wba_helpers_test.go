@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -233,4 +234,47 @@ func requireWBAError(t *testing.T, err error, status int) *WBAError {
 func requireWBAStatus(t *testing.T, err error, status int) {
 	t.Helper()
 	_ = requireWBAError(t, err, status)
+}
+
+// signDirectoryBody serves body as origin's key directory, signed once by
+// each key (WBA Appendix B.1), for directories SignKeyDirectory does not
+// build.
+func signDirectoryBody(t *testing.T, origin string, body []byte, keys ...any) *DirectoryResponse {
+	t.Helper()
+	h := http.Header{}
+	h.Set("Content-Type", DirectoryMediaType)
+	h.Set("Content-Digest", computeSHA256DigestHeaderForEncoding(body, BinaryEncodingRFC8941))
+	var inputs, sigs sfDict
+	for i, k := range keys {
+		jwk, err := PublicDirectoryKey(k)
+		require.NoError(t, err)
+		m := sfMember{inner: true, list: []sfItem{
+			{value: sfStringItem(componentAuthority), params: []sfParam{{key: "req", value: sfTrue()}}},
+			{value: sfStringItem(componentContentDigst)},
+		}, params: []sfParam{
+			{key: "created", value: sfIntItem(wbaTestNow.Add(-time.Hour).Unix())},
+			{key: "expires", value: sfIntItem(wbaTestNow.Add(24 * time.Hour).Unix())},
+			{key: "keyid", value: sfStringItem(jwk.Kid)},
+			{key: "tag", value: sfStringItem(DirectoryTag)},
+		}}
+		base, err := wbaSignatureBase(http.MethodGet, origin+DirectoryPath, h, m, true)
+		require.NoError(t, err)
+		sig, err := signWithKey(k, []byte(base))
+		require.NoError(t, err)
+		label := fmt.Sprintf("key%d", i+1)
+		inputs = append(inputs, sfDictEntry{key: label, member: m})
+		sigs = append(sigs, sfDictEntry{key: label, member: sfMember{item: sfItem{value: sfBare{kind: sfBinary, b: sig}}}})
+	}
+	if len(keys) > 0 {
+		h.Set("Signature-Input", inputs.serialize())
+		h.Set("Signature", sigs.serialize())
+	}
+	return &DirectoryResponse{Status: http.StatusOK, Header: h, Body: body}
+}
+
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	require.NoError(t, err)
+	return string(b)
 }

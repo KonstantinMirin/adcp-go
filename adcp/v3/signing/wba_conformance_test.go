@@ -3,7 +3,10 @@ package signing
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -51,6 +54,7 @@ type wbaVector struct {
 			Label      string   `json:"label"`
 			Components string   `json:"components"`
 			Parameters []string `json:"parameters"`
+			Nonce      string   `json:"nonce"`
 		} `json:"accept_signature"`
 	} `json:"expected_outcome"`
 }
@@ -130,7 +134,7 @@ func vectorRequest(v wbaVector) *http.Request {
 	return r
 }
 
-func verifyWBAVector(t *testing.T, v wbaVector, keys map[string]wbaVectorKey) ([]*VerifiedSigner, error) {
+func verifyWBAVector(t *testing.T, v wbaVector, keys map[string]wbaVectorKey) (*VerifiedSigner, error) {
 	t.Helper()
 	replay := NewMemoryReplayStore(0)
 	if v.TestHarnessState != nil {
@@ -143,6 +147,43 @@ func verifyWBAVector(t *testing.T, v wbaVector, keys map[string]wbaVectorKey) ([
 		Replay: replay,
 		Clock:  func() time.Time { return time.Unix(v.ReferenceNow, 0) },
 	})
+}
+
+// TestWBAVectorsArePinned: the vendored vectors match the checksums
+// recorded with their provenance in UPSTREAM.json, and every vendored file
+// is pinned.
+func TestWBAVectorsArePinned(t *testing.T) {
+	const dir = "testdata/wba-profile"
+	b, err := os.ReadFile(filepath.Join(dir, "UPSTREAM.json"))
+	require.NoError(t, err)
+	var up struct {
+		Repository string            `json:"repository"`
+		Commit     string            `json:"commit"`
+		Files      map[string]string `json:"files"`
+	}
+	require.NoError(t, json.Unmarshal(b, &up))
+	require.Equal(t, "https://github.com/adcontextprotocol/adcp", up.Repository)
+	require.Equal(t, "e24eeb090c4365707641099cbbb45f9945c6d6e0", up.Commit)
+	var vendored []string
+	require.NoError(t, filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, _ := filepath.Rel(dir, path)
+		if rel != "UPSTREAM.json" {
+			vendored = append(vendored, filepath.ToSlash(rel))
+		}
+		return nil
+	}))
+	require.Len(t, up.Files, len(vendored), "every vendored file is pinned")
+	for _, name := range vendored {
+		want, ok := up.Files[name]
+		require.True(t, ok, name)
+		data, err := os.ReadFile(filepath.Join(dir, name)) // #nosec G304 -- names come from a walk of testdata.
+		require.NoError(t, err, name)
+		sum := sha256.Sum256(data)
+		require.Equal(t, want, "sha256:"+hex.EncodeToString(sum[:]), name)
+	}
 }
 
 func TestWBAPositiveVectors(t *testing.T) {
@@ -165,59 +206,105 @@ func TestWBAPositiveVectors(t *testing.T) {
 				require.Equal(t, want, got, label)
 			}
 
-			signers, err := verifyWBAVector(t, v, keys)
+			signer, err := verifyWBAVector(t, v, keys)
 			require.NoError(t, err)
-			got := map[string]string{}
-			for _, s := range signers {
-				got[s.Label] = s.AgentURL
-				require.Equal(t, ProfileTagWebBotAuth, s.Profile)
-				require.Empty(t, s.PrincipalID, "verification alone never binds a principal")
-			}
-			require.Equal(t, v.ExpectedOutcome.Identities, got)
+			require.Equal(t, ProfileTagWebBotAuth, signer.Profile)
+			require.Empty(t, signer.PrincipalID, "verification alone never binds a principal")
+			require.Equal(t, v.ExpectedOutcome.Identities, map[string]string{signer.Label: signer.AgentURL})
 		})
 	}
 }
 
+// wbaPageAcceptSignature is the Accept-Signature example on the profile
+// page (Error responses), unwrapped.
+const wbaPageAcceptSignature = `sig1=("@method" "@target-uri" "@authority" "content-type" "content-digest" "signature-agent";key="sig1");created;expires;nonce;keyid;alg;tag="web-bot-auth"`
+
 func TestWBANegativeVectors(t *testing.T) {
 	keys := loadWBAKeys(t)
-	for name, v := range loadWBAVectors(t, "negative") {
+	vectors := loadWBAVectors(t, "negative")
+	require.Len(t, vectors, 6)
+	for name, v := range vectors {
 		t.Run(name, func(t *testing.T) {
 			_, err := verifyWBAVector(t, v, keys)
 			we := AsWBAError(err)
 			require.NotNil(t, we, "want a *WBAError, got %v", err)
 			require.Equal(t, v.ExpectedOutcome.Status, we.Status, we.Reason)
+			require.False(t, we.Authorization)
 			h := we.ResponseHeader()
-			if v.ExpectedOutcome.Status == http.StatusForbidden {
-				require.False(t, we.Authorization)
-				accept := h.Get(acceptSignatureHeader)
-				require.NotEmpty(t, accept)
-				d, err := parseSFDictionary(accept)
-				require.NoError(t, err)
-				want := v.ExpectedOutcome.AcceptSignature
-				m, ok := d.get(want.Label)
-				require.True(t, ok, "Accept-Signature label %q in %q", want.Label, accept)
-				components := sfMember{inner: true, list: m.list}.serialize()
-				require.Equal(t, want.Components, components)
-				var params []string
-				for _, p := range m.params {
-					params = append(params, p.key)
-				}
-				for _, p := range want.Parameters {
-					require.Contains(t, params, p)
-				}
-				nonce, ok := stringParam(m.params, "nonce")
-				require.True(t, ok)
-				require.True(t, validWBANonce(nonce), "the offered nonce is 64 bytes")
-			} else {
+			if v.ExpectedOutcome.Status == http.StatusBadRequest {
 				require.Empty(t, h.Get(acceptSignatureHeader))
+				return
 			}
+			accept := h.Get(acceptSignatureHeader)
+			require.NotEmpty(t, accept)
+			d, err := parseSFDictionary(accept)
+			require.NoError(t, err)
+			require.Len(t, d, 1, "one label")
+			want := v.ExpectedOutcome.AcceptSignature
+			m, ok := d.get(want.Label)
+			require.True(t, ok, "Accept-Signature label %q in %q", want.Label, accept)
+			components := sfMember{inner: true, list: m.list}.serialize()
+			require.Equal(t, want.Components, components)
+			var params []string
+			for _, p := range m.params {
+				params = append(params, p.key)
+			}
+			require.Equal(t, want.Parameters, params)
+			tag, _ := stringParam(m.params, "tag")
+			require.Equal(t, ProfileTagWebBotAuth, tag)
+			nonce, fresh := stringParam(m.params, "nonce")
+			if want.Nonce == "verifier-chosen" {
+				require.Equal(t, http.StatusTooManyRequests, we.Status)
+				require.True(t, fresh, "a replay offers a fresh nonce")
+				require.True(t, validWBANonce(nonce), "the offered nonce is 64 bytes")
+				return
+			}
+			require.Equal(t, http.StatusForbidden, we.Status)
+			require.Equal(t, wbaPageAcceptSignature, accept, "the page's Accept-Signature, byte for byte")
 		})
 	}
 }
 
+// TestWBATwoSignaturesEachVerifyAlone: the rejection of
+// 006-two-signatures is the profile's count check, not cryptography: each
+// of its signatures, alone on the request, verifies against its own
+// directory.
+func TestWBATwoSignaturesEachVerifyAlone(t *testing.T) {
+	keys := loadWBAKeys(t)
+	v := loadWBAVectors(t, "negative")["006-two-signatures.json"]
+	for label, origin := range map[string]string{"sig1": "https://buyer-7k3q.com", "sig2": "https://agent.brand-7k3q.com"} {
+		r := vectorRequest(v)
+		for _, h := range []string{"Signature-Agent", "Signature-Input", "Signature"} {
+			d, err := parseSFDictionary(r.Header.Get(h))
+			require.NoError(t, err)
+			m, ok := d.get(label)
+			require.True(t, ok)
+			r.Header.Set(h, sfDict{{key: label, member: m}}.serialize())
+		}
+		got, err := VerifyWebBotAuthRequest(r, WBAVerifyOptions{
+			Keys:   vectorDirectories(t, v, keys),
+			Replay: NewMemoryReplayStore(0),
+			Clock:  func() time.Time { return time.Unix(v.ReferenceNow, 0) },
+		})
+		require.NoError(t, err, label)
+		require.Equal(t, origin, got.AgentURL)
+		require.Equal(t, v.ExpectedSignatureBase[label], mustWBABase(t, r, label))
+	}
+}
+
+func mustWBABase(t *testing.T, r *http.Request, label string) string {
+	t.Helper()
+	inputs, err := parseSFDictionary(r.Header.Get(signatureInputHeader))
+	require.NoError(t, err)
+	m, _ := inputs.get(label)
+	base, err := wbaSignatureBase(r.Method, "https://"+r.Host+r.URL.RequestURI(), r.Header, m, false)
+	require.NoError(t, err)
+	return base
+}
+
 func TestWBADirectoryResponseVector(t *testing.T) {
 	keys := loadWBAKeys(t)
-	v := loadWBAVectors(t, "positive")["003-signed-directory-response.json"]
+	v := loadWBAVectors(t, "positive")["002-signed-directory-response.json"]
 	require.NotNil(t, v.Response)
 	resp := &DirectoryResponse{Status: v.Response.Status, Header: http.Header{}, Body: []byte(v.Response.Body)}
 	for k, val := range v.Response.Headers {
@@ -244,6 +331,14 @@ func TestWBADirectoryResponseVector(t *testing.T) {
 	// Covering the request authority stops the key set being replayed from
 	// another domain.
 	_, err = VerifyDirectoryResponse("https://agent.brand-7k3q.com", resp, time.Unix(v.ReferenceNow, 0))
+	require.Error(t, err)
+
+	// The profile requires the signatures: the same body unsigned is
+	// refused.
+	unsigned := &DirectoryResponse{Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body}
+	unsigned.Header.Del("Signature-Input")
+	unsigned.Header.Del("Signature")
+	_, err = VerifyDirectoryResponse("https://buyer-7k3q.com", unsigned, time.Unix(v.ReferenceNow, 0))
 	require.Error(t, err)
 }
 
@@ -273,38 +368,4 @@ func TestWBASignerReproducesVector(t *testing.T) {
 	require.Equal(t, v.Request.Headers["Content-Digest"], r.Header.Get("Content-Digest"))
 	require.Equal(t, v.Request.Headers["Signature-Input"], r.Header.Get("Signature-Input"))
 	require.Equal(t, v.Request.Headers["Signature"], r.Header.Get("Signature"))
-}
-
-// TestWBARelaySignerReproducesVector rebuilds the two-signature relay
-// request: the brand signs, then the relay adds a signature covering the
-// brand's members.
-func TestWBARelaySignerReproducesVector(t *testing.T) {
-	keys := loadWBAKeys(t)
-	v := loadWBAVectors(t, "positive")["002-relay-request-two-signatures.json"]
-	priv := func(kid string) ed25519.PrivateKey {
-		seed, err := b64UrlDecode(keys[kid].TestOnlyPrivateD)
-		require.NoError(t, err)
-		return ed25519.NewKeyFromSeed(seed)
-	}
-	inputs, err := parseSFDictionary(v.Request.Headers["Signature-Input"])
-	require.NoError(t, err)
-	param := func(label string) (int64, string) {
-		m, _ := inputs.get(label)
-		c, _ := intParam(m.params, "created")
-		n, _ := stringParam(m.params, "nonce")
-		return c, n
-	}
-	r := httptest.NewRequest(v.Request.Method, v.Request.URL, strings.NewReader(v.Request.Body))
-	r.Header.Set("Content-Type", "application/json")
-	created, nonce := param("brand")
-	require.NoError(t, SignWebBotAuthRequest(r, priv("hHurKlVBnPJ4AGiPyl6HWMhxgkIcRBzaC8qWwEtnuVI"), WBASignOptions{
-		AgentOrigin: "https://agent.brand-7k3q.com", Label: "brand", CreatedOverride: created, NonceOverride: nonce,
-	}))
-	created, nonce = param("relay")
-	require.NoError(t, SignWebBotAuthRelay(r, priv("ZtaFf5jj-EzorJmZn6mX3YnmK_QyZKVLbbinzIQKOjQ"), WBASignOptions{
-		AgentOrigin: "https://relay.agency-7k3q.com", Label: "relay", CreatedOverride: created, NonceOverride: nonce,
-	}))
-	for _, h := range []string{"Signature-Agent", "Signature-Input", "Signature", "Content-Digest"} {
-		require.Equal(t, v.Request.Headers[h], r.Header.Get(h), h)
-	}
 }

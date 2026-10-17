@@ -29,6 +29,9 @@ type SignerOptions struct {
 
 	// PrivateKey is the private key half: ed25519.PrivateKey or
 	// *ecdsa.PrivateKey on P-256. Use LoadPrivateKey to parse PEM files.
+	// With AgentOrigin (Web Bot Auth) it is ed25519.PrivateKey or an
+	// *rsa.PrivateKey of 2048 to 8192 bits: the profile signs only with
+	// ed25519 and rsa-pss-sha512, so a P-256 key is refused there.
 	PrivateKey any
 
 	// Profile selects the signing profile — tag and required JWK adcp_use.
@@ -49,8 +52,8 @@ type SignerOptions struct {
 	// AgentOrigin, when set, opts this signer into the experimental AdCP 3.3
 	// Web Bot Auth profile instead of the RFC 9421 profile: SignRequest sets
 	// and covers Signature-Agent naming this HTTPS origin, uses
-	// tag="web-bot-auth", a nonce, sf-binary signatures, and the key's RFC
-	// 7638 thumbprint as keyid, and always covers Content-Digest on a body
+	// tag="web-bot-auth", a 64-byte nonce, alg, sf-binary signatures, and
+	// the key's RFC 7638 thumbprint as keyid, and always covers Content-Digest on a body
 	// (SignOptions.CoverContentDigest is ignored). Profile is ignored. KeyID
 	// may be empty, in which case it is set to the thumbprint; otherwise it
 	// must equal the thumbprint. Leave empty to keep RFC 9421 signing: the
@@ -180,8 +183,8 @@ func (s *Signer) SignRequest(r *http.Request, opts SignOptions) error {
 	}
 	if s.opts.AgentOrigin != "" {
 		// Like SignWebBotAuthRequest, refuses a request that already carries
-		// signature fields (another party's included): use
-		// SignWebBotAuthRelay to add a signature. RoundTripper signs a fresh
+		// signature fields (another party's included): a Web Bot Auth
+		// request carries exactly one signature. RoundTripper signs a fresh
 		// clone of the caller's request on every attempt.
 		return SignWebBotAuthRequest(r, s.opts.PrivateKey, WBASignOptions{
 			AgentOrigin:     s.opts.AgentOrigin,

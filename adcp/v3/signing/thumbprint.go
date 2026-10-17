@@ -2,7 +2,6 @@ package signing
 
 import (
 	"crypto"
-	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rsa"
 	"errors"
@@ -67,8 +66,9 @@ func JWKThumbprint(jwk JWK) (string, error) {
 }
 
 // PublicDirectoryKey returns the public JWK a Web Bot Auth key directory
-// publishes for privateKey (ed25519.PrivateKey, a P-256 *ecdsa.PrivateKey, or
-// an *rsa.PrivateKey of 2048 to 8192 bits, which signs with rsa-pss-sha512):
+// publishes for privateKey (ed25519.PrivateKey, which signs with ed25519, or
+// an *rsa.PrivateKey of 2048 to 8192 bits, which signs with rsa-pss-sha512;
+// the profile admits no other algorithm, so a P-256 key is refused):
 // kid set to the RFC 7638 thumbprint, use "sig", and no AdCP purpose member,
 // since purpose belongs to the origin under the profile.
 func PublicDirectoryKey(privateKey any) (JWK, error) {
@@ -80,18 +80,13 @@ func PublicDirectoryKey(privateKey any) (JWK, error) {
 			return JWK{}, errors.New("signing: invalid Ed25519 key")
 		}
 		pub = p
-	case *ecdsa.PrivateKey:
-		if k == nil || k.Curve == nil || k.Curve.Params().Name != "P-256" {
-			return JWK{}, errors.New("signing: Web Bot Auth supports Ed25519 and P-256 keys")
-		}
-		pub = &k.PublicKey
 	case *rsa.PrivateKey:
 		if k == nil || k.N.BitLen() < rsaMinModulus || k.N.BitLen() > rsaMaxModulus {
 			return JWK{}, errors.New("signing: Web Bot Auth RSA keys are 2048 to 8192 bits")
 		}
 		pub = &k.PublicKey
 	default:
-		return JWK{}, fmt.Errorf("signing: unsupported private key type %T", privateKey)
+		return JWK{}, fmt.Errorf("signing: Web Bot Auth keys are Ed25519 or RSA, not %T", privateKey)
 	}
 	jwk, err := jwkFromPublicKey(pub)
 	if err != nil {

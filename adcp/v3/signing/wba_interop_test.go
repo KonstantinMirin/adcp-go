@@ -123,8 +123,9 @@ func receivedInteropRequest(t *testing.T, f wbaInteropFixture, headers map[strin
 func interopVerifyOptions(t *testing.T, f wbaInteropFixture) WBAVerifyOptions {
 	clock := func() time.Time { return time.Unix(f.ReferenceNow, 0) }
 	return WBAVerifyOptions{
-		// Both directories carry Appendix B signatures; require them.
-		Keys:        NewDirectoryResolver(DirectoryResolverOptions{Fetch: interopDirectoryFetcher(t, f), Clock: clock, RequireSignedDirectory: true}),
+		// Both directories carry Appendix B signatures, which the profile
+		// requires.
+		Keys:        NewDirectoryResolver(DirectoryResolverOptions{Fetch: interopDirectoryFetcher(t, f), Clock: clock}),
 		Replay:      NewMemoryReplayStore(0),
 		Clock:       clock,
 		Scheme:      "https",
@@ -154,12 +155,11 @@ func TestWBAInteropFixturesVerify(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, f.Expected.SignatureBase, base)
 
-			signers, err := VerifyWebBotAuthRequest(r, interopVerifyOptions(t, f))
+			signer, err := VerifyWebBotAuthRequest(r, interopVerifyOptions(t, f))
 			require.NoError(t, err)
-			require.Len(t, signers, 1)
-			require.Equal(t, f.Expected.Identity, signers[0].AgentURL)
-			require.Equal(t, f.Expected.KeyID, signers[0].KeyID)
-			require.Equal(t, AlgEd25519, signers[0].Algorithm)
+			require.Equal(t, f.Expected.Identity, signer.AgentURL)
+			require.Equal(t, f.Expected.KeyID, signer.KeyID)
+			require.Equal(t, AlgEd25519, signer.Algorithm)
 
 			// The same request with its path percent-decoded is a
 			// different target URI and must not verify.
@@ -242,10 +242,14 @@ func TestWBAInteropGoSignerMatches(t *testing.T) {
 				require.NoError(t, err, "Go-signed request under the %s directory", f.Signer)
 			}
 
-			padded := strings.Repeat("CQkJ", 21) + "CQ=="
-			require.True(t, validWBANonce(padded))
-			_, err = VerifyWebBotAuthRequest(receivedInteropRequest(t, cf, sign(padded)), interopVerifyOptions(t, cf))
-			require.NoError(t, err)
+			// Cloudflare's signer emits 64 random bytes in padded standard
+			// base64, whose alphabet includes "+" and "/"; the profile asks
+			// for base64url. Both encodings of 64 bytes are accepted.
+			for _, nonce := range []string{strings.Repeat("CQkJ", 21) + "CQ==", strings.Repeat("+/+/", 21) + "+w=="} {
+				require.True(t, validWBANonce(nonce))
+				_, err = VerifyWebBotAuthRequest(receivedInteropRequest(t, cf, sign(nonce)), interopVerifyOptions(t, cf))
+				require.NoError(t, err, nonce)
+			}
 		})
 	}
 }

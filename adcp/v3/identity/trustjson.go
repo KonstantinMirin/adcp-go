@@ -34,7 +34,10 @@ const (
 	Authoring ValidationMode = iota
 	// Reading keeps unknown onboarding requirement kinds, which are
 	// advisory and never machine-satisfiable, without relaxing any
-	// authority-bearing member.
+	// authority-bearing member. One rule differs by mode: Authoring
+	// requires every grantee to be a registrable domain, while Reading
+	// keeps a record whose grantee is a host (compared as its registrable
+	// domain) or has no registrable domain (that grant matches nothing).
 	Reading
 )
 
@@ -43,8 +46,10 @@ type TrustRecordOptions struct {
 	Mode ValidationMode
 	// Owner, when set, is the registrable domain (or a host under it) the
 	// record speaks for: the host serving it. Every agent origin must then
-	// be HTTPS under that registrable domain, and every grantee an exact
-	// registrable domain.
+	// be HTTPS under that registrable domain. In Authoring mode every
+	// grantee must be a registrable domain (narrow with agents[]); a reader
+	// accepts a host under one and compares it as its registrable domain
+	// (L2 Grants in trust.json).
 	Owner string
 }
 
@@ -83,7 +88,7 @@ func ValidateTrustRecord(data []byte, opts TrustRecordOptions) (*TrustRecord, er
 	if err := json.Unmarshal(data, &rec); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidTrustRecord, err)
 	}
-	if err := rec.checkRules(opts.Owner); err != nil {
+	if err := rec.checkRules(opts.Owner, opts.Mode); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidTrustRecord, err)
 	}
 	return &rec, nil
@@ -103,7 +108,7 @@ func MarshalTrustRecord(rec *TrustRecord, owner string) ([]byte, error) {
 }
 
 // checkRules applies the rules beyond the schema.
-func (r *TrustRecord) checkRules(owner string) error {
+func (r *TrustRecord) checkRules(owner string, mode ValidationMode) error {
 	if r.AuthoritativeLocation != "" {
 		return nil
 	}
@@ -140,9 +145,16 @@ func (r *TrustRecord) checkRules(owner string) error {
 		}
 	}
 	for i, g := range r.Grants {
-		if operator != "" {
+		// A grantee is compared as its registrable domain, so a host under
+		// one names that whole operator. An author must write the
+		// registrable domain and narrow with agents[], so a grant to one
+		// tenant host is never silently a grant to every tenant. A reader
+		// keeps the record: a host grantee covers its registrable domain
+		// (TrustRecordEvaluator logs a warning when it has no agents[]),
+		// and a grantee with no registrable domain matches nothing.
+		if operator != "" && mode == Authoring {
 			if d, ok := psl.RegistrableDomain(g.Grantee); !ok || d != g.Grantee {
-				return fmt.Errorf("grants[%d].grantee must be an exact registrable domain", i)
+				return fmt.Errorf("grants[%d].grantee must be a registrable domain; narrow the grant to specific agents with agents[]", i)
 			}
 		}
 		for j, a := range g.Agents {

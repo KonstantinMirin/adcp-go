@@ -232,7 +232,7 @@ func ParseRevocationList(payload []byte, issuer string) (*RevocationList, error)
 
 // revocationJWSAlgorithms are the JWS algorithms a revocation list may be
 // signed with: one per key type a Web Bot Auth key directory holds.
-var revocationJWSAlgorithms = []jose.SignatureAlgorithm{jose.EdDSA, jose.ES256, jose.PS512}
+var revocationJWSAlgorithms = []jose.SignatureAlgorithm{jose.EdDSA, jose.PS512}
 
 // revocationMaxProtectedHeader caps the encoded protected header of a
 // revocation list JWS. A real header (alg, typ, kid) is under 200 bytes.
@@ -243,7 +243,7 @@ const revocationMaxProtectedHeader = 8 << 10
 
 // verifyRevocationJWS verifies a revocation list JWS in compact, flattened
 // JSON, or single-signature general JSON serialization and returns its
-// payload. The protected header must carry alg EdDSA, ES256 or PS512, typ
+// payload. The protected header must carry alg EdDSA or PS512, typ
 // adcp-gov-revocation+jws, a kid, and no crit; the kid is resolved by
 // resolve and the key's algorithm must match alg.
 //
@@ -337,8 +337,6 @@ func verifyRevocationJWS(body []byte, resolve func(kid string) (*JWK, error)) ([
 	switch jose.SignatureAlgorithm(protected.Algorithm) {
 	case jose.EdDSA:
 		want = AlgEd25519
-	case jose.ES256:
-		want = AlgES256
 	case jose.PS512:
 		want = AlgRSAPSSSHA512
 	default:

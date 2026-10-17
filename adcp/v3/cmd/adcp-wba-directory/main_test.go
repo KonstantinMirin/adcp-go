@@ -15,7 +15,7 @@ import (
 func TestRunWritesAVerifiableDirectory(t *testing.T) {
 	dir := t.TempDir()
 	var paths []string
-	for i, alg := range []signing.Algorithm{signing.AlgEd25519, signing.AlgES256} {
+	for i, alg := range []signing.Algorithm{signing.AlgEd25519, signing.AlgEd25519, signing.AlgES256} {
 		res, err := signing.GenerateSigningKey(alg, "")
 		if err != nil {
 			t.Fatal(err)
@@ -60,5 +60,10 @@ func TestRunWritesAVerifiableDirectory(t *testing.T) {
 	}
 	if err := run([]string{"--origin", "https://buyer.example.com"}, &stdout, &stderr, time.Now); err == nil {
 		t.Fatal("missing flags accepted")
+	}
+	// ES256 is not a Web Bot Auth algorithm: a P-256 key is refused.
+	args = []string{"--origin", "https://buyer.example.com", "--key", paths[2], "--out-body", body, "--out-headers", headers}
+	if err := run(args, &stdout, &stderr, time.Now); err == nil {
+		t.Fatal("P-256 key accepted")
 	}
 }
