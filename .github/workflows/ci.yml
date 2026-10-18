@@ -220,7 +220,7 @@ jobs:
       # adcontextprotocol/adcp commit whose tests/wba-interop/ harness and
       # wba-profile vectors grade this SDK: the head of adcp#8298. Move it to
       # the merge commit once that pull request merges.
-      ADCP_REF: "6bf069b61f8bb921983b6fbabd2cfce0962fefb8"
+      ADCP_REF: "ef966de19affc8b36a28f2fbc7c508050ce92d7b"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
