@@ -220,7 +220,7 @@ jobs:
       # adcontextprotocol/adcp commit whose tests/wba-interop/ harness and
       # wba-profile vectors grade this SDK: the head of adcp#8298. Move it to
       # the merge commit once that pull request merges.
-      ADCP_REF: "a7708e41fbcf0da84273a988c519b25a14b41dbc"
+      ADCP_REF: "6bf069b61f8bb921983b6fbabd2cfce0962fefb8"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -230,7 +230,8 @@ jobs:
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
-          node-version: "22"
+          # The harness's package.json requires Node 24.
+          node-version: "24"
 
       # The spec checkout goes under RUNNER_TEMP: ./adcp is this repository's
       # own module.
@@ -243,7 +244,7 @@ jobs:
           git -C "$spec" checkout -q FETCH_HEAD
 
       - name: Install the harness
-        run: npm ci --prefix "$RUNNER_TEMP/adcp-spec/tests/wba-interop"
+        run: npm ci --ignore-scripts --prefix "$RUNNER_TEMP/adcp-spec/tests/wba-interop"
 
       - name: Build the adapter
         working-directory: adcp/v3
