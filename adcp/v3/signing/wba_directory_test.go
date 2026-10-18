@@ -105,6 +105,11 @@ func TestVerifyDirectoryResponseRejectsTampering(t *testing.T) {
 			r.Header.Set("Signature", strings.Replace(r.Header.Get("Signature"), "key2=", "key9=", 1))
 		}, origin, wbaTestNow},
 		{"wrong media type", func(r *DirectoryResponse) { r.Header.Set("Content-Type", "text/html") }, origin, wbaTestNow},
+		// WBA §5.5.1: a directory MUST be served as
+		// application/http-message-signatures-directory+json.
+		{"plain JWK Set media type", func(r *DirectoryResponse) { r.Header.Set("Content-Type", "application/jwk-set+json") }, origin, wbaTestNow},
+		{"plain JSON media type", func(r *DirectoryResponse) { r.Header.Set("Content-Type", "application/json") }, origin, wbaTestNow},
+		{"no media type", func(r *DirectoryResponse) { r.Header.Del("Content-Type") }, origin, wbaTestNow},
 		{"not 200", func(r *DirectoryResponse) { r.Status = http.StatusNotModified }, origin, wbaTestNow},
 		{"oversized", func(r *DirectoryResponse) { r.Body = make([]byte, directoryMaxBytes+1) }, origin, wbaTestNow},
 		{"served for another origin", func(*DirectoryResponse) {}, "https://evil.example.com", wbaTestNow},
@@ -161,15 +166,15 @@ func TestVerifyDirectoryResponseRejectsTampering(t *testing.T) {
 	_, err := VerifyDirectoryResponse(origin, fresh(), wbaTestNow)
 	require.NoError(t, err)
 
-	// Accepted: a plain JWK Set media type, and keys the profile cannot use
-	// (here P-384 and P-256), which are skipped and need no signature. A
-	// signature naming a skipped key is not read.
+	// Accepted: media type parameters, and keys the profile cannot use (here
+	// P-384 and P-256), which are skipped and need no signature. A signature
+	// naming a skipped key is not read.
 	jwkA, _ := PublicDirectoryKey(keyA)
 	p256, _ := jwkFromPublicKey(&newP256(t).PublicKey)
 	p256Kid, err := JWKThumbprint(p256)
 	require.NoError(t, err)
 	accepted := map[string]func(*DirectoryResponse){
-		"plain JWK Set media type": func(r *DirectoryResponse) { r.Header.Set("Content-Type", "application/jwk-set+json") },
+		"media type with a parameter": func(r *DirectoryResponse) { r.Header.Set("Content-Type", DirectoryMediaType+"; charset=utf-8") },
 		"an unusable key is skipped": func(r *DirectoryResponse) {
 			*r = *signDirectoryBody(t, origin, []byte(`{"keys":[{"kty":"EC","crv":"P-384","x":"AAAA","y":"AAAA"},{"kty":"OKP","crv":"Ed25519","x":"`+jwkA.X+`","kid":"operator-chosen"}]}`), keyA)
 		},
@@ -338,7 +343,7 @@ func TestDirectoryResolverSignedDirectoriesOnly(t *testing.T) {
 	origin := "https://buyer.example.com"
 	key := newEd25519(t)
 	jwk, _ := PublicDirectoryKey(key)
-	plain := &DirectoryResponse{Status: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}},
+	plain := &DirectoryResponse{Status: http.StatusOK, Header: http.Header{"Content-Type": {DirectoryMediaType}},
 		Body: []byte(`{"keys":[{"kty":"OKP","crv":"Ed25519","x":"` + jwk.X + `"}]}`)}
 	_, err := NewDirectoryResolver(DirectoryResolverOptions{Fetch: func(context.Context, string) (*DirectoryResponse, error) { return plain, nil }, Clock: clock}).
 		ResolveWBAKey(context.Background(), origin, jwk.Kid)

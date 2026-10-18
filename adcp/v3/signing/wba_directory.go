@@ -39,9 +39,8 @@ type DirectoryResponse struct {
 // VerifyDirectoryResponse validates a signed key directory served at
 // origin and returns its usable keys indexed by RFC 7638 thumbprint. It
 // checks:
-//   - status 200, a body of at most 256 KiB, and a JWK Set media type
-//     (application/http-message-signatures-directory+json,
-//     application/jwk-set+json, or application/json);
+//   - status 200, a body of at most 256 KiB, and the media type
+//     application/http-message-signatures-directory+json (WBA §5.5.1);
 //   - strict JSON with 1 to 100 keys and no private key material. Keys the
 //     profile cannot use (key types other than Ed25519 and RSA, use other
 //     than sig, key_ops without verify) are skipped, at least one must
@@ -73,10 +72,7 @@ func verifyDirectoryResponse(origin string, resp *DirectoryResponse, now time.Ti
 	if resp == nil || resp.Status != http.StatusOK || len(resp.Body) > directoryMaxBytes {
 		return nil, time.Time{}, errors.New("signing: invalid key directory response")
 	}
-	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get(contentTypeHeader))
-	switch mediaType {
-	case DirectoryMediaType, "application/jwk-set+json", "application/json":
-	default:
+	if mediaType, _, _ := mime.ParseMediaType(resp.Header.Get(contentTypeHeader)); mediaType != DirectoryMediaType {
 		return nil, time.Time{}, errors.New("signing: key directory has the wrong media type")
 	}
 	keys, err := parseDirectoryKeys(resp.Body)
