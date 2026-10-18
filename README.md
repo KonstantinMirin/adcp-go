@@ -36,6 +36,8 @@ below, each with its own tag prefix and SemVer cadence.
 The `adcp/vN` major version tracks the AdCP protocol spec's major version 1:1.
 `adcp/v3` speaks AdCP 3.x; a hypothetical future `adcp/v4` will ship when the
 protocol spec bumps to 4.0. Other sub-modules stay on independent SemVer.
+Until AdCP 3.3 is ratified, `main` publishes `adcp/v3` as pre-releases
+(`adcp/v3.3.0-beta.N`); see [`RELEASING.md`](RELEASING.md).
 
 Upgrading from `adcp` v2 or an earlier root-module pseudo-version? See
 [`MIGRATING.md`](MIGRATING.md) for the full recipe — import path map, sample
