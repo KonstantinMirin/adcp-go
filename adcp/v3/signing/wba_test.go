@@ -655,6 +655,18 @@ func TestWBAAuthorities(t *testing.T) {
 	requireWBAStatus(t, err, http.StatusForbidden)
 }
 
+// TestWBAReadsOnlyTheWebBotAuthSignature: a second signature with another
+// tag, such as one a CDN adds, is not read, even when it does not verify.
+func TestWBAReadsOnlyTheWebBotAuthSignature(t *testing.T) {
+	rig := newWBARig(t)
+	r := rig.signedRequest(t, `{"jsonrpc":"2.0","id":1}`)
+	r.Header.Set("Signature-Input", r.Header.Get("Signature-Input")+`, cdn=("@method" "@authority");created=1;keyid="edge";tag="cdn-edge"`)
+	r.Header.Set("Signature", r.Header.Get("Signature")+", cdn=:AAAA:")
+	signer, err := VerifyWebBotAuthRequest(r, rig.opts())
+	require.NoError(t, err)
+	require.Equal(t, "sig1", signer.Label)
+}
+
 // replaceNonce swaps the nonce parameter of a serialized Signature-Input.
 func replaceNonce(input, nonce string) string {
 	start := strings.Index(input, `nonce="`) + len(`nonce="`)
