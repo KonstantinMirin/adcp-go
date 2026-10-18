@@ -664,9 +664,10 @@ func replaceNonce(input, nonce string) string {
 
 // TestWBANonceEncodings: the signer emits 64 random bytes as unpadded
 // base64url, the profile's encoding; the verifier accepts exactly 64 bytes
-// as base64url (unpadded or padded) or padded standard base64, the encoding
-// Cloudflare's web-bot-auth library and the WBA architecture draft's
-// Appendix A vectors use.
+// as unpadded base64url or padded standard base64, the two forms
+// Cloudflare's web-bot-auth validateNonce accepts. Padded standard base64 is
+// the encoding its generateNonce and the WBA architecture draft's Appendix A
+// vectors use. Padded base64url is refused, as validateNonce refuses it.
 func TestWBANonceEncodings(t *testing.T) {
 	rig := newWBARig(t)
 	r := rig.signedRequest(t, "")
@@ -686,17 +687,15 @@ func TestWBANonceEncodings(t *testing.T) {
 	_, err = VerifyWebBotAuthRequest(r, rig.opts())
 	require.NoError(t, err, "padded standard base64 is accepted")
 
-	padded := base64.URLEncoding.EncodeToString(bytes.Repeat([]byte{0xfb, 0xff}, 32))
-	require.Contains(t, padded, "_")
-	r = httptest.NewRequest(http.MethodGet, "https://seller.example.com/adcp/get_principal", nil)
-	require.NoError(t, SignWebBotAuthRequest(r, rig.key, WBASignOptions{AgentOrigin: rig.origin, Clock: wbaClock, NonceOverride: padded}))
-	_, err = VerifyWebBotAuthRequest(r, rig.opts())
-	require.NoError(t, err, "padded base64url is base64url (RFC 4648 §5)")
+	paddedURL := base64.URLEncoding.EncodeToString(bytes.Repeat([]byte{0xfb, 0xff}, 32))
+	require.Contains(t, paddedURL, "_")
+	require.True(t, strings.HasSuffix(paddedURL, "=="))
 
 	for _, bad := range []string{
 		base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
 		base64.RawURLEncoding.EncodeToString(make([]byte, 63)),
 		base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{0xfb}, 64)),
+		paddedURL,
 	} {
 		require.False(t, validWBANonce(bad), bad)
 		require.Error(t, SignWebBotAuthRequest(httptest.NewRequest(http.MethodGet, "https://s.example.com/", nil), rig.key,

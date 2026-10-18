@@ -60,14 +60,14 @@ const (
 )
 
 // validWBANonce reports whether nonce encodes exactly 64 bytes, canonically,
-// in base64url (RFC 4648 §5, unpadded or padded) or padded standard base64.
-// The profile's nonce is 64 random bytes, base64url-encoded, and this
-// package's signer emits unpadded base64url. Padded standard base64 is
-// accepted too: the Web Bot Auth architecture draft's own Appendix A nonces
-// and Cloudflare's web-bot-auth library use it. A nonce of any other length
+// as unpadded base64url (RFC 4648 §5) or padded standard base64 (§4): the
+// two forms Cloudflare's web-bot-auth validateNonce accepts. This package's
+// signer emits unpadded base64url. Padded standard base64 is what that
+// library's generateNonce and the Web Bot Auth architecture draft's
+// Appendix A nonces use. Padded base64url, and a nonce of any other length,
 // is refused.
 func validWBANonce(nonce string) bool {
-	for _, enc := range []*base64.Encoding{base64.RawURLEncoding, base64.URLEncoding, base64.StdEncoding} {
+	for _, enc := range []*base64.Encoding{base64.RawURLEncoding, base64.StdEncoding} {
 		b, err := enc.DecodeString(nonce)
 		if err == nil && len(b) == wbaNonceBytes && enc.EncodeToString(b) == nonce {
 			return true

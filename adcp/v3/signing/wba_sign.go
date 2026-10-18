@@ -121,7 +121,7 @@ func SignWebBotAuthRequest(r *http.Request, privateKey any, opts WBASignOptions)
 		nonce = b64UrlEncodeRaw(buf[:])
 	}
 	if !validWBANonce(nonce) {
-		return errors.New("signing: a Web Bot Auth nonce is 64 bytes, as unpadded base64url or padded base64")
+		return errors.New("signing: a Web Bot Auth nonce is 64 bytes, as unpadded base64url or padded standard base64")
 	}
 
 	staged := r.Header.Clone()
