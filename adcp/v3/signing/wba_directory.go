@@ -41,9 +41,10 @@ type DirectoryResponse struct {
 // checks:
 //   - status 200, a body of at most 256 KiB, and the media type
 //     application/http-message-signatures-directory+json (WBA §5.5.1);
-//   - strict JSON with 1 to 100 keys and no private key material. Keys the
-//     profile cannot use (key types other than Ed25519, RSA included, use other
-//     than sig, key_ops without verify) are skipped, at least one must
+//   - strict JSON with 1 to 100 keys and no private key material on any
+//     key, skipped or not (no d, p, q, dp, dq, qi, oth, or k member, in any
+//     case). Keys the profile cannot use (key types other than Ed25519, RSA
+//     included, use other than sig, key_ops without verify) are skipped, at least one must
 //     remain, and a kid, when present, does not affect lookup: a key is
 //     found by its thumbprint, which the request's keyid must equal;
 //   - the response signatures (WBA Appendix B.1), which the profile
@@ -171,7 +172,7 @@ func parseDirectoryKeys(body []byte) (map[string]JWK, error) {
 		// private member names under case folding too.
 		for name := range members {
 			switch strictjson.Fold(name) {
-			case strictjson.Fold("d"), strictjson.Fold("p"), strictjson.Fold("q"), strictjson.Fold("dp"), strictjson.Fold("dq"), strictjson.Fold("qi"), strictjson.Fold("k"):
+			case strictjson.Fold("d"), strictjson.Fold("p"), strictjson.Fold("q"), strictjson.Fold("dp"), strictjson.Fold("dq"), strictjson.Fold("qi"), strictjson.Fold("oth"), strictjson.Fold("k"):
 				return nil, errors.New("signing: key directory entry carries private key material")
 			}
 		}
