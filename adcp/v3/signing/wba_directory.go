@@ -52,7 +52,8 @@ type DirectoryResponse struct {
 //     "@authority";req and content-digest, naming the key's thumbprint as
 //     keyid, inside its validity window with no clock skew (so a created in
 //     the future is refused), and verifying under that key. A signature
-//     naming any other key (one the profile skipped, say) is not read.
+//     naming any other key (one the profile skipped, say) is not read, but
+//     must be well formed (RFC 9421 §4.1 and §4.2), as every member is.
 //
 // An unsigned directory, or one with a usable key that did not sign it, is
 // refused.
@@ -96,6 +97,9 @@ func verifyDirectoryResponse(origin string, resp *DirectoryResponse, now time.Ti
 	}
 	if !sameKeys(inputs.keys(), signatures.keys()) {
 		return nil, time.Time{}, errors.New("signing: key directory Signature and Signature-Input labels differ")
+	}
+	if !wbaFieldsWellFormed(inputs, signatures) {
+		return nil, time.Time{}, errors.New("signing: key directory Signature or Signature-Input member is malformed")
 	}
 	verified := map[string]struct{}{}
 	var earliest int64

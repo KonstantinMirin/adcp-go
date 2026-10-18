@@ -425,7 +425,8 @@ var errWBANotConfigured = errors.New("signing: Web Bot Auth verification require
 // verifies on its own: an intermediary that signs a request is its signer,
 // and whether it may act for another party is an authorization question,
 // not a second signature. Signature-Input members with another tag are
-// not read.
+// not read, but every member of both fields must be well formed (RFC 9421
+// §4.1 and §4.2): a malformed member under any label is 400.
 //
 // A failure is a *WBAError carrying the status to answer: 400 when the
 // signature fields do not parse, 429 with Accept-Signature and a fresh nonce
@@ -521,6 +522,9 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) (*VerifiedS
 	}
 	if !sameKeys(inputs.keys(), signatures.keys()) {
 		return nil, wbaFail(http.StatusBadRequest, "", "Signature and Signature-Input labels differ")
+	}
+	if !wbaFieldsWellFormed(inputs, signatures) {
+		return nil, wbaFail(http.StatusBadRequest, "", "Signature or Signature-Input member is malformed")
 	}
 	if count > 1 {
 		return nil, wbaFail(http.StatusForbidden, label, "more than one web-bot-auth signature")
@@ -741,6 +745,26 @@ func sameKeys(a, b []string) bool {
 	}
 	for _, k := range b {
 		if _, ok := set[k]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// wbaFieldsWellFormed reports whether every Signature-Input member is an
+// inner list and every Signature member an unparameterized byte sequence
+// (RFC 9421 §4.1 and §4.2), whatever its label. Cloudflare's
+// http-message-sig refuses a field that breaks either rule as malformed, so
+// a malformed member with another tag makes the field malformed too, though
+// nothing else is read from that member.
+func wbaFieldsWellFormed(inputs, signatures sfDict) bool {
+	for _, e := range inputs {
+		if !e.member.inner {
+			return false
+		}
+	}
+	for _, e := range signatures {
+		if e.member.inner || e.member.item.value.kind != sfBinary || len(e.member.item.params) != 0 {
 			return false
 		}
 	}

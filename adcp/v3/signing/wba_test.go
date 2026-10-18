@@ -667,6 +667,46 @@ func TestWBAReadsOnlyTheWebBotAuthSignature(t *testing.T) {
 	require.Equal(t, "sig1", signer.Label)
 }
 
+// TestWBAMalformedSignatureMemberIs400: RFC 9421 §4.2 defines every
+// Signature member as an unparameterized byte sequence and every
+// Signature-Input member as an inner list. A member that is not makes the
+// field malformed, 400, under any label, as Cloudflare's http-message-sig
+// answers (MalformedField). Nothing else is read from a sibling member.
+func TestWBAMalformedSignatureMemberIs400(t *testing.T) {
+	const sibling = `cdn=("@method" "@authority");created=1;keyid="edge";tag="cdn-edge"`
+	for _, tc := range []struct {
+		name, input, signature string
+	}{
+		{"sibling Signature member is a token", sibling, "cdn=token"},
+		{"sibling Signature member is an inner list", sibling, "cdn=(1 2)"},
+		{"sibling Signature member has a parameter", sibling, "cdn=:AAAA:;x=1"},
+		{"sibling Signature-Input member is a token", `cdn=token;tag="cdn-edge"`, "cdn=:AAAA:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newWBARig(t)
+			r := rig.signedRequest(t, `{"jsonrpc":"2.0","id":1}`)
+			r.Header.Set("Signature-Input", r.Header.Get("Signature-Input")+", "+tc.input)
+			r.Header.Set("Signature", r.Header.Get("Signature")+", "+tc.signature)
+			_, err := VerifyWebBotAuthRequest(r, rig.opts())
+			requireWBAStatus(t, err, http.StatusBadRequest)
+		})
+	}
+
+	for name, mutate := range map[string]func(string) string{
+		"web-bot-auth Signature member is a token":       func(string) string { return "sig1=token" },
+		"web-bot-auth Signature member has a parameter":  func(s string) string { return s + ";x=1" },
+		"web-bot-auth Signature member is an inner list": func(string) string { return "sig1=(1 2)" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			rig := newWBARig(t)
+			r := rig.signedRequest(t, `{"jsonrpc":"2.0","id":1}`)
+			r.Header.Set("Signature", mutate(r.Header.Get("Signature")))
+			_, err := VerifyWebBotAuthRequest(r, rig.opts())
+			requireWBAStatus(t, err, http.StatusBadRequest)
+		})
+	}
+}
+
 // replaceNonce swaps the nonce parameter of a serialized Signature-Input.
 func replaceNonce(input, nonce string) string {
 	start := strings.Index(input, `nonce="`) + len(`nonce="`)

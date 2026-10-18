@@ -106,6 +106,15 @@ func TestVerifyDirectoryResponseRejectsTampering(t *testing.T) {
 		{"plain JWK Set media type", func(r *DirectoryResponse) { r.Header.Set("Content-Type", "application/jwk-set+json") }, origin, wbaTestNow},
 		{"plain JSON media type", func(r *DirectoryResponse) { r.Header.Set("Content-Type", "application/json") }, origin, wbaTestNow},
 		{"no media type", func(r *DirectoryResponse) { r.Header.Del("Content-Type") }, origin, wbaTestNow},
+		// RFC 9421 §4.1 and §4.2, under any label, as http-message-sig parses.
+		{"a Signature member that is not a byte sequence", func(r *DirectoryResponse) {
+			r.Header.Set("Signature-Input", r.Header.Get("Signature-Input")+`, key9=("@authority";req "content-digest");created=1;expires=2;keyid="unknown";tag="`+DirectoryTag+`"`)
+			r.Header.Set("Signature", r.Header.Get("Signature")+", key9=token")
+		}, origin, wbaTestNow},
+		{"a Signature-Input member that is not an inner list", func(r *DirectoryResponse) {
+			r.Header.Set("Signature-Input", r.Header.Get("Signature-Input")+`, key9=token;tag="`+DirectoryTag+`"`)
+			r.Header.Set("Signature", r.Header.Get("Signature")+", key9=:AAAA:")
+		}, origin, wbaTestNow},
 		{"not 200", func(r *DirectoryResponse) { r.Status = http.StatusNotModified }, origin, wbaTestNow},
 		{"oversized", func(r *DirectoryResponse) { r.Body = make([]byte, directoryMaxBytes+1) }, origin, wbaTestNow},
 		{"served for another origin", func(*DirectoryResponse) {}, "https://evil.example.com", wbaTestNow},
