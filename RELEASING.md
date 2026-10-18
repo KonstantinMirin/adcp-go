@@ -36,7 +36,7 @@ What release-please does with that:
   pre-releases when a stable release exists.
 - The GitHub release is marked as a pre-release.
 - Do not land breaking-change commits (`feat!:` or a `BREAKING CHANGE:` footer)
-  under `adcp/`. release-please would propose `4.0.0-beta.*`, which is not a
+  under `adcp/v3/`. release-please would propose `4.0.0-beta.*`, which is not a
   valid version for the `adcp/v3` module path.
 
 Every other module (`urlcanon`, `registry`, `registry/redisstore`,
@@ -83,7 +83,7 @@ is needed, create a release branch then, not ahead of time:
    as a pre-release. Do not just delete the three keys: the default versioning
    strategy keeps the pre-release suffix and would propose `3.4.0-beta.N`
    (`feat`) or `3.3.1-beta.N` (`fix`).
-2. If no releasable `adcp/` commit has landed since the last beta, nothing
+2. If no releasable `adcp/v3/` commit has landed since the last beta, nothing
    opens a release PR. Either land one, or add `"release-as": "3.3.0"` instead
    and remove it in a follow-up PR once `adcp/v3.3.0` is tagged (otherwise
    every later release PR stays pinned to 3.3.0).
