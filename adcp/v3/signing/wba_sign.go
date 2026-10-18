@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/rsa"
 	"errors"
 	"fmt"
 	"io"
@@ -41,9 +40,9 @@ type WBASignOptions struct {
 // SignWebBotAuthRequest signs r under the opt-in Web Bot Auth profile. It
 // sets Signature-Agent to the agent's origin under the label and covers it,
 // and sets tag="web-bot-auth", a nonce of 64 random bytes (unpadded
-// base64url), the key's RFC 7638 thumbprint as keyid, and alg: ed25519 for
-// an ed25519.PrivateKey, rsa-pss-sha512 for an *rsa.PrivateKey of 2048 to
-// 8192 bits. Other keys, P-256 included, are refused. A request with a body
+// base64url), the key's RFC 7638 thumbprint as keyid, and alg="ed25519".
+// The key is an ed25519.PrivateKey; other keys, RSA and P-256 included, are
+// refused. A request with a body
 // must carry Content-Type; the signer sets Content-Digest and covers both.
 // Signatures use RFC 8941 sf-binary (standard Base64).
 //
@@ -164,15 +163,11 @@ func SignWebBotAuthRequest(r *http.Request, privateKey any, opts WBASignOptions)
 	return nil
 }
 
-// signWithKey signs base with a Web Bot Auth key: a raw Ed25519 signature,
-// or an RSASSA-PSS (SHA-512, 64-byte salt) signature.
+// signWithKey signs base with a Web Bot Auth key: a raw Ed25519 signature.
 func signWithKey(privateKey any, base []byte) ([]byte, error) {
-	switch k := privateKey.(type) {
-	case ed25519.PrivateKey:
-		return ed25519.Sign(k, base), nil
-	case *rsa.PrivateKey:
-		return signRSAPSS(k, base)
-	default:
+	k, ok := privateKey.(ed25519.PrivateKey)
+	if !ok {
 		return nil, fmt.Errorf("signing: unsupported private key type %T", privateKey)
 	}
+	return ed25519.Sign(k, base), nil
 }

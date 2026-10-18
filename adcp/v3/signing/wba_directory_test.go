@@ -2,8 +2,6 @@ package signing
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,9 +17,7 @@ import (
 )
 
 func TestSignKeyDirectoryRoundTrip(t *testing.T) {
-	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	require.NoError(t, err)
-	keys := []any{newEd25519(t), rsaKey}
+	keys := []any{newEd25519(t), newEd25519(t)}
 	resp, err := SignKeyDirectory("https://buyer.example.com/agent", keys, wbaTestNow, time.Hour)
 	require.NoError(t, err)
 	require.Equal(t, DirectoryMediaType, resp.Header.Get("Content-Type"))

@@ -226,7 +226,7 @@ func TestWBARejections(t *testing.T) {
 		{"alg not a Web Bot Auth algorithm", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
 			r.Header.Set("Signature-Input", strings.Replace(r.Header.Get("Signature-Input"), `alg="ed25519"`, `alg="ecdsa-p256-sha256"`, 1))
 		}, http.StatusForbidden, false},
-		{"alg does not match key", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
+		{"alg rsa-pss-sha512 (the profile is Ed25519 only)", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
 			r.Header.Set("Signature-Input", strings.Replace(r.Header.Get("Signature-Input"), `alg="ed25519"`, `alg="rsa-pss-sha512"`, 1))
 		}, http.StatusForbidden, false},
 		{"alg missing", body, func(t *testing.T, _ *wbaRig, r *http.Request) {

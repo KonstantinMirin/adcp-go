@@ -30,7 +30,7 @@ Everything here is **opt-in and experimental**.
 2. Sign with the Web Bot Auth profile:
 
    ```go
-   priv, _, _ := signing.LoadPrivateKey(pemBytes) // Ed25519 (PrivateKey may also be an *rsa.PrivateKey of 2048 to 8192 bits; P-256 is refused)
+   priv, _, _ := signing.LoadPrivateKey(pemBytes) // Ed25519 only: RSA and P-256 keys are refused
    client, _ := signing.NewSignedHTTPClient(signing.SignedHTTPClientOptions{
        PrivateKey:         priv,
        AgentOrigin:        "https://buyer.example.com",
@@ -39,7 +39,7 @@ Everything here is **opt-in and experimental**.
    })
    ```
 
-   `AgentOrigin` sets and covers `Signature-Agent`. The signature carries `tag="web-bot-auth"`, a 64-byte random nonce (unpadded base64url), the key's thumbprint as `keyid`, and `alg`: `ed25519`, or `rsa-pss-sha512` for an RSA key. Those are the profile's only algorithms, so a P-256 key cannot sign under Web Bot Auth; keep it for RFC 9421. A request carries exactly one Web Bot Auth signature, so an intermediary that forwards a request for someone else signs it as itself, and the brand's `brand.json` or `trust.json` says whether it may. `@target-uri` is the URI the request is sent to, unchanged. The digest is always covered on a body. With a `CapabilityProvider`, the client sends only when the seller lists `web-bot-auth`. Otherwise it returns `ErrWebBotAuthNotAdvertised` and never downgrades on its own. `identity.AdvertisedRequestSigningProfiles` reads the list from a capabilities response.
+   `AgentOrigin` sets and covers `Signature-Agent`. The signature carries `tag="web-bot-auth"`, a 64-byte random nonce (unpadded base64url), the key's thumbprint as `keyid`, and `alg="ed25519"`. Ed25519 is the profile's only algorithm, so an RSA or P-256 key cannot sign under Web Bot Auth; keep a P-256 key for RFC 9421. A request carries exactly one Web Bot Auth signature, so an intermediary that forwards a request for someone else signs it as itself, and the brand's `brand.json` or `trust.json` says whether it may. `@target-uri` is the URI the request is sent to, unchanged. The digest is always covered on a body. With a `CapabilityProvider`, the client sends only when the seller lists `web-bot-auth`. Otherwise it returns `ErrWebBotAuthNotAdvertised` and never downgrades on its own. `identity.AdvertisedRequestSigningProfiles` reads the list from a capabilities response.
 
 3. Serve the key directory on that origin, signed once per key (WBA Appendix B.1). The profile requires the signatures, and verifiers using this SDK refuse a plain JWK Set:
 
@@ -84,12 +84,12 @@ mw := signing.Middleware(signing.MiddlewareOptions{
 - **Authorities.** Set `Authorities` so that a signature captured at another seller cannot be replayed to this endpoint under that seller's `Host`.
 - **Layers.** Verification (`signing.VerifyWebBotAuthRequest`) needs only the key directory and replay state, so it can run in front of the server. Revocation, bindings, and grants are the authorization layer after it. The middleware runs both.
 - **One signature.** A request carries exactly one `web-bot-auth` signature and one `Signature-Agent` member. More is refused with `403` and `Accept-Signature`, even when each signature verifies.
-- **Required parameters.** `created`, `expires`, `keyid`, `alg`, `nonce`, and `tag`. `alg` is `ed25519` or `rsa-pss-sha512` and must match the directory key.
+- **Required parameters.** `created`, `expires`, `keyid`, `alg`, `nonce`, and `tag`. `alg` is `ed25519` and must match the directory key.
 - **Unsigned requests** that need a signature (an operation in `RequiredFor` or a method in `ProtocolMethodsRequiredFor`, read by exact member name, a body carrying `push_notification_config.authentication` under any letter case, or a body that is not strict JSON) get `401` with `request_signature_required` plus `Accept-Signature` for Web Bot Auth, since the middleware also accepts the RFC 9421 profile. A seller that advertises only `web-bot-auth` sets `WebBotAuthOptions.Exclusive`: those requests get `403` with `Accept-Signature`, and every signed request is verified under Web Bot Auth.
 - **Interop.**
   - Nonces must be 64 bytes, as unpadded base64url (the profile's encoding) or padded standard base64 (which Cloudflare's library and the WBA architecture draft's own vectors use). These are the two forms Cloudflare's `validateNonce` accepts; padded base64url is refused.
   - `@target-uri` is the target URI as received, percent-encoding included (RFC 9421 §2.2.2), so `/a%7Eb/mcp/` is signed and verified as sent. `@authority` is normalized (§2.2.3). The canonical origin is used only for the `Signature-Agent` identity.
-  - RSA keys verify with `rsa-pss-sha512` (2048 to 8192 bits), as in the draft's Appendix E vectors.
+  - Keys are Ed25519 only. A directory that also lists an RSA key, or any other key the profile cannot use, skips that key, and the key needs no directory signature.
   - Cross-implementation fixtures from the TypeScript SDK, generated against Cloudflare's `web-bot-auth@0.2.0` and `http-message-sig@0.3.0`, are vendored under `adcp/v3/signing/testdata/wba-interop/` (provenance in `UPSTREAM.json`). The Go verifier accepts both the Cloudflare-signed and the TypeScript-signed requests and their signed directories, percent-encoded path included, and builds the same signature base. With the fixtures' `created` and nonce, the Go signer reproduces the TypeScript signatures byte for byte.
 - **Key directories.** Directories must be served as `application/http-message-signatures-directory+json` (WBA §5.5.1), and signed, one signature per usable key (WBA Appendix B.1). A directory with another media type is invalid. An unsigned directory, or one with a key that did not sign it, is a discovery failure.
   - **Discovery failures** (WBA §6.10) cover a directory that doesn't resolve: network or TLS error, timeout, any status other than `200` (including 404, 410, 429, 5xx), an invalid directory, or a fetch refused by the resolver's own limits.

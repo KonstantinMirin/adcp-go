@@ -42,7 +42,7 @@ type DirectoryResponse struct {
 //   - status 200, a body of at most 256 KiB, and the media type
 //     application/http-message-signatures-directory+json (WBA §5.5.1);
 //   - strict JSON with 1 to 100 keys and no private key material. Keys the
-//     profile cannot use (key types other than Ed25519 and RSA, use other
+//     profile cannot use (key types other than Ed25519, RSA included, use other
 //     than sig, key_ops without verify) are skipped, at least one must
 //     remain, and a kid, when present, does not affect lookup: a key is
 //     found by its thumbprint, which the request's keyid must equal;
@@ -203,9 +203,9 @@ func parseDirectoryKeys(body []byte) (map[string]JWK, error) {
 }
 
 // SignKeyDirectory builds the signed key directory response an origin
-// serves at DirectoryPath (WBA §5.5 and Appendix B.1). Each private key
-// (ed25519.PrivateKey, or *rsa.PrivateKey of 2048 to 8192 bits) is published as its
-// PublicDirectoryKey and signs the response once, covering "@authority";req
+// serves at DirectoryPath (WBA §5.5 and Appendix B.1). Each private key, an
+// ed25519.PrivateKey, is published as its PublicDirectoryKey and signs the
+// response once, covering "@authority";req
 // and content-digest. created is the signatures' created time (time.Now
 // minus DirectorySkewAllowance when zero) and lifetime their validity from
 // created (DefaultDirectoryLifetime when zero). Serve Body byte for byte

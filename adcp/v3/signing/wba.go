@@ -555,10 +555,10 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) (*VerifiedS
 	if !ok || !validWBANonce(nonce) {
 		return nil, wbaFail(http.StatusForbidden, label, "missing nonce, or not 64 bytes in canonical base64")
 	}
-	// alg is required and names one of the profile's two algorithms; it
-	// must also match the directory key (wbaVerifyCrypto).
-	if alg, ok := stringParam(member.params, "alg"); !ok || (Algorithm(alg) != AlgEd25519 && Algorithm(alg) != AlgRSAPSSSHA512) {
-		return nil, wbaFail(http.StatusForbidden, label, "alg must be ed25519 or rsa-pss-sha512")
+	// alg is required and names the profile's one algorithm; it must also
+	// match the directory key (wbaVerifyCrypto).
+	if alg, ok := stringParam(member.params, "alg"); !ok || Algorithm(alg) != AlgEd25519 {
+		return nil, wbaFail(http.StatusForbidden, label, "alg must be ed25519")
 	}
 	agent, ok := agents.get(label)
 	if !ok || agent.inner || agent.item.value.kind != sfString {
@@ -870,25 +870,16 @@ func wbaSignatureBase(method, rawURL string, h http.Header, member sfMember, dir
 }
 
 // wbaKeyAlgorithm derives the signature algorithm from a directory key and
-// checks the key may verify: Ed25519 (ed25519) or RSA (2048 to 8192 bits,
-// rsa-pss-sha512), the profile's two algorithms; use "sig" when present, no
-// private member, a matching alg when present, and key_ops containing
-// "verify" when present. Any other key, P-256 included, is not a Web Bot
-// Auth key: ES256 stays on the AdCP RFC 9421 profile.
+// checks the key may verify: Ed25519 (ed25519), the profile's one
+// algorithm; use "sig" when present, no private member, a matching alg when
+// present, and key_ops containing "verify" when present. Any other key is
+// not a Web Bot Auth key: RSA is not part of the profile, and ES256 stays on
+// the AdCP RFC 9421 profile.
 func wbaKeyAlgorithm(jwk JWK) (Algorithm, error) {
-	var alg Algorithm
-	var jwsAlg string
-	switch {
-	case jwk.Kty == "OKP" && jwk.Crv == "Ed25519":
-		alg, jwsAlg = AlgEd25519, string(jwkAlgEdDSA)
-	case jwk.Kty == "RSA" && jwk.Crv == "":
-		if _, err := rsaPublicKey(jwk); err != nil {
-			return "", wbaFail(http.StatusForbidden, "", "unsupported RSA directory key")
-		}
-		alg, jwsAlg = AlgRSAPSSSHA512, jwkAlgPS512
-	default:
+	if jwk.Kty != "OKP" || jwk.Crv != "Ed25519" {
 		return "", wbaFail(http.StatusForbidden, "", "unsupported directory key")
 	}
+	alg, jwsAlg := AlgEd25519, string(jwkAlgEdDSA)
 	if (jwk.Use != "" && jwk.Use != "sig") || jwk.PrivateD != "" || jwk.TestOnlyPrivateD != "" {
 		return "", wbaFail(http.StatusForbidden, "", "directory key is not a public signing key")
 	}
@@ -937,6 +928,13 @@ func wbaVerifyCrypto(member, signature sfMember, jwk JWK, base string) (Algorith
 		return "", wbaFail(http.StatusForbidden, "", "signature did not verify")
 	}
 	return alg, nil
+}
+
+// verifyWithJWK verifies sig over base under a Web Bot Auth directory key
+// with the algorithm wbaKeyAlgorithm derived for it.
+func verifyWithJWK(alg Algorithm, jwk JWK, base, sig []byte) bool {
+	pub, err := jwk.PublicKey()
+	return err == nil && verifySignature(alg, pub, base, sig)
 }
 
 // wbaDigestMatches reports whether the Content-Digest sha-256 member equals
