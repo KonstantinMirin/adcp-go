@@ -23,8 +23,8 @@ type JWK struct {
 	X       string   `json:"x,omitempty"`
 	Y       string   `json:"y,omitempty"`
 	// N and E are an RSA key's modulus and exponent. No profile verifies
-	// with RSA keys; they are decoded so that JWKThumbprint covers RSA and a
-	// Web Bot Auth key directory can skip an RSA key it lists.
+	// with RSA keys; they are decoded so that JWKThumbprint covers RSA. A Web
+	// Bot Auth key directory skips an RSA key by its kty alone.
 	N string `json:"n,omitempty"`
 	E string `json:"e,omitempty"`
 
