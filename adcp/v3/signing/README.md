@@ -257,7 +257,7 @@ The verifier implements all 14 checks (13 numbered + 9a) of the [verifier checkl
 
 ## Web Bot Auth (experimental, AdCP 3.3)
 
-The [Web Bot Auth profile](https://adcontextprotocol.org/docs/building/by-layer/L1/wba-profile) identifies a signer by its origin. The signer names the origin in a covered `Signature-Agent` member. The verifier fetches the origin's key directory at `/.well-known/http-message-signatures-directory` and looks keys up by `(origin, RFC 7638 thumbprint)`. There is no capabilities call and no keyid-to-agent map. Everything here is opt-in, and the default signer never emits or covers `Signature-Agent`.
+The [Web Bot Auth profile](https://adcontextprotocol.org/docs/building/by-layer/L1/wba-profile) identifies a signer by its origin. The signer names the origin in a covered `Signature-Agent` member, whose value must be exactly the canonical `https` origin: a lowercase host, no default port, and no trailing slash, path, query, fragment, or userinfo (WBA §5.2.1 and §5.5). The verifier refuses any other value with `403` before it fetches a directory. The verifier fetches the origin's key directory at `/.well-known/http-message-signatures-directory` and looks keys up by `(origin, RFC 7638 thumbprint)`. There is no capabilities call and no keyid-to-agent map. Everything here is opt-in, and the default signer never emits or covers `Signature-Agent`.
 
 Buyer side:
 

@@ -667,6 +667,40 @@ func TestWBAReadsOnlyTheWebBotAuthSignature(t *testing.T) {
 	require.Equal(t, "sig1", signer.Label)
 }
 
+// TestWBASignatureAgentIsExactlyAnOrigin: the Signature-Agent member value
+// is the signer's origin, an https origin with no path (WBA §5.2.1 and
+// §5.5), spelled exactly as its canonical form. Any other spelling, a path,
+// a query, a fragment, or userinfo is refused with 403 before any directory
+// is fetched. Each refused request carries a valid signature.
+func TestWBASignatureAgentIsExactlyAnOrigin(t *testing.T) {
+	rig := newWBARig(t)
+	signer, err := VerifyWebBotAuthRequest(rig.signWithAgent(t, rig.origin), rig.opts())
+	require.NoError(t, err)
+	require.Equal(t, rig.origin, signer.AgentURL)
+
+	for name, value := range map[string]string{
+		"trailing slash":           rig.origin + "/",
+		"path":                     rig.origin + "/agents/a",
+		"the well-known URI":       rig.origin + DirectoryPath,
+		"query":                    rig.origin + "?v=1",
+		"fragment":                 rig.origin + "#k",
+		"uppercase host":           "https://BUYER.example.com",
+		"default port spelled out": "https://buyer.example.com:443",
+		"userinfo":                 "https://u@buyer.example.com",
+		"http":                     "http://buyer.example.com",
+	} {
+		t.Run(name, func(t *testing.T) {
+			opts := rig.opts()
+			opts.Keys = NewDirectoryResolver(DirectoryResolverOptions{Fetch: rig.dirs.fetch, Clock: wbaClock})
+			before := rig.dirs.count(rig.origin)
+			_, err := VerifyWebBotAuthRequest(rig.signWithAgent(t, value), opts)
+			we := requireWBAError(t, err, http.StatusForbidden)
+			require.False(t, we.DiscoveryFailure)
+			require.Equal(t, before, rig.dirs.count(rig.origin), "refused before any directory fetch")
+		})
+	}
+}
+
 // TestWBAMalformedSignatureMemberIs400: RFC 9421 §4.2 defines every
 // Signature member as an unparameterized byte sequence and every
 // Signature-Input member as an inner list. A member that is not makes the

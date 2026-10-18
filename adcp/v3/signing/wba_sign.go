@@ -49,6 +49,16 @@ type WBASignOptions struct {
 // A request carries exactly one Web Bot Auth signature, so a request that
 // already carries Signature, Signature-Input, or Signature-Agent is refused.
 func SignWebBotAuthRequest(r *http.Request, privateKey any, opts WBASignOptions) error {
+	origin, err := webBotAuthOrigin(opts.AgentOrigin)
+	if err != nil {
+		return fmt.Errorf("signing: agent origin: %w", err)
+	}
+	return signWebBotAuthRequest(r, privateKey, opts, origin)
+}
+
+// signWebBotAuthRequest signs r with origin as its Signature-Agent member
+// value, used as given. opts.AgentOrigin is not read.
+func signWebBotAuthRequest(r *http.Request, privateKey any, opts WBASignOptions, origin string) error {
 	if r == nil {
 		return errors.New("signing: nil request")
 	}
@@ -62,10 +72,6 @@ func SignWebBotAuthRequest(r *http.Request, privateKey any, opts WBASignOptions)
 	}
 	if !isValidLabel(opts.Label) {
 		return fmt.Errorf("signing: invalid signature label %q", opts.Label)
-	}
-	origin, err := webBotAuthOrigin(opts.AgentOrigin)
-	if err != nil {
-		return fmt.Errorf("signing: agent origin: %w", err)
 	}
 	window := opts.ValidityWindow
 	if window == 0 {

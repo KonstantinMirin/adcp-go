@@ -33,11 +33,28 @@ func CanonicalOrigin(rawURL string) (string, error) {
 	return u.Scheme + "://" + u.Host, nil
 }
 
-// webBotAuthOrigin validates a Signature-Agent value (or any URL naming a
-// Web Bot Auth identity) and returns its canonical origin: HTTPS, no
+// signatureAgentOrigin returns the origin a Signature-Agent member value
+// names. The value must be an https origin with no path (WBA §5.2.1 and
+// §5.5), spelled exactly as its canonical origin: a lowercase host, no
+// default port, and no trailing slash, path, query, fragment, or userinfo.
+// One identity therefore has one spelling on the wire.
+func signatureAgentOrigin(value string) (string, error) {
+	origin, err := webBotAuthOrigin(value)
+	if err != nil {
+		return "", err
+	}
+	if value != origin {
+		return "", errors.New("signing: Signature-Agent is not a canonical https origin")
+	}
+	return origin, nil
+}
+
+// webBotAuthOrigin validates a URL naming a Web Bot Auth identity (a
+// signer's AgentOrigin, say) and returns its canonical origin: HTTPS, no
 // userinfo, no whitespace or control characters, and a host that passes the
-// static SSRF rules. A path is permitted and discarded, as in the Python
-// SDK; the identity is the origin.
+// static SSRF rules. A path is permitted and discarded; the identity is the
+// origin. A Signature-Agent value must be the origin itself
+// (signatureAgentOrigin).
 func webBotAuthOrigin(rawURL string) (string, error) {
 	for i := 0; i < len(rawURL); i++ {
 		if rawURL[i] < 0x21 || rawURL[i] == 0x7f {

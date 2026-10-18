@@ -571,7 +571,7 @@ func verifyWebBotAuthRequest(r *http.Request, opts WBAVerifyOptions) (*VerifiedS
 	if typ, present := sfParamValue(agent.item.params, "type"); present && (typ.kind != sfToken && typ.kind != sfString || typ.s != "directory") {
 		return nil, wbaFail(http.StatusForbidden, label, "unsupported Signature-Agent member type")
 	}
-	origin, err := webBotAuthOrigin(agent.item.value.s)
+	origin, err := signatureAgentOrigin(agent.item.value.s)
 	if err != nil {
 		return nil, &WBAError{Status: http.StatusForbidden, Label: label, Reason: "invalid signer origin", Wrapped: err}
 	}
