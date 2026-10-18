@@ -218,9 +218,9 @@ jobs:
     timeout-minutes: 10
     env:
       # adcontextprotocol/adcp commit whose tests/wba-interop/ harness and
-      # wba-profile vectors grade this SDK. Placeholder: replace it with the
-      # commit that adds the harness once that commit merges.
-      ADCP_REF: "0000000000000000000000000000000000000000"
+      # wba-profile vectors grade this SDK: the head of adcp#8298. Move it to
+      # the merge commit once that pull request merges.
+      ADCP_REF: "a7708e41fbcf0da84273a988c519b25a14b41dbc"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
