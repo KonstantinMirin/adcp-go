@@ -4,7 +4,7 @@ This note covers the experimental AdCP 3.3 agent-identity support in `github.com
 
 Everything here is **opt-in and experimental**.
 - **Wire pin.** It is unchanged: `adcp/v3/schemas/VERSION` stays at 3.2.x, and nothing advertises 3.3.
-- **Pinned drafts.** The Web Bot Auth wire rules and vectors are pinned to adcontextprotocol/adcp#7894 at `e5929470` (provenance and checksums in [`adcp/v3/signing/testdata/wba-profile/UPSTREAM.json`](../adcp/v3/signing/testdata/wba-profile/UPSTREAM.json)). The identity schemas are pinned to the draft commits in [`adcp/v3/identity/testdata/schemas/UPSTREAM.json`](../adcp/v3/identity/testdata/schemas/UPSTREAM.json).
+- **Pinned drafts.** The Web Bot Auth wire rules and vectors are pinned to adcontextprotocol/adcp#7894, as carried by adcontextprotocol/adcp#8298 at `f44785a5` (provenance and checksums in [`adcp/v3/signing/testdata/wba-profile/UPSTREAM.json`](../adcp/v3/signing/testdata/wba-profile/UPSTREAM.json)). The identity schemas are pinned to the draft commits in [`adcp/v3/identity/testdata/schemas/UPSTREAM.json`](../adcp/v3/identity/testdata/schemas/UPSTREAM.json).
 - **Change.** Both may still change before 3.3 ships.
 - **Default behavior.** Existing APIs behave exactly as before unless you set the new options.
 
