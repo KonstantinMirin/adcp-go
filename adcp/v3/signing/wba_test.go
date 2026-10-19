@@ -226,7 +226,7 @@ func TestWBARejections(t *testing.T) {
 		{"alg not a Web Bot Auth algorithm", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
 			r.Header.Set("Signature-Input", strings.Replace(r.Header.Get("Signature-Input"), `alg="ed25519"`, `alg="ecdsa-p256-sha256"`, 1))
 		}, http.StatusForbidden, false},
-		{"alg does not match key", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
+		{"alg rsa-pss-sha512 (the profile is Ed25519 only)", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
 			r.Header.Set("Signature-Input", strings.Replace(r.Header.Get("Signature-Input"), `alg="ed25519"`, `alg="rsa-pss-sha512"`, 1))
 		}, http.StatusForbidden, false},
 		{"alg missing", body, func(t *testing.T, _ *wbaRig, r *http.Request) {
@@ -655,6 +655,92 @@ func TestWBAAuthorities(t *testing.T) {
 	requireWBAStatus(t, err, http.StatusForbidden)
 }
 
+// TestWBAReadsOnlyTheWebBotAuthSignature: a second signature with another
+// tag, such as one a CDN adds, is not read, even when it does not verify.
+func TestWBAReadsOnlyTheWebBotAuthSignature(t *testing.T) {
+	rig := newWBARig(t)
+	r := rig.signedRequest(t, `{"jsonrpc":"2.0","id":1}`)
+	r.Header.Set("Signature-Input", r.Header.Get("Signature-Input")+`, cdn=("@method" "@authority");created=1;keyid="edge";tag="cdn-edge"`)
+	r.Header.Set("Signature", r.Header.Get("Signature")+", cdn=:AAAA:")
+	signer, err := VerifyWebBotAuthRequest(r, rig.opts())
+	require.NoError(t, err)
+	require.Equal(t, "sig1", signer.Label)
+}
+
+// TestWBASignatureAgentIsExactlyAnOrigin: the Signature-Agent member value
+// is the signer's origin, an https origin with no path (WBA §5.2.1 and
+// §5.5), spelled exactly as its canonical form. Any other spelling, a path,
+// a query, a fragment, or userinfo is refused with 403 before any directory
+// is fetched. Each refused request carries a valid signature.
+func TestWBASignatureAgentIsExactlyAnOrigin(t *testing.T) {
+	rig := newWBARig(t)
+	signer, err := VerifyWebBotAuthRequest(rig.signWithAgent(t, rig.origin), rig.opts())
+	require.NoError(t, err)
+	require.Equal(t, rig.origin, signer.AgentURL)
+
+	for name, value := range map[string]string{
+		"trailing slash":           rig.origin + "/",
+		"path":                     rig.origin + "/agents/a",
+		"the well-known URI":       rig.origin + DirectoryPath,
+		"query":                    rig.origin + "?v=1",
+		"fragment":                 rig.origin + "#k",
+		"uppercase host":           "https://BUYER.example.com",
+		"default port spelled out": "https://buyer.example.com:443",
+		"userinfo":                 "https://u@buyer.example.com",
+		"http":                     "http://buyer.example.com",
+	} {
+		t.Run(name, func(t *testing.T) {
+			opts := rig.opts()
+			opts.Keys = NewDirectoryResolver(DirectoryResolverOptions{Fetch: rig.dirs.fetch, Clock: wbaClock})
+			before := rig.dirs.count(rig.origin)
+			_, err := VerifyWebBotAuthRequest(rig.signWithAgent(t, value), opts)
+			we := requireWBAError(t, err, http.StatusForbidden)
+			require.False(t, we.DiscoveryFailure)
+			require.Equal(t, before, rig.dirs.count(rig.origin), "refused before any directory fetch")
+		})
+	}
+}
+
+// TestWBAMalformedSignatureMemberIs400: RFC 9421 §4.2 defines every
+// Signature member as an unparameterized byte sequence and every
+// Signature-Input member as an inner list. A member that is not makes the
+// field malformed, 400, under any label, as Cloudflare's http-message-sig
+// answers (MalformedField). Nothing else is read from a sibling member.
+func TestWBAMalformedSignatureMemberIs400(t *testing.T) {
+	const sibling = `cdn=("@method" "@authority");created=1;keyid="edge";tag="cdn-edge"`
+	for _, tc := range []struct {
+		name, input, signature string
+	}{
+		{"sibling Signature member is a token", sibling, "cdn=token"},
+		{"sibling Signature member is an inner list", sibling, "cdn=(1 2)"},
+		{"sibling Signature member has a parameter", sibling, "cdn=:AAAA:;x=1"},
+		{"sibling Signature-Input member is a token", `cdn=token;tag="cdn-edge"`, "cdn=:AAAA:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newWBARig(t)
+			r := rig.signedRequest(t, `{"jsonrpc":"2.0","id":1}`)
+			r.Header.Set("Signature-Input", r.Header.Get("Signature-Input")+", "+tc.input)
+			r.Header.Set("Signature", r.Header.Get("Signature")+", "+tc.signature)
+			_, err := VerifyWebBotAuthRequest(r, rig.opts())
+			requireWBAStatus(t, err, http.StatusBadRequest)
+		})
+	}
+
+	for name, mutate := range map[string]func(string) string{
+		"web-bot-auth Signature member is a token":       func(string) string { return "sig1=token" },
+		"web-bot-auth Signature member has a parameter":  func(s string) string { return s + ";x=1" },
+		"web-bot-auth Signature member is an inner list": func(string) string { return "sig1=(1 2)" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			rig := newWBARig(t)
+			r := rig.signedRequest(t, `{"jsonrpc":"2.0","id":1}`)
+			r.Header.Set("Signature", mutate(r.Header.Get("Signature")))
+			_, err := VerifyWebBotAuthRequest(r, rig.opts())
+			requireWBAStatus(t, err, http.StatusBadRequest)
+		})
+	}
+}
+
 // replaceNonce swaps the nonce parameter of a serialized Signature-Input.
 func replaceNonce(input, nonce string) string {
 	start := strings.Index(input, `nonce="`) + len(`nonce="`)
@@ -662,11 +748,13 @@ func replaceNonce(input, nonce string) string {
 	return input[:start] + nonce + input[end:]
 }
 
-// TestWBANonceEncodings: the signer emits 64 random bytes as unpadded
-// base64url, the profile's encoding; the verifier accepts exactly 64 bytes
-// as base64url (unpadded or padded) or padded standard base64, the encoding
-// Cloudflare's web-bot-auth library and the WBA architecture draft's
-// Appendix A vectors use.
+// TestWBANonceEncodings: this signer emits 64 random bytes as unpadded
+// base64url (the profile states no preference for signers); the verifier
+// accepts exactly 64 bytes as unpadded base64url or padded standard base64,
+// the two forms Cloudflare's web-bot-auth validateNonce accepts. Padded
+// standard base64 is the encoding its generateNonce and the WBA
+// architecture draft's Appendix A vectors use. Padded base64url is refused,
+// as validateNonce refuses it.
 func TestWBANonceEncodings(t *testing.T) {
 	rig := newWBARig(t)
 	r := rig.signedRequest(t, "")
@@ -686,17 +774,15 @@ func TestWBANonceEncodings(t *testing.T) {
 	_, err = VerifyWebBotAuthRequest(r, rig.opts())
 	require.NoError(t, err, "padded standard base64 is accepted")
 
-	padded := base64.URLEncoding.EncodeToString(bytes.Repeat([]byte{0xfb, 0xff}, 32))
-	require.Contains(t, padded, "_")
-	r = httptest.NewRequest(http.MethodGet, "https://seller.example.com/adcp/get_principal", nil)
-	require.NoError(t, SignWebBotAuthRequest(r, rig.key, WBASignOptions{AgentOrigin: rig.origin, Clock: wbaClock, NonceOverride: padded}))
-	_, err = VerifyWebBotAuthRequest(r, rig.opts())
-	require.NoError(t, err, "padded base64url is base64url (RFC 4648 §5)")
+	paddedURL := base64.URLEncoding.EncodeToString(bytes.Repeat([]byte{0xfb, 0xff}, 32))
+	require.Contains(t, paddedURL, "_")
+	require.True(t, strings.HasSuffix(paddedURL, "=="))
 
 	for _, bad := range []string{
 		base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
 		base64.RawURLEncoding.EncodeToString(make([]byte, 63)),
 		base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{0xfb}, 64)),
+		paddedURL,
 	} {
 		require.False(t, validWBANonce(bad), bad)
 		require.Error(t, SignWebBotAuthRequest(httptest.NewRequest(http.MethodGet, "https://s.example.com/", nil), rig.key,
