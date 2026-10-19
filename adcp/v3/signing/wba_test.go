@@ -748,12 +748,13 @@ func replaceNonce(input, nonce string) string {
 	return input[:start] + nonce + input[end:]
 }
 
-// TestWBANonceEncodings: the signer emits 64 random bytes as unpadded
-// base64url, the profile's encoding; the verifier accepts exactly 64 bytes
-// as unpadded base64url or padded standard base64, the two forms
-// Cloudflare's web-bot-auth validateNonce accepts. Padded standard base64 is
-// the encoding its generateNonce and the WBA architecture draft's Appendix A
-// vectors use. Padded base64url is refused, as validateNonce refuses it.
+// TestWBANonceEncodings: this signer emits 64 random bytes as unpadded
+// base64url (the profile states no preference for signers); the verifier
+// accepts exactly 64 bytes as unpadded base64url or padded standard base64,
+// the two forms Cloudflare's web-bot-auth validateNonce accepts. Padded
+// standard base64 is the encoding its generateNonce and the WBA
+// architecture draft's Appendix A vectors use. Padded base64url is refused,
+// as validateNonce refuses it.
 func TestWBANonceEncodings(t *testing.T) {
 	rig := newWBARig(t)
 	r := rig.signedRequest(t, "")
