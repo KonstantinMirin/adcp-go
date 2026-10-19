@@ -3,6 +3,7 @@ package signing
 import (
 	"errors"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/adcontextprotocol/adcp-go/adcp/v3/internal/safefetch"
@@ -43,10 +44,20 @@ func signatureAgentOrigin(value string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if value != origin {
+	u, err := url.Parse(origin)
+	if err != nil || value != origin || !canonicalPort(u.Port()) {
 		return "", errors.New("signing: Signature-Agent is not a canonical https origin")
 	}
 	return origin, nil
+}
+
+// canonicalPort reports whether port is empty or spelled as its decimal
+// value, 0 to 65535. Canonicalization strips a default port by comparing
+// strings, so a port with a leading zero (0443, 08443) or out of range
+// (99999) survives it.
+func canonicalPort(port string) bool {
+	n, err := strconv.ParseUint(port, 10, 16)
+	return port == "" || (err == nil && strconv.FormatUint(n, 10) == port)
 }
 
 // webBotAuthOrigin validates a URL naming a Web Bot Auth identity (a

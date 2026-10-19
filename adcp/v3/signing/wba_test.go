@@ -679,15 +679,18 @@ func TestWBASignatureAgentIsExactlyAnOrigin(t *testing.T) {
 	require.Equal(t, rig.origin, signer.AgentURL)
 
 	for name, value := range map[string]string{
-		"trailing slash":           rig.origin + "/",
-		"path":                     rig.origin + "/agents/a",
-		"the well-known URI":       rig.origin + DirectoryPath,
-		"query":                    rig.origin + "?v=1",
-		"fragment":                 rig.origin + "#k",
-		"uppercase host":           "https://BUYER.example.com",
-		"default port spelled out": "https://buyer.example.com:443",
-		"userinfo":                 "https://u@buyer.example.com",
-		"http":                     "http://buyer.example.com",
+		"trailing slash":                   rig.origin + "/",
+		"path":                             rig.origin + "/agents/a",
+		"the well-known URI":               rig.origin + DirectoryPath,
+		"query":                            rig.origin + "?v=1",
+		"fragment":                         rig.origin + "#k",
+		"uppercase host":                   "https://BUYER.example.com",
+		"default port spelled out":         "https://buyer.example.com:443",
+		"default port with a leading zero": "https://buyer.example.com:0443",
+		"port with a leading zero":         "https://buyer.example.com:08443",
+		"port out of range":                "https://buyer.example.com:99999",
+		"userinfo":                         "https://u@buyer.example.com",
+		"http":                             "http://buyer.example.com",
 	} {
 		t.Run(name, func(t *testing.T) {
 			opts := rig.opts()
