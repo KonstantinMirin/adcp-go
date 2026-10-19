@@ -18,10 +18,19 @@
 // response. now is a Unix time in seconds and is the only clock the SDK reads.
 // The adapter verifies each request in prior with the same replay store
 // before the graded request, so the harness builds replay state without
-// knowing how the SDK stores it. A failure is {ok: false, status, rule,
-// error}: status is the HTTP status the SDK assigns (0 when it assigns none),
-// and rule is "discovery" for a key discovery failure, the AdCP error code for
-// an authorization failure, and "signature" for any other signature failure.
+// knowing how the SDK stores it.
+//
+// A refusal is {ok: false, status, rule, error}, and the adapter writes one
+// only for an SDK verification refusal: a *signing.WBAError from
+// VerifyWebBotAuthRequest, or an error from VerifyDirectoryResponse. status is
+// the HTTP status the SDK assigns (0 when it assigns none), and rule is
+// "discovery" for a key discovery failure, the AdCP error code for an
+// authorization failure, "signature" for any other request signature failure,
+// and "directory" for a directory refusal. Any other error (an operation the
+// adapter cannot read, a signer error, an untyped verifier error, or a prior
+// request that does not verify) is an adapter failure: the adapter writes it
+// to standard error and exits 1 with nothing on standard output, so the
+// harness never reads it as a refusal.
 package main
 
 import (
@@ -62,22 +71,28 @@ type operation struct {
 }
 
 func main() {
-	raw, err := io.ReadAll(os.Stdin)
+	out, err := runInput(os.Stdin)
 	if err != nil {
-		write(failure(0, "adapter", err))
-		return
+		fmt.Fprintln(os.Stderr, "wbainterop:", err)
+		os.Exit(1)
+	}
+	_ = json.NewEncoder(os.Stdout).Encode(out)
+}
+
+func runInput(r io.Reader) (any, error) {
+	raw, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
 	}
 	var op operation
 	if err := json.Unmarshal(raw, &op); err != nil {
-		write(failure(0, "adapter", err))
-		return
+		return nil, err
 	}
-	write(run(op))
+	return run(op)
 }
 
-func write(v any) { _ = json.NewEncoder(os.Stdout).Encode(v) }
-
-func run(op operation) any {
+// run returns the operation's result, or an adapter failure as the error.
+func run(op operation) (any, error) {
 	switch op.Op {
 	case "sign_request":
 		return signRequest(op)
@@ -88,26 +103,28 @@ func run(op operation) any {
 	case "verify_directory":
 		return verifyDirectory(op)
 	default:
-		return failure(0, "adapter", fmt.Errorf("unknown operation %q", op.Op))
+		return nil, fmt.Errorf("unknown operation %q", op.Op)
 	}
 }
 
-func failure(status int, rule string, err error) map[string]any {
+func refusal(status int, rule string, err error) map[string]any {
 	return map[string]any{"ok": false, "status": status, "rule": rule, "error": err.Error()}
 }
 
-// sdkFailure reports err with the status and reason the SDK assigned.
-func sdkFailure(err error) map[string]any {
+// requestRefusal reports a request verification refusal with the status and
+// reason the SDK assigned. An error that is not a *signing.WBAError is not a
+// refusal, and is returned as an adapter failure.
+func requestRefusal(err error) (any, error) {
 	we := signing.AsWBAError(err)
 	switch {
 	case we == nil:
-		return failure(0, "error", err)
+		return nil, fmt.Errorf("verifier returned an error that is not a refusal: %w", err)
 	case we.DiscoveryFailure:
-		return failure(we.Status, "discovery", err)
+		return refusal(we.Status, "discovery", err), nil
 	case we.Code != "":
-		return failure(we.Status, we.Code, err)
+		return refusal(we.Status, we.Code, err), nil
 	default:
-		return failure(we.Status, "signature", err)
+		return refusal(we.Status, "signature", err), nil
 	}
 }
 
@@ -145,10 +162,10 @@ func directoryURL(origin string) string {
 	return strings.TrimSuffix(origin, "/") + signing.DirectoryPath
 }
 
-func signRequest(op operation) any {
+func signRequest(op operation) (any, error) {
 	key, err := privateKey(op.Key)
 	if err != nil {
-		return failure(0, "key", err)
+		return nil, err
 	}
 	var body io.Reader
 	if op.Request.Body != "" {
@@ -156,21 +173,21 @@ func signRequest(op operation) any {
 	}
 	req, err := http.NewRequest(op.Request.Method, op.Request.URL, body)
 	if err != nil {
-		return failure(0, "request", err)
+		return nil, err
 	}
 	req.Header = header(op.Request.Headers)
 	if err := signing.SignWebBotAuthRequest(req, key, signing.WBASignOptions{AgentOrigin: op.Origin, Clock: clock(op.Now)}); err != nil {
-		return sdkFailure(err)
+		return nil, err
 	}
-	return message{Method: op.Request.Method, URL: op.Request.URL, Headers: flatten(req.Header), Body: op.Request.Body}
+	return message{Method: op.Request.Method, URL: op.Request.URL, Headers: flatten(req.Header), Body: op.Request.Body}, nil
 }
 
-func signDirectory(op operation) any {
+func signDirectory(op operation) (any, error) {
 	keys := make([]any, 0, len(op.Keys))
 	for _, raw := range op.Keys {
 		key, err := privateKey(raw)
 		if err != nil {
-			return failure(0, "key", err)
+			return nil, err
 		}
 		keys = append(keys, key)
 	}
@@ -178,12 +195,12 @@ func signDirectory(op operation) any {
 	// verifier that allows no skew on directory signatures accepts it.
 	d, err := signing.SignKeyDirectory(op.Origin, keys, time.Unix(op.Now-60, 0), 24*time.Hour)
 	if err != nil {
-		return sdkFailure(err)
+		return nil, err
 	}
-	return message{URL: directoryURL(op.Origin), Status: d.Status, Headers: flatten(d.Header), Body: string(d.Body)}
+	return message{URL: directoryURL(op.Origin), Status: d.Status, Headers: flatten(d.Header), Body: string(d.Body)}, nil
 }
 
-func verifyRequest(op operation) any {
+func verifyRequest(op operation) (any, error) {
 	fetch := func(_ context.Context, url string) (*signing.DirectoryResponse, error) {
 		for origin, d := range op.Directories {
 			if directoryURL(origin) == url {
@@ -197,35 +214,39 @@ func verifyRequest(op operation) any {
 		Replay: signing.NewMemoryReplayStore(0),
 		Clock:  clock(op.Now),
 	}
-	var (
-		signer *signing.VerifiedSigner
-		err    error
-	)
-	for _, m := range append(op.Prior, op.Request) {
-		req, rerr := http.NewRequest(m.Method, m.URL, bytes.NewBufferString(m.Body))
-		if rerr != nil {
-			return failure(http.StatusBadRequest, "request", rerr)
+	verify := func(m message) (*signing.VerifiedSigner, error) {
+		req, err := http.NewRequest(m.Method, m.URL, bytes.NewBufferString(m.Body))
+		if err != nil {
+			return nil, err
 		}
 		req.Header = header(m.Headers)
 		req.Host = req.URL.Host
-		signer, err = signing.VerifyWebBotAuthRequest(req, opts)
+		return signing.VerifyWebBotAuthRequest(req, opts)
 	}
+	// A prior request builds replay state, so it must verify: one that does
+	// not is a broken setup, not the SDK's answer to the graded request.
+	for i, m := range op.Prior {
+		if _, err := verify(m); err != nil {
+			return nil, fmt.Errorf("prior request %d did not verify: %w", i, err)
+		}
+	}
+	signer, err := verify(op.Request)
 	if err != nil {
-		return sdkFailure(err)
+		return requestRefusal(err)
 	}
-	return map[string]any{"ok": true, "identity": signer.AgentURL, "keyid": signer.KeyID}
+	return map[string]any{"ok": true, "identity": signer.AgentURL, "keyid": signer.KeyID}, nil
 }
 
-func verifyDirectory(op operation) any {
+func verifyDirectory(op operation) (any, error) {
 	keys, err := signing.VerifyDirectoryResponse(op.Origin, &signing.DirectoryResponse{
 		Status: op.Response.Status, Header: header(op.Response.Headers), Body: []byte(op.Response.Body),
 	}, time.Unix(op.Now, 0))
 	if err != nil {
-		return sdkFailure(err)
+		return refusal(0, "directory", err), nil
 	}
 	ids := make([]string, 0, len(keys))
 	for kid := range keys {
 		ids = append(ids, kid)
 	}
-	return map[string]any{"ok": true, "keyids": ids}
+	return map[string]any{"ok": true, "keyids": ids}, nil
 }
