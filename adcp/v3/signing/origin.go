@@ -44,20 +44,10 @@ func signatureAgentOrigin(value string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	u, err := url.Parse(origin)
-	if err != nil || value != origin || !canonicalPort(u.Port()) {
+	if value != origin {
 		return "", errors.New("signing: Signature-Agent is not a canonical https origin")
 	}
 	return origin, nil
-}
-
-// canonicalPort reports whether port is empty or spelled as its decimal
-// value, 0 to 65535. Canonicalization strips a default port by comparing
-// strings, so a port with a leading zero (0443, 08443) or out of range
-// (99999) survives it.
-func canonicalPort(port string) bool {
-	n, err := strconv.ParseUint(port, 10, 16)
-	return port == "" || (err == nil && strconv.FormatUint(n, 10) == port)
 }
 
 // webBotAuthOrigin validates a URL naming a Web Bot Auth identity (a
@@ -86,8 +76,26 @@ func webBotAuthOrigin(rawURL string) (string, error) {
 	if !strings.HasPrefix(origin, "https://") {
 		return "", errors.New("signing: Web Bot Auth origins require HTTPS")
 	}
+	// CanonicalOrigin strips only the literal default port "443", so a port
+	// written with a leading zero (":0443", ":08443") or out of range
+	// (":99999") would survive as a second spelling of an identity, or as
+	// one no fetch can reach. Require a port as the WHATWG URL parser
+	// serializes it: decimal, no leading zero, 1 to 65535.
+	if u, err := url.Parse(origin); err != nil || !canonicalPort(u.Port()) {
+		return "", errors.New("signing: Web Bot Auth origin port is not a canonical port number")
+	}
 	if err := safefetch.ValidateTarget(origin + "/"); err != nil {
 		return "", err
 	}
 	return origin, nil
+}
+
+// canonicalPort reports whether port is empty or a decimal port number
+// from 1 to 65535 with no leading zero.
+func canonicalPort(port string) bool {
+	if port == "" {
+		return true
+	}
+	n, err := strconv.Atoi(port)
+	return err == nil && n >= 1 && n <= 65535 && strconv.Itoa(n) == port
 }
